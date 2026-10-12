@@ -4,7 +4,8 @@
 //!   empty compact unified `NSToolbar`, plus an `NSVisualEffectView` (sidebar material) behind the
 //!   app's content view so translucent regions show system vibrancy.
 //! - [`chrome_metrics`]: the live height of that title bar region and the width taken by
-//!   the traffic lights, so app content never sits under the system's drag region.
+//!   the traffic lights, so app content never sits under the system's drag region. It also
+//!   hides the toolbar in full screen, where the system would draw it over the app's own.
 //! - [`accent_color`]: the user's system accent colour (`NSColor.controlAccentColor`).
 
 use std::ffi::c_void;
@@ -30,7 +31,7 @@ mod imp {
     use objc2_app_kit::{
         NSAutoresizingMaskOptions, NSColor, NSColorSpace, NSToolbar, NSView, NSVisualEffectBlendingMode,
         NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowButton, NSWindowOrderingMode,
-        NSWindowTitleVisibility, NSWindowToolbarStyle,
+        NSWindowStyleMask, NSWindowTitleVisibility, NSWindowToolbarStyle,
     };
     use objc2_foundation::NSString;
 
@@ -85,6 +86,14 @@ mod imp {
         // SAFETY: caller guarantees a live NSView on the main thread.
         let view: &NSView = unsafe { &*(ns_view as *const NSView) };
         let window = view.window()?;
+        // In full screen the system draws the (empty) toolbar in its own window above the
+        // content, covering the app's toolbar; hide it there and bring it back on exit.
+        if let Some(toolbar) = window.toolbar() {
+            let full_screen = window.styleMask().contains(NSWindowStyleMask::FullScreen);
+            if toolbar.isVisible() == full_screen {
+                toolbar.setVisible(!full_screen);
+            }
+        }
         // The content layout rect excludes the title bar/toolbar strip that overlaps a
         // full-size content view; the difference is the region the system owns.
         let titlebar = (window.frame().size.height - window.contentLayoutRect().size.height).max(0.0) as f32;
