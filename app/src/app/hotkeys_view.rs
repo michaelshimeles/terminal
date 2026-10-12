@@ -290,6 +290,7 @@ impl TerminalApp {
                     (&["RAY", "HRAY", "CROSS", "CHANNEL", "FIBEXT", "RECT"], "More drawing tools"),
                     (&["LONG", "SHORT", "MEASURE"], "Position (entry, target, stop) and measure"),
                     (&["TOOLS", "CLEAR DRAW"], "Drawing toolbar · remove all drawings"),
+                    (&["UNDO", "REDO"], "Undo or redo drawing changes (⌘Z, ⌘⇧Z)"),
                 ],
             );
             para(

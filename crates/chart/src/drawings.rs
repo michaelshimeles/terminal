@@ -168,6 +168,63 @@ pub fn format_span(secs: i64) -> String {
     }
 }
 
+/// Undo/redo over a chart's drawings, by snapshots. Changes are picked up by
+/// [`History::track`] wherever they came from (toolbar, hotkeys, commands, menus).
+#[derive(Debug, Clone, Default)]
+pub struct History {
+    undo: Vec<Vec<Drawing>>,
+    redo: Vec<Vec<Drawing>>,
+    /// The drawings as last seen; `None` until the first track.
+    last: Option<Vec<Drawing>>,
+}
+
+impl History {
+    /// Undo steps kept per chart.
+    pub const LIMIT: usize = 100;
+
+    /// Record `current` as a new step if it differs from the last state seen. A new step
+    /// clears the redo stack.
+    pub fn track(&mut self, current: &[Drawing]) {
+        match &mut self.last {
+            None => self.last = Some(current.to_vec()),
+            Some(last) if last.as_slice() != current => {
+                self.undo.push(std::mem::replace(last, current.to_vec()));
+                if self.undo.len() > Self::LIMIT {
+                    self.undo.remove(0);
+                }
+                self.redo.clear();
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Restore the previous state into `current`. Returns whether there was one.
+    pub fn undo(&mut self, current: &mut Vec<Drawing>) -> bool {
+        self.track(current);
+        let Some(prev) = self.undo.pop() else { return false };
+        self.redo.push(std::mem::replace(current, prev));
+        self.last = Some(current.clone());
+        true
+    }
+
+    /// Re-apply the last undone state into `current`. Returns whether there was one.
+    pub fn redo(&mut self, current: &mut Vec<Drawing>) -> bool {
+        self.track(current);
+        let Some(next) = self.redo.pop() else { return false };
+        self.undo.push(std::mem::replace(current, next));
+        self.last = Some(current.clone());
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+}
+
 /// Screen-space geometry of a drawing, produced by the chart for hit testing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
@@ -358,6 +415,65 @@ mod tests {
         assert_eq!(parallel_offset([0.0, 0.0], [10.0, 10.0], [5.0, 15.0]), 10.0);
         assert_eq!(parallel_offset([0.0, 0.0], [10.0, 0.0], [3.0, -4.0]), -4.0);
         assert_eq!(parallel_offset([2.0, 0.0], [2.0, 10.0], [7.0, 3.0]), 3.0);
+    }
+
+    #[test]
+    fn history_undoes_and_redoes_tracked_changes() {
+        let line = |p: f64| Drawing::new(Tool::Horizontal, at(0, p), at(0, p));
+        let mut h = History::default();
+        let mut d = vec![line(1.0)];
+        h.track(&d); // the starting state is not an undo step
+        assert!(!h.can_undo());
+        d.push(line(2.0));
+        h.track(&d);
+        d.push(line(3.0));
+        h.track(&d);
+        h.track(&d); // unchanged: no new step
+        assert!(h.undo(&mut d));
+        assert_eq!(d, vec![line(1.0), line(2.0)]);
+        assert!(h.undo(&mut d));
+        assert_eq!(d, vec![line(1.0)]);
+        assert!(!h.undo(&mut d), "nothing older than the starting state");
+        assert!(h.redo(&mut d));
+        assert_eq!(d, vec![line(1.0), line(2.0)]);
+        // A new change after undo drops the redo branch.
+        d.clear();
+        h.track(&d);
+        assert!(!h.can_redo());
+        assert!(!h.redo(&mut d));
+        assert!(h.undo(&mut d));
+        assert_eq!(d, vec![line(1.0), line(2.0)]);
+    }
+
+    #[test]
+    fn history_flushes_untracked_changes_before_undo() {
+        let line = |p: f64| Drawing::new(Tool::Horizontal, at(0, p), at(0, p));
+        let mut h = History::default();
+        let mut d = Vec::new();
+        h.track(&d);
+        // Changed (e.g. by a command) and undone before the next frame tracked it.
+        d.push(line(1.0));
+        assert!(h.undo(&mut d));
+        assert!(d.is_empty());
+        assert!(h.redo(&mut d));
+        assert_eq!(d, vec![line(1.0)]);
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut h = History::default();
+        let mut d = Vec::new();
+        h.track(&d);
+        for i in 0..History::LIMIT + 20 {
+            d.push(Drawing::new(Tool::Vertical, at(i as i64, 0.0), at(i as i64, 0.0)));
+            h.track(&d);
+        }
+        let mut steps = 0;
+        while h.undo(&mut d) {
+            steps += 1;
+        }
+        assert_eq!(steps, History::LIMIT);
+        assert_eq!(d.len(), 20, "the oldest steps were dropped");
     }
 
     #[test]

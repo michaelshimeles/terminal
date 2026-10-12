@@ -111,6 +111,8 @@ pub struct ChartState {
     markers: Vec<Trade>,
     pending_range: Option<Range>,
     draw: DrawState,
+    /// Undo/redo over `drawings`.
+    history: drawings::History,
     /// Last tool picked in each toolbar group (index into the group).
     tool_picks: [usize; toolbar::GROUPS.len()],
     hover_marker: Option<usize>,
@@ -165,6 +167,7 @@ impl ChartState {
             pending_range: None,
             draw: DrawState::default(),
             tool_picks: [0; toolbar::GROUPS.len()],
+            history: drawings::History::default(),
             hover_marker: None,
             sec: tr_data::security(symbol),
             last_live: None,
@@ -289,6 +292,23 @@ impl ChartState {
         } else {
             false
         }
+    }
+
+    /// Undo the last drawing change (or, mid-placement, drop the points placed so far).
+    /// Returns whether anything changed.
+    pub fn undo(&mut self) -> bool {
+        if !self.draw.pending.is_empty() {
+            self.draw.pending.clear();
+            return true;
+        }
+        self.draw.selected = None;
+        self.history.undo(&mut self.drawings)
+    }
+
+    /// Redo the last undone drawing change. Returns whether there was one.
+    pub fn redo(&mut self) -> bool {
+        self.draw.selected = None;
+        self.history.redo(&mut self.drawings)
     }
 
     pub fn delete_selected(&mut self) -> bool {
@@ -504,6 +524,8 @@ impl ChartState {
     }
 
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, focused: bool, w: &Worker) -> bool {
+        // Every drawing change since the last frame becomes one undo step, whatever made it.
+        self.history.track(&self.drawings);
         let painter = ui.painter_at(rect);
         // Sits under a tab strip inside a card: square top, rounded bottom.
         let r = theme::CARD_RADIUS.saturating_sub(1);

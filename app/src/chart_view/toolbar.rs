@@ -584,6 +584,38 @@ mod tests {
     }
 
     #[test]
+    fn remove_all_from_the_toolbar_can_be_undone() {
+        use tr_chart::drawings::{Anchor, Drawing};
+        let mut chart = ChartState::new(1, "AAPL", tr_core::Timeframe::D1);
+        let at = |p| Anchor { ts: 0, price: p };
+        chart.history.track(&chart.drawings);
+        chart.drawings.push(Drawing::new(Tool::Horizontal, at(1.0), at(1.0)));
+        chart.history.track(&chart.drawings);
+        chart.drawings.push(Drawing::new(Tool::Horizontal, at(2.0), at(2.0)));
+        chart.history.track(&chart.drawings);
+        // The trash button is last: 11 buttons and 3 separators above it.
+        let strip = Rect::from_min_size(Pos2::ZERO, vec2(STRIP_W, 800.0));
+        let trash = pos2(STRIP_W / 2.0, 4.0 + 11.0 * (BUTTON + 2.0) + 3.0 * (7.0 + 2.0) + BUTTON / 2.0);
+        click(&mut chart, trash, |c, ui| {
+            c.toolbar_strip(ui, strip);
+        });
+        assert!(chart.drawings.is_empty());
+        assert!(chart.undo());
+        assert_eq!(chart.drawings.len(), 2);
+        assert!(chart.undo());
+        assert_eq!(chart.drawings.len(), 1);
+        assert!(chart.redo());
+        assert!(chart.redo());
+        assert!(chart.drawings.is_empty());
+        assert!(!chart.redo());
+        // Mid-placement, undo first drops the points placed so far.
+        chart.start_tool(Tool::Trendline);
+        chart.draw.pending.push(at(3.0));
+        assert!(chart.undo());
+        assert!(chart.draw.pending.is_empty() && chart.draw.tool == Some(Tool::Trendline));
+    }
+
+    #[test]
     fn glyphs_paint_without_panicking() {
         let ctx = egui::Context::default();
         let mut out = ctx.run_ui(Default::default(), |ui| {

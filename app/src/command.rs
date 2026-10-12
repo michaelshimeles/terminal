@@ -174,6 +174,9 @@ pub enum Function {
     ClearDrawings,
     /// Show or hide the focused chart's drawing toolbar.
     DrawingToolbar,
+    /// Undo or redo the focused chart's last drawing change.
+    Undo,
+    Redo,
     Magnet,
     /// Congress trades: feed when used alone, per-ticker list after a symbol.
     Congress,
@@ -272,6 +275,8 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "SHORT" => Function::Draw(Tool::ShortPosition),
         "MEASURE" | "RULER" => Function::Draw(Tool::Measure),
         "TOOLS" | "TOOLBAR" | "DRAWBAR" => Function::DrawingToolbar,
+        "UNDO" => Function::Undo,
+        "REDO" => Function::Redo,
         "MAGNET" | "MAG" => Function::Magnet,
         "CONG" | "CONGRESS" => Function::Congress,
         "POL" | "PROFILE" => Function::Politician(joined()),
@@ -391,6 +396,8 @@ fn describe(f: &Function) -> String {
         Function::Draw(t) => format!("Draw {}", t.label()),
         Function::ClearDrawings => "Remove all drawings".into(),
         Function::DrawingToolbar => "Show or hide the drawing toolbar".into(),
+        Function::Undo => "Undo the last drawing change".into(),
+        Function::Redo => "Redo the last undone drawing change".into(),
         Function::Magnet => "Toggle magnet (snap to OHLC)".into(),
         Function::Congress => "Congressional trades".into(),
         Function::Politician(n) => format!("Politician profile: {n}"),
@@ -495,6 +502,8 @@ mod tests {
         assert_eq!(parse("LONG"), Some(Command::Function(Function::Draw(Tool::LongPosition))));
         assert_eq!(parse("RULER"), Some(Command::Function(Function::Draw(Tool::Measure))));
         assert_eq!(parse("TOOLS"), Some(Command::Function(Function::DrawingToolbar)));
+        assert_eq!(parse("undo"), Some(Command::Function(Function::Undo)));
+        assert_eq!(parse("REDO"), Some(Command::Function(Function::Redo)));
         assert_eq!(parse("POL Nancy Pelosi"), Some(Command::Function(Function::Politician("Nancy Pelosi".into()))));
         assert_eq!(
             parse("WL ADD msft nvda"),

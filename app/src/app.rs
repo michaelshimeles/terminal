@@ -783,6 +783,17 @@ impl TerminalApp {
             Function::ClearDrawings => self.with_chart(|c, _| c.drawings.clear()),
             Function::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
             Function::DrawingToolbar => self.with_chart(|c, _| c.toolbar_open = !c.toolbar_open),
+            Function::Undo | Function::Redo => {
+                let undo = f == Function::Undo;
+                let mut changed = false;
+                self.with_chart(|c, _| changed = if undo { c.undo() } else { c.redo() });
+                self.status = match (undo, changed) {
+                    (true, true) => "Undid the last drawing change".into(),
+                    (true, false) => "Nothing to undo".into(),
+                    (false, true) => "Redid the drawing change".into(),
+                    (false, false) => "Nothing to redo".into(),
+                };
+            }
             Function::Congress => self.open_panel(PaneKind::Feed { filter: FeedFilter::default() }),
             Function::Politician(q) if q.trim().is_empty() => self.open_panel(PaneKind::Politicians),
             Function::Politician(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
@@ -1212,6 +1223,8 @@ impl TerminalApp {
             | A::ResetView
             | A::LogScale
             | A::Magnet => self.focused_is_chart(),
+            // With text in the command line, ⌘Z / ⌘⇧Z edit the text instead.
+            A::Undo | A::Redo => self.focused_is_chart() && self.cmd.is_empty(),
             a => a.layout_slot().is_none_or(|i| i < self.layout_names.len()),
         }
     }
@@ -1256,6 +1269,8 @@ impl TerminalApp {
             A::DrawHorizontalRay => self.with_chart(|c, _| c.start_tool(Tool::HorizontalRay)),
             A::DrawCrossLine => self.with_chart(|c, _| c.start_tool(Tool::CrossLine)),
             A::DrawingToolbar => self.apply(Function::DrawingToolbar),
+            A::Undo => self.apply(Function::Undo),
+            A::Redo => self.apply(Function::Redo),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
             A::LogScale => self.with_chart(|c, _| c.log = !c.log),
             A::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
