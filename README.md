@@ -50,9 +50,15 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   1M plus quick ranges (1D … ALL); volume; SMA, EMA, VWAP, Bollinger overlays; RSI and MACD
   sub-panes; `CMP <SYM>` compare; log scale; crosshair with OHLC legend; smooth pan and zoom over
   a million bars. Live crypto bars from the Binance websocket (Coinbase fallback).
-- **Drawings** — trendline (Alt+T), horizontal (Alt+H), vertical (Alt+V) and fib retracement
-  (Alt+F), stored in (time, price) so they survive zoom and timeframe changes; magnet (Alt+M) snaps
-  to OHLC; click to select, Del to remove.
+- **Drawings** — a collapsible drawing toolbar on each chart's left edge (the tab on the plot's
+  edge, `TOOLS` or Alt+D) with grouped tools and flyouts: trendline (Alt+T), ray, extended line,
+  horizontal line (Alt+H), horizontal ray (Alt+J), vertical line (Alt+V), cross line (Alt+C),
+  parallel channel; fib retracement (Alt+F) and trend-based fib extension; long and short positions
+  (entry, target, stop, with % to each and the reward-to-risk ratio); rectangle; measure (price
+  change, %, bars and time between two points) and zoom to an area. Drawings are stored in
+  (time, price) so they survive zoom and timeframe changes; magnet (Alt+M) snaps to OHLC; keep
+  drawing, lock and hide all drawings, remove all; click to select, Del to remove. The toolbar
+  state and toggles save with the layout.
 - **Options** (`AAPL OMON`, ⌘⇧O) — full chains from Yahoo for US equities, ETFs and indices
   (SPX via ^SPX): every expiration, calls and puts by strike with bid/ask/last, change, volume,
   open interest and IV, plus Black-Scholes greeks (Δ, Γ, Θ/day, vega) from each contract's IV, the
@@ -208,7 +214,8 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | ⌘S · ⌥1 … ⌥9 | save layout · switch to saved layout 1–9 |
 | ⌃⌘S (Ctrl+Shift+S) · ⌘⌥S | toggle sidebar · move sidebar to the other side |
 | ⌘⌥T · ⌘, | cycle theme · settings |
-| ⌥T · ⌥H · ⌥V · ⌥F · ⌥M | draw trendline · horizontal · vertical · fib · magnet |
+| ⌥T · ⌥H · ⌥J · ⌥V · ⌥C · ⌥F · ⌥M | draw trendline · horizontal · horizontal ray · vertical · cross line · fib · magnet |
+| ⌥D | show or hide the drawing toolbar |
 | ⌥R · ⌥L · Esc · Del | reset chart view · log scale · cancel · delete selected drawing |
 | wheel · drag · drag axes · double-click | zoom · pan · stretch · reset |
 
@@ -219,6 +226,7 @@ Settings › Hotkeys. On Linux and Windows ⌘ is Ctrl and ⌥ is Alt.
 | `5` `1H` `D` `1W` `1M` · `YTD` `5Y` `ALL` | interval · quick range |
 | `RSI` `MACD` `BB` `SMA 50` `EMA 20` `VWAP` · `CLEAR` | toggle indicators |
 | `CMP MSFT` · `LOG` · `CANDLE` `BAR` `LINE` `AREA` | compare · log scale · chart type |
+| `TOOLS` · `TL` `RAY` `EXTLINE` `HL` `HRAY` `VL` `CROSS` `CHANNEL` · `FIB` `FIBEXT` · `RECT` · `LONG` `SHORT` · `MEASURE` · `CLEAR DRAW` | drawing toolbar · drawing tools · remove all drawings |
 | `AAPL OMON` · `AAPL CN` · `BTCUSD CRNCY OB` · `WEI` · `GC` · `SECF <query>` | options · news · order book · world markets · yield curve · search |
 | `CONG` · `NVDA CONG` · `POL PELOSI` · `TRACK PELOSI` · `ALERTS` · `REFRESH` | Congress feed · who traded it · profile · track · alerts · refresh |
 | `NEW BOOK` · `SPLIT DOWN NEWS` · `POP` · `LINK GREEN` · `TITLE Desk` · `CLOSE` | add, split, pop out, link, rename, close panes |

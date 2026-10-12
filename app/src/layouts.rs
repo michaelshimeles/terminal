@@ -70,6 +70,15 @@ pub enum PaneSettings {
         show_congress: bool,
         #[serde(default)]
         magnet: bool,
+        /// Drawing toolbar open, and its drawing toggles.
+        #[serde(default)]
+        toolbar: bool,
+        #[serde(default)]
+        keep_drawing: bool,
+        #[serde(default)]
+        lock_drawings: bool,
+        #[serde(default)]
+        hide_drawings: bool,
     },
     /// Congress feed with its filter (`None` = unfiltered).
     Feed(Option<FeedSettings>),
@@ -273,6 +282,10 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
         show_volume: d.show_volume,
         show_congress: d.congress_markers,
         magnet: false,
+        toolbar: false,
+        keep_drawing: false,
+        lock_drawings: false,
+        hide_drawings: false,
     }
 }
 
@@ -465,6 +478,18 @@ mod tests {
             title: None,
             window: None,
         });
+        match &mut doc.panes[0].settings {
+            PaneSettings::Chart { toolbar, lock_drawings, drawings, .. } => {
+                use tr_chart::drawings::{Anchor, Tool};
+                *toolbar = true;
+                *lock_drawings = true;
+                let at = |ts, price| Anchor { ts, price };
+                drawings
+                    .push(Drawing::from_points(Tool::LongPosition, &[at(1, 10.0), at(2, 12.0), at(1, 9.0)]).unwrap());
+                drawings.push(Drawing::from_points(Tool::Ray, &[at(1, 10.0), at(3, 11.0)]).unwrap());
+            }
+            other => panic!("{other:?}"),
+        }
         doc.dock.insert(1, Zone::Right, 5);
         doc.dock.insert(5, Zone::Center, 7);
         doc.panes[0].link = Some(Link::Blue);
@@ -513,8 +538,19 @@ mod tests {
             {"id":2,"Feed":null}]}"#;
         let doc = LayoutDoc::from_json(raw.as_bytes()).unwrap();
         match &doc.panes[0].settings {
-            PaneSettings::Chart { show_volume, show_congress, magnet, log, .. } => {
-                assert!(*show_volume && *show_congress && !*magnet && *log)
+            PaneSettings::Chart {
+                show_volume,
+                show_congress,
+                magnet,
+                log,
+                toolbar,
+                keep_drawing,
+                lock_drawings,
+                hide_drawings,
+                ..
+            } => {
+                assert!(*show_volume && *show_congress && !*magnet && *log);
+                assert!(!*toolbar && !*keep_drawing && !*lock_drawings && !*hide_drawings);
             }
             other => panic!("{other:?}"),
         }

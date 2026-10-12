@@ -42,3 +42,11 @@ Magnet tooltip text: "Magnet mode snaps drawings placed near price bars to the c
   timeframe changes; persisted per symbol in SQLite.
 - Magnet toggle on `Alt+M` (bare letters are reserved for the command line)
   snaps to the nearest O/H/L/C of the bar under the cursor.
+- Toolbar (implemented after the MVP): a collapsible strip on the chart's left edge mirroring the
+  observed grouping — cursor; trend tools (trendline, ray, extended line, horizontal line and ray,
+  vertical, cross line, parallel channel); Fibonacci (retracement, trend-based extension);
+  projection (long/short position); shapes (rectangle); then measure and zoom; then magnet, keep
+  drawing, lock, hide and remove all. A group button shows the tool last picked from its flyout
+  (corner chevron or right-click), as observed. Closed, the toolbar is a slim tab on the plot edge.
+  Glyphs are drawn in-app as simple line icons; no TradingView icons are used. Three-point tools
+  (channel, extension, position) store the third anchor alongside the first two.

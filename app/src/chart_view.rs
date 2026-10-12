@@ -1,6 +1,8 @@
 //! Chart pane: GPU-rendered price/volume/indicator panes with egui-drawn axes, legend,
 //! crosshair, drawings and congressional trade markers.
 
+mod toolbar;
+
 use std::sync::Arc;
 
 use egui::{
@@ -33,8 +35,45 @@ const DEFAULT_VISIBLE: usize = 160;
 #[derive(Default)]
 struct DrawState {
     tool: Option<Tool>,
-    pending: Option<Anchor>,
+    /// Points placed so far for the active tool.
+    pending: Vec<Anchor>,
     selected: Option<usize>,
+}
+
+/// One piece of a drawing's screen geometry, with optional label and fill.
+struct Part {
+    shape: Shape,
+    label: Option<(String, Pos2, Align2)>,
+    fill: Option<Color32>,
+    /// Line colour when not selected (default cyan).
+    color: Option<Color32>,
+    dashed: bool,
+}
+
+impl Part {
+    fn new(shape: Shape) -> Self {
+        Self { shape, label: None, fill: None, color: None, dashed: false }
+    }
+
+    fn label(mut self, text: String, at: Pos2, align: Align2) -> Self {
+        self.label = Some((text, at, align));
+        self
+    }
+
+    fn fill(mut self, fill: Color32) -> Self {
+        self.fill = Some(fill);
+        self
+    }
+
+    fn color(mut self, color: Color32) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    fn dashed(mut self) -> Self {
+        self.dashed = true;
+        self
+    }
 }
 
 pub struct ChartState {
@@ -49,6 +88,13 @@ pub struct ChartState {
     pub indicators: Vec<IndicatorSpec>,
     pub drawings: Vec<Drawing>,
     pub compare: Option<String>,
+    /// Drawing toolbar open on the left edge (closed it is a slim tab).
+    pub toolbar_open: bool,
+    /// Keep the drawing tool active after placing a drawing.
+    pub keep_drawing: bool,
+    /// Drawings can't be selected or deleted one by one.
+    pub lock_drawings: bool,
+    pub hide_drawings: bool,
 
     bars: Arc<Vec<Bar>>,
     gpu: Option<SeriesGpu>,
@@ -65,6 +111,8 @@ pub struct ChartState {
     markers: Vec<Trade>,
     pending_range: Option<Range>,
     draw: DrawState,
+    /// Last tool picked in each toolbar group (index into the group).
+    tool_picks: [usize; toolbar::GROUPS.len()],
     hover_marker: Option<usize>,
     /// Resolved security for `symbol`.
     sec: Security,
@@ -97,6 +145,10 @@ impl ChartState {
             indicators: vec![IndicatorSpec::Sma(20), IndicatorSpec::Sma(50)],
             drawings: Vec::new(),
             compare: None,
+            toolbar_open: false,
+            keep_drawing: false,
+            lock_drawings: false,
+            hide_drawings: false,
             bars: Arc::new(Vec::new()),
             gpu: None,
             generation: 0,
@@ -112,6 +164,7 @@ impl ChartState {
             markers: Vec::new(),
             pending_range: None,
             draw: DrawState::default(),
+            tool_picks: [0; toolbar::GROUPS.len()],
             hover_marker: None,
             sec: tr_data::security(symbol),
             last_live: None,
@@ -221,7 +274,11 @@ impl ChartState {
 
     pub fn start_tool(&mut self, tool: Tool) {
         self.draw.tool = Some(tool);
-        self.draw.pending = None;
+        self.draw.pending.clear();
+        // The toolbar group shows the tool last used from it, hotkeys included.
+        if let Some((g, k)) = toolbar::group_of(tool) {
+            self.tool_picks[g] = k;
+        }
     }
 
     /// Esc: cancel an in-progress drawing, then deselect. Returns whether it consumed the key.
@@ -235,6 +292,9 @@ impl ChartState {
     }
 
     pub fn delete_selected(&mut self) -> bool {
+        if self.lock_drawings {
+            return false;
+        }
         match self.draw.selected.take() {
             Some(i) if i < self.drawings.len() => {
                 self.drawings.remove(i);
@@ -242,6 +302,16 @@ impl ChartState {
             }
             _ => false,
         }
+    }
+
+    /// Zoom the time axis to the span between two anchors (the zoom tool).
+    fn zoom_to(&mut self, a: &Anchor, b: &Anchor) {
+        let (ia, ib) = (self.index_of_ts(a.ts), self.index_of_ts(b.ts));
+        if let Some(v) = self.viewport.as_mut() {
+            v.fit_range(ia, ib);
+            v.clamp(self.bars.len());
+        }
+        self.manual_scale = None;
     }
 
     pub fn reset_view(&mut self) {
@@ -525,14 +595,22 @@ impl ChartState {
         );
 
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
-        let plot_all = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
+        // The open drawing toolbar takes a strip on the left; the plot starts after it.
+        let strip = Rect::from_min_size(body.min, vec2(toolbar::STRIP_W, body.height()));
+        let plot_left = if self.toolbar_open { strip.right() } else { body.left() };
+        let plot_all =
+            Rect::from_min_max(pos2(plot_left, body.top()), pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
         if plot_all.width() < 40.0 || plot_all.height() < 40.0 {
             return clicked;
+        }
+        if self.toolbar_open {
+            clicked |= self.toolbar_strip(ui, strip);
         }
 
         let Some(gpu) = self.gpu.clone() else {
             let msg = self.error.clone().unwrap_or_else(|| format!("Loading {} {}…", self.symbol, self.tf));
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
+            self.toolbar_tab(ui, plot_all);
             return clicked;
         };
 
@@ -826,6 +904,8 @@ impl ChartState {
             }
         }
         self.paint_legend(ui, price_rect, hovered_bar.unwrap_or(len.saturating_sub(1)), &sub_rects);
+        // Last, so it sits above the plot for clicks.
+        self.toolbar_tab(ui, plot_all);
 
         let _ = focused; // the surrounding card shows focus
         clicked
@@ -867,20 +947,34 @@ impl ChartState {
             }
         });
         ui.menu_button("Draw", |ui| {
-            let alt = if cfg!(target_os = "macos") { "⌥" } else { "Alt+" };
-            for (tool, key) in
-                [(Tool::Trendline, "T"), (Tool::Horizontal, "H"), (Tool::Vertical, "V"), (Tool::Fib, "F")]
-            {
-                if ui.add(egui::Button::new(tool.label()).shortcut_text(format!("{alt}{key}"))).clicked() {
+            for (name, tools) in toolbar::GROUPS {
+                ui.menu_button(name, |ui| {
+                    for &tool in tools {
+                        let b = egui::Button::new(tool.label())
+                            .shortcut_text(toolbar::shortcut_text(tool).unwrap_or_default());
+                        if ui.add(b).clicked() {
+                            self.start_tool(tool);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            for tool in [Tool::Measure, Tool::Zoom] {
+                if ui.button(tool.label()).clicked() {
                     self.start_tool(tool);
                     ui.close();
                 }
             }
+            ui.separator();
+            ui.checkbox(&mut self.keep_drawing, "Keep Drawing");
+            ui.checkbox(&mut self.lock_drawings, "Lock Drawings");
+            ui.checkbox(&mut self.hide_drawings, "Hide Drawings");
             if ui.button("Remove All Drawings").clicked() {
                 self.drawings.clear();
                 ui.close();
             }
         });
+        ui.checkbox(&mut self.toolbar_open, "Drawing Toolbar");
         ui.checkbox(&mut self.log, "Log Scale");
         ui.checkbox(&mut self.magnet, "Magnet");
         ui.checkbox(&mut self.show_volume, "Volume");
@@ -958,15 +1052,11 @@ impl ChartState {
             ly += 14.0;
         }
         if let Some(tool) = self.draw.tool {
-            let msg = if self.draw.pending.is_some() {
-                "click second point (Esc cancels)"
-            } else {
-                "click to place (Esc cancels)"
-            };
+            let keep = if self.keep_drawing { ", keep drawing on" } else { "" };
             p.text(
                 pos2(price_rect.left() + 6.0, ly),
                 Align2::LEFT_TOP,
-                format!("{}: {msg}", tool.label()),
+                format!("{}: {} (Esc cancels{keep})", tool.label(), tool.step(self.draw.pending.len())),
                 mono(11.0),
                 amber(),
             );
@@ -985,23 +1075,123 @@ impl ChartState {
         }
     }
 
-    fn drawing_shapes(&self, d: &Drawing, rect: Rect, v: &Viewport, s: &PriceScale) -> Vec<(Shape, Option<String>)> {
+    /// Screen geometry of a drawing: shapes for painting and hit testing, with labels.
+    fn drawing_parts(&self, d: &Drawing, rect: Rect, v: &Viewport, s: &PriceScale) -> Vec<Part> {
         let px =
             |a: &Anchor| [rect.left() as f64 + v.x_of(self.index_of_ts(a.ts)), rect.top() as f64 + s.y_of(a.price)];
+        let (pa, pb, pc) = (px(&d.a), px(&d.b), d.c.as_ref().map(px));
+        let (min, max) = ([rect.left() as f64, rect.top() as f64], [rect.right() as f64, rect.bottom() as f64]);
+        let price = |p: f64| scale::format_price(p, self.sec.decimals(p));
+        let seg = |a: [f64; 2], b: [f64; 2]| Part::new(Shape::Segment(a, b));
+        let hline_label = |y: f64, p: f64| (price(p), pos2(rect.right() - 4.0, y as f32 - 1.0), Align2::RIGHT_BOTTOM);
+        let levels = |levels: Vec<(f64, f64)>, x0: f64, x1: f64| -> Vec<Part> {
+            levels
+                .into_iter()
+                .map(|(r, p)| {
+                    let y = rect.top() as f64 + s.y_of(p);
+                    seg([x0, y], [x1, y]).label(
+                        format!("{r:.3} ({})", price(p)),
+                        pos2(x0 as f32 + 3.0, y as f32 - 1.0),
+                        Align2::LEFT_BOTTOM,
+                    )
+                })
+                .collect()
+        };
         match d.tool {
-            Tool::Trendline => vec![(Shape::Segment(px(&d.a), px(&d.b)), None)],
-            Tool::Horizontal => vec![(Shape::HLine(px(&d.a)[1]), Some(format!("{:.2}", d.a.price)))],
-            Tool::Vertical => vec![(Shape::VLine(px(&d.a)[0]), None)],
+            Tool::Trendline => vec![seg(pa, pb)],
+            Tool::Ray | Tool::ExtendedLine => drawings::extend_line(pa, pb, min, max, d.tool == Tool::ExtendedLine)
+                .map(|(a, b)| vec![seg(a, b)])
+                .unwrap_or_default(),
+            Tool::Horizontal => {
+                let (t, p, al) = hline_label(pa[1], d.a.price);
+                vec![Part::new(Shape::HLine(pa[1])).label(t, p, al)]
+            }
+            Tool::HorizontalRay => {
+                let (t, p, al) = hline_label(pa[1], d.a.price);
+                vec![seg(pa, [max[0], pa[1]]).label(t, p, al)]
+            }
+            Tool::Vertical => vec![Part::new(Shape::VLine(pa[0]))],
+            Tool::CrossLine => {
+                let (t, p, al) = hline_label(pa[1], d.a.price);
+                vec![Part::new(Shape::HLine(pa[1])).label(t, p, al), Part::new(Shape::VLine(pa[0]))]
+            }
+            Tool::ParallelChannel => {
+                let mut parts = vec![seg(pa, pb)];
+                if let Some(c) = pc {
+                    let dy = drawings::parallel_offset(pa, pb, c);
+                    let shift = |q: [f64; 2], k: f64| [q[0], q[1] + dy * k];
+                    parts.push(seg(shift(pa, 1.0), shift(pb, 1.0)));
+                    parts.push(seg(shift(pa, 0.5), shift(pb, 0.5)).dashed());
+                }
+                parts
+            }
             Tool::Fib => {
-                let (xa, xb) = (px(&d.a)[0], px(&d.b)[0]);
-                let (x0, x1) = (xa.min(xb), xa.max(xb));
-                d.fib_levels()
-                    .into_iter()
-                    .map(|(r, price)| {
-                        let y = rect.top() as f64 + s.y_of(price);
-                        (Shape::Segment([x0, y], [x1, y]), Some(format!("{r:.3} ({price:.2})")))
-                    })
-                    .collect()
+                let (x0, x1) = (pa[0].min(pb[0]), pa[0].max(pb[0]));
+                levels(d.fib_levels(), x0, x1)
+            }
+            Tool::FibExtension => {
+                let mut parts = vec![seg(pa, pb).dashed()];
+                if let Some(c) = pc {
+                    parts.push(seg(pb, c).dashed());
+                }
+                let x0 = pc.unwrap_or(pb)[0];
+                let x1 = x0 + (pb[0] - pa[0]).abs().max(60.0);
+                parts.extend(levels(d.fib_extension_levels(), x0, x1));
+                parts
+            }
+            Tool::Rectangle => vec![Part::new(Shape::Rect(pa, pb)).fill(theme::cyan().gamma_multiply(0.12))],
+            Tool::LongPosition | Tool::ShortPosition => {
+                let Some(stats) = d.position() else { return Vec::new() };
+                // Too narrow to read: give the box a default width to the right of the entry.
+                let x1 = if (pb[0] - pa[0]).abs() < 24.0 { pa[0] + 120.0 } else { pb[0] };
+                let (xl, xr) = (pa[0].min(x1), pa[0].max(x1));
+                let inside = |y: f64, from: f64| {
+                    let above = y < from;
+                    let ly = if above { y + 2.0 } else { y - 2.0 };
+                    (pos2(xl as f32 + 4.0, ly as f32), if above { Align2::LEFT_TOP } else { Align2::LEFT_BOTTOM })
+                };
+                let (tp, ta) = inside(pb[1], pa[1]);
+                let mut parts = vec![
+                    Part::new(Shape::Rect([xl, pa[1]], [xr, pb[1]]))
+                        .fill(theme::up().gamma_multiply(0.18))
+                        .color(theme::up())
+                        .label(format!("Target {} ({:+.2}%)", price(d.b.price), stats.target_pct), tp, ta),
+                ];
+                if let (Some(c), Some(cp)) = (pc, d.c) {
+                    let (sp, sa) = inside(c[1], pa[1]);
+                    let pct = stats.stop_pct.unwrap_or(0.0);
+                    parts.push(
+                        Part::new(Shape::Rect([xl, pa[1]], [xr, c[1]]))
+                            .fill(theme::down().gamma_multiply(0.18))
+                            .color(theme::down())
+                            .label(format!("Stop {} ({pct:+.2}%)", price(cp.price)), sp, sa),
+                    );
+                }
+                let side = if d.tool == Tool::LongPosition { "LONG" } else { "SHORT" };
+                let rr = stats.reward_risk.map(|r| format!("  R:R {r:.2}")).unwrap_or_default();
+                parts.push(seg([xl, pa[1]], [xr, pa[1]]).color(text()).label(
+                    format!("{side} {}{rr}", price(d.a.price)),
+                    pos2(xr as f32 - 4.0, pa[1] as f32 - 2.0),
+                    Align2::RIGHT_BOTTOM,
+                ));
+                parts
+            }
+            Tool::Measure | Tool::Zoom => {
+                let wash = theme::accent().gamma_multiply(0.14);
+                let part = Part::new(Shape::Rect(pa, pb)).fill(wash).color(theme::accent());
+                if d.tool == Tool::Zoom {
+                    return vec![part];
+                }
+                let (delta, pct) = drawings::price_change(d.a.price, d.b.price);
+                let bars = (self.index_of_ts(d.b.ts) - self.index_of_ts(d.a.ts)).round();
+                let label = format!(
+                    "{}{} ({pct:+.2}%)  {bars:.0} bars, {}",
+                    if delta >= 0.0 { "+" } else { "" },
+                    price(delta),
+                    drawings::format_span(d.b.ts - d.a.ts)
+                );
+                let top = pos2(((pa[0] + pb[0]) / 2.0) as f32, pa[1].min(pb[1]) as f32 - 3.0);
+                vec![part.label(label, top, Align2::CENTER_BOTTOM)]
             }
         }
     }
@@ -1027,73 +1217,82 @@ impl ChartState {
             Anchor { ts: this.ts_of_index(idx), price }
         };
 
-        // Placement.
+        // Placement: collect the tool's points, then store it (or zoom, for the zoom tool).
         if let (Some(tool), true, Some(pos)) = (self.draw.tool, resp.clicked(), resp.interact_pointer_pos()) {
             let a = pointer_anchor(self, pos);
-            if tool.points() == 1 {
-                self.drawings.push(Drawing::new(tool, a, a));
-                self.draw = DrawState::default();
-            } else if let Some(first) = self.draw.pending.take() {
-                self.drawings.push(Drawing::new(tool, first, a));
-                self.draw = DrawState::default();
-            } else {
-                self.draw.pending = Some(a);
+            self.draw.pending.push(a);
+            if self.draw.pending.len() >= tool.points() {
+                let pts = std::mem::take(&mut self.draw.pending);
+                if tool == Tool::Zoom {
+                    self.zoom_to(&pts[0], &pts[1]);
+                } else if let Some(d) = Drawing::from_points(tool, &pts) {
+                    self.drawings.push(d);
+                    self.hide_drawings = false;
+                }
+                if !self.keep_drawing || tool == Tool::Zoom {
+                    self.draw.tool = None;
+                }
             }
-        } else if self.draw.tool.is_none() && resp.clicked() {
+        } else if self.draw.tool.is_none() && resp.clicked() && !self.lock_drawings && !self.hide_drawings {
             // Selection by proximity.
             self.draw.selected = resp.interact_pointer_pos().and_then(|pos| {
                 self.drawings.iter().enumerate().find_map(|(i, d)| {
                     let near = self
-                        .drawing_shapes(d, rect, v, s)
+                        .drawing_parts(d, rect, v, s)
                         .iter()
-                        .any(|(sh, _)| drawings::distance(sh, [pos.x as f64, pos.y as f64]) < 6.0);
+                        .any(|part| drawings::distance(&part.shape, [pos.x as f64, pos.y as f64]) < 6.0);
                     near.then_some(i)
                 })
             });
         }
 
-        let mut all: Vec<(Drawing, bool)> =
-            self.drawings.iter().cloned().enumerate().map(|(i, d)| (d, self.draw.selected == Some(i))).collect();
-        if let (Some(tool), Some(first), Some(h)) = (self.draw.tool, self.draw.pending, hover) {
-            all.push((Drawing::new(tool, first, pointer_anchor(self, h)), true));
+        let mut all: Vec<(Drawing, bool)> = if self.hide_drawings {
+            Vec::new()
+        } else {
+            self.drawings.iter().cloned().enumerate().map(|(i, d)| (d, self.draw.selected == Some(i))).collect()
+        };
+        if let (Some(tool), false, Some(h)) = (self.draw.tool, self.draw.pending.is_empty(), hover) {
+            let mut pts = self.draw.pending.clone();
+            pts.push(pointer_anchor(self, h));
+            all.extend(Drawing::from_points(tool, &pts).map(|d| (d, true)));
         }
         for (d, selected) in all {
-            let color = if selected { amber() } else { theme::cyan() };
-            let stroke = Stroke::new(if selected { 2.0 } else { 1.3 }, color);
-            for (shape, label) in self.drawing_shapes(&d, rect, v, s) {
-                match shape {
+            for part in self.drawing_parts(&d, rect, v, s) {
+                let color = if selected { amber() } else { part.color.unwrap_or_else(theme::cyan) };
+                let stroke = Stroke::new(if selected { 2.0 } else { 1.3 }, color);
+                match part.shape {
                     Shape::Segment(a, b) => {
-                        p.line_segment([pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32)], stroke);
-                        if let Some(l) = label {
-                            p.text(
-                                pos2(a[0] as f32 + 3.0, a[1] as f32 - 1.0),
-                                Align2::LEFT_BOTTOM,
-                                l,
-                                mono(10.0),
-                                color,
-                            );
-                        }
-                        if selected && d.tool == Tool::Trendline {
-                            for q in [a, b] {
-                                p.circle_filled(pos2(q[0] as f32, q[1] as f32), 3.5, amber());
-                            }
+                        let pts = [pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32)];
+                        if part.dashed {
+                            p.extend(egui::Shape::dashed_line(&pts, stroke, 5.0, 4.0));
+                        } else {
+                            p.line_segment(pts, stroke);
                         }
                     }
                     Shape::HLine(y) => {
                         p.hline(rect.x_range(), y as f32, stroke);
-                        if let Some(l) = label {
-                            p.text(
-                                pos2(rect.right() - 4.0, y as f32 - 1.0),
-                                Align2::RIGHT_BOTTOM,
-                                l,
-                                mono(10.0),
-                                color,
-                            );
-                        }
                     }
                     Shape::VLine(x) => {
                         p.vline(x as f32, rect.y_range(), stroke);
                     }
+                    Shape::Rect(a, b) => {
+                        let r = Rect::from_two_pos(pos2(a[0] as f32, a[1] as f32), pos2(b[0] as f32, b[1] as f32));
+                        if let Some(f) = part.fill {
+                            p.rect_filled(r, 0.0, f);
+                        }
+                        p.rect_stroke(r, 0.0, Stroke::new(stroke.width * 0.8, color), StrokeKind::Middle);
+                    }
+                }
+                if let Some((label, pos, align)) = part.label {
+                    p.text(pos, align, label, mono(10.0), color);
+                }
+            }
+            if selected {
+                // Handles on the placed points.
+                for a in [Some(d.a), (d.tool.points() > 1).then_some(d.b), d.c].into_iter().flatten() {
+                    let q =
+                        pos2(rect.left() + v.x_of(self.index_of_ts(a.ts)) as f32, rect.top() + s.y_of(a.price) as f32);
+                    p.circle_filled(q, 3.5, amber());
                 }
             }
         }

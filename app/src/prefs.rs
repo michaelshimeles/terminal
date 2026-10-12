@@ -234,6 +234,9 @@ pub enum Action {
     DrawHorizontal,
     DrawVertical,
     DrawFib,
+    DrawHorizontalRay,
+    DrawCrossLine,
+    DrawingToolbar,
     ResetView,
     LogScale,
     Magnet,
@@ -249,7 +252,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 49] = [
+    pub const ALL: [Action; 52] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -287,6 +290,9 @@ impl Action {
         Action::DrawHorizontal,
         Action::DrawVertical,
         Action::DrawFib,
+        Action::DrawHorizontalRay,
+        Action::DrawCrossLine,
+        Action::DrawingToolbar,
         Action::ResetView,
         Action::LogScale,
         Action::Magnet,
@@ -341,6 +347,9 @@ impl Action {
             Action::DrawHorizontal => "Draw horizontal line".into(),
             Action::DrawVertical => "Draw vertical line".into(),
             Action::DrawFib => "Draw Fibonacci retracement".into(),
+            Action::DrawHorizontalRay => "Draw horizontal ray".into(),
+            Action::DrawCrossLine => "Draw cross line".into(),
+            Action::DrawingToolbar => "Show or hide the drawing toolbar".into(),
             Action::ResetView => "Reset chart view".into(),
             Action::LogScale => "Toggle log scale".into(),
             Action::Magnet => "Toggle magnet".into(),
@@ -369,6 +378,9 @@ impl Action {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::DrawHorizontalRay
+            | A::DrawCrossLine
+            | A::DrawingToolbar
             | A::ResetView
             | A::LogScale
             | A::Magnet => "Chart",
@@ -560,6 +572,9 @@ impl Default for Keymap {
         bind(Action::DrawHorizontal, "Alt+H");
         bind(Action::DrawVertical, "Alt+V");
         bind(Action::DrawFib, "Alt+F");
+        bind(Action::DrawHorizontalRay, "Alt+J");
+        bind(Action::DrawCrossLine, "Alt+C");
+        bind(Action::DrawingToolbar, "Alt+D");
         bind(Action::ResetView, "Alt+R");
         bind(Action::LogScale, "Alt+L");
         bind(Action::Magnet, "Alt+M");

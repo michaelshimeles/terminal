@@ -81,6 +81,13 @@ impl Viewport {
         self.right = idx + (self.width_px - anchor_x) / self.bar_px;
     }
 
+    /// Fit the bar-index span between `a` and `b` (either order) to the plot width,
+    /// with its left end at the left edge.
+    pub fn fit_range(&mut self, a: f64, b: f64) {
+        self.bar_px = (self.width_px / (a - b).abs().max(2.0)).clamp(MIN_BAR_PX, MAX_BAR_PX);
+        self.right = a.min(b) + self.visible_bars();
+    }
+
     pub fn set_width(&mut self, width_px: f64) {
         // Keep the right edge pinned, like resizing a terminal pane.
         self.width_px = width_px.max(1.0);
@@ -172,6 +179,19 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn fit_range_spans_the_width() {
+        let mut v = Viewport { right: 100.0, bar_px: 10.0, width_px: 500.0 };
+        v.fit_range(80.0, 30.0);
+        assert!(close(v.bar_px, 10.0));
+        assert!(close(v.left(), 30.0));
+        assert!(close(v.right, 80.0));
+        // A tiny span keeps at least two bars and never exceeds the zoom limit.
+        v.fit_range(40.0, 40.0);
+        assert!(close(v.bar_px, MAX_BAR_PX.min(250.0)));
+        assert!(close(v.left(), 40.0));
     }
 
     #[test]

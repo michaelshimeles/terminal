@@ -245,6 +245,10 @@ impl PaneKind {
                 show_volume: c.show_volume,
                 show_congress: c.show_congress,
                 magnet: c.magnet,
+                toolbar: c.toolbar_open,
+                keep_drawing: c.keep_drawing,
+                lock_drawings: c.lock_drawings,
+                hide_drawings: c.hide_drawings,
             },
             PaneKind::Feed { filter } => {
                 PaneSettings::Feed((*filter != FeedFilter::default()).then(|| (*filter).into()))
@@ -289,6 +293,10 @@ impl PaneKind {
                 show_volume,
                 show_congress,
                 magnet,
+                toolbar,
+                keep_drawing,
+                lock_drawings,
+                hide_drawings,
             } => {
                 let mut c = ChartState::new(0, &symbol, tf);
                 c.chart_type = chart_type;
@@ -299,6 +307,10 @@ impl PaneKind {
                 c.show_volume = show_volume;
                 c.show_congress = show_congress;
                 c.magnet = magnet;
+                c.toolbar_open = toolbar;
+                c.keep_drawing = keep_drawing;
+                c.lock_drawings = lock_drawings;
+                c.hide_drawings = hide_drawings;
                 PaneKind::Chart(Box::new(c))
             }
             PaneSettings::Feed(f) => PaneKind::Feed { filter: f.map(Into::into).unwrap_or_default() },
@@ -770,6 +782,7 @@ impl TerminalApp {
             Function::Draw(t) => self.with_chart(|c, _| c.start_tool(t)),
             Function::ClearDrawings => self.with_chart(|c, _| c.drawings.clear()),
             Function::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),
+            Function::DrawingToolbar => self.with_chart(|c, _| c.toolbar_open = !c.toolbar_open),
             Function::Congress => self.open_panel(PaneKind::Feed { filter: FeedFilter::default() }),
             Function::Politician(q) if q.trim().is_empty() => self.open_panel(PaneKind::Politicians),
             Function::Politician(q) => self.open_panel(PaneKind::Profile { query: q, data: None, loading: true }),
@@ -1193,6 +1206,9 @@ impl TerminalApp {
             | A::DrawHorizontal
             | A::DrawVertical
             | A::DrawFib
+            | A::DrawHorizontalRay
+            | A::DrawCrossLine
+            | A::DrawingToolbar
             | A::ResetView
             | A::LogScale
             | A::Magnet => self.focused_is_chart(),
@@ -1237,6 +1253,9 @@ impl TerminalApp {
             A::DrawHorizontal => self.with_chart(|c, _| c.start_tool(Tool::Horizontal)),
             A::DrawVertical => self.with_chart(|c, _| c.start_tool(Tool::Vertical)),
             A::DrawFib => self.with_chart(|c, _| c.start_tool(Tool::Fib)),
+            A::DrawHorizontalRay => self.with_chart(|c, _| c.start_tool(Tool::HorizontalRay)),
+            A::DrawCrossLine => self.with_chart(|c, _| c.start_tool(Tool::CrossLine)),
+            A::DrawingToolbar => self.apply(Function::DrawingToolbar),
             A::ResetView => self.with_chart(|c, _| c.reset_view()),
             A::LogScale => self.with_chart(|c, _| c.log = !c.log),
             A::Magnet => self.with_chart(|c, _| c.magnet = !c.magnet),

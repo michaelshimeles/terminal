@@ -287,6 +287,9 @@ impl TerminalApp {
                     (&["SMA 50", "EMA 20", "BB 20 2", "RSI", "MACD", "VWAP"], "Toggle indicators (CLEAR removes all)"),
                     (&["CMP MSFT"], "Compare, rebased to the main symbol"),
                     (&["TL", "HL", "VL", "FIB", "MAGNET"], "Drawing tools and snapping"),
+                    (&["RAY", "HRAY", "CROSS", "CHANNEL", "FIBEXT", "RECT"], "More drawing tools"),
+                    (&["LONG", "SHORT", "MEASURE"], "Position (entry, target, stop) and measure"),
+                    (&["TOOLS", "CLEAR DRAW"], "Drawing toolbar · remove all drawings"),
                 ],
             );
             para(

@@ -172,6 +172,8 @@ pub enum Function {
     Range(Range),
     Draw(Tool),
     ClearDrawings,
+    /// Show or hide the focused chart's drawing toolbar.
+    DrawingToolbar,
     Magnet,
     /// Congress trades: feed when used alone, per-ticker list after a symbol.
     Congress,
@@ -259,6 +261,17 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "HL" | "HLINE" => Function::Draw(Tool::Horizontal),
         "VL" | "VLINE" => Function::Draw(Tool::Vertical),
         "FIB" => Function::Draw(Tool::Fib),
+        "RAY" => Function::Draw(Tool::Ray),
+        "EXTLINE" | "EXTENDED" => Function::Draw(Tool::ExtendedLine),
+        "HRAY" => Function::Draw(Tool::HorizontalRay),
+        "CROSS" | "CROSSLINE" => Function::Draw(Tool::CrossLine),
+        "CHANNEL" => Function::Draw(Tool::ParallelChannel),
+        "FIBEXT" => Function::Draw(Tool::FibExtension),
+        "RECT" | "RECTANGLE" => Function::Draw(Tool::Rectangle),
+        "LONG" => Function::Draw(Tool::LongPosition),
+        "SHORT" => Function::Draw(Tool::ShortPosition),
+        "MEASURE" | "RULER" => Function::Draw(Tool::Measure),
+        "TOOLS" | "TOOLBAR" | "DRAWBAR" => Function::DrawingToolbar,
         "MAGNET" | "MAG" => Function::Magnet,
         "CONG" | "CONGRESS" => Function::Congress,
         "POL" | "PROFILE" => Function::Politician(joined()),
@@ -377,6 +390,7 @@ fn describe(f: &Function) -> String {
         Function::Range(r) => format!("Show {} at {}", r.label(), r.timeframe()),
         Function::Draw(t) => format!("Draw {}", t.label()),
         Function::ClearDrawings => "Remove all drawings".into(),
+        Function::DrawingToolbar => "Show or hide the drawing toolbar".into(),
         Function::Magnet => "Toggle magnet (snap to OHLC)".into(),
         Function::Congress => "Congressional trades".into(),
         Function::Politician(n) => format!("Politician profile: {n}"),
@@ -475,6 +489,12 @@ mod tests {
         assert_eq!(parse("CMP"), Some(Command::Function(Function::Compare(None))));
         assert_eq!(parse("FIB"), Some(Command::Function(Function::Draw(Tool::Fib))));
         assert_eq!(parse("CLEAR DRAW"), Some(Command::Function(Function::ClearDrawings)));
+        assert_eq!(parse("hray"), Some(Command::Function(Function::Draw(Tool::HorizontalRay))));
+        assert_eq!(parse("CHANNEL"), Some(Command::Function(Function::Draw(Tool::ParallelChannel))));
+        assert_eq!(parse("FIBEXT"), Some(Command::Function(Function::Draw(Tool::FibExtension))));
+        assert_eq!(parse("LONG"), Some(Command::Function(Function::Draw(Tool::LongPosition))));
+        assert_eq!(parse("RULER"), Some(Command::Function(Function::Draw(Tool::Measure))));
+        assert_eq!(parse("TOOLS"), Some(Command::Function(Function::DrawingToolbar)));
         assert_eq!(parse("POL Nancy Pelosi"), Some(Command::Function(Function::Politician("Nancy Pelosi".into()))));
         assert_eq!(
             parse("WL ADD msft nvda"),
