@@ -53,7 +53,15 @@ if [ "$notarize" = 1 ]; then
 fi
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# A failure while the DMG's writable image is mounted would otherwise leave it attached, and
+# rm -rf would delete into it.
+cleanup() {
+  if [ -d "$tmp/mnt" ] && [ "$(stat -f %d "$tmp/mnt")" != "$(stat -f %d "$tmp")" ]; then
+    hdiutil detach -force "$tmp/mnt" >/dev/null || { echo "left $tmp/rw.dmg mounted at $tmp/mnt" >&2; return; }
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 # Submits $1, waits for Apple's verdict, then staples the ticket to $2.
 notarize() {
