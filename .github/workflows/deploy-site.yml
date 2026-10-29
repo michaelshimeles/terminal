@@ -1,0 +1,121 @@
+name: deploy site
+
+# Builds the browser app with scripts/build-web.sh and deploys the site with it to Vercel:
+# production on every push to master, a preview for each pull request. Vercel's own Git
+# deployments are off (site/vercel.json) because Vercel's build doesn't run Rust.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Production runs queue instead of cancelling each other, so the newest commit always deploys
+# last. A new push to a pull request cancels the preview run for the old one.
+concurrency:
+  group: deploy-site-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wasm:
+    name: Build the browser app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Pull requests build the branch head, like Vercel's Git previews did, not the merge commit.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Read the wasm-bindgen version from Cargo.lock
+        id: lock
+        run: echo "wasm-bindgen=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.lock.outputs.wasm-bindgen }}
+      - name: Install wasm-opt (binaryen)
+        env:
+          BINARYEN: version_133
+          SHA256: 2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489
+        run: |
+          curl -sSfLo "$RUNNER_TEMP/binaryen.tar.gz" "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN/binaryen-$BINARYEN-x86_64-linux.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/binaryen.tar.gz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-$BINARYEN/bin" >> "$GITHUB_PATH"
+      - run: scripts/build-web.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-app
+          path: site/static/app
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Vercel
+    needs: wasm
+    # Pull requests from forks get no secrets, so they stop after the build.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    environment:
+      name: ${{ github.ref == 'refs/heads/master' && 'production' || 'preview' }}
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      TARGET: ${{ github.ref == 'refs/heads/master' && 'production' || 'preview' }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - name: Check the Vercel secrets
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          missing=0
+          for name in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The $name repository secret is not set (see site/README.md)"
+              missing=1
+            fi
+          done
+          exit $missing
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-app
+          path: site/static/app
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm install --global vercel@65.7.0
+      # Run from the repository root, because the Vercel project's Root Directory is site/.
+      - name: Pull the project settings and environment variables
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel pull --yes --environment="$TARGET" --token="$VERCEL_TOKEN"
+      # The build gets no token, since it runs the site's npm install and build scripts.
+      - name: Build
+        run: |
+          if [ "$TARGET" = production ]; then vercel build --prod; else vercel build; fi
+          test -f .vercel/output/static/app/index.html
+      - name: Deploy
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ "$TARGET" = production ]; then
+            url=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          else
+            url=$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Deployed $TARGET: $url ($url/app)" >> "$GITHUB_STEP_SUMMARY"

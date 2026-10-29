@@ -212,6 +212,9 @@ cd site && npm run dev                                      # then open http://l
 
 `scripts/build-web.sh <dir>` writes somewhere else instead; any static file server works. Add
 `?sample` to the URL to run offline on sample data, or `?fps` for the frame-time readout.
+Every push to `master` builds it and deploys it with the site to
+[terminal.rasmic.xyz/app](https://terminal.rasmic.xyz/app). Pull requests get a preview;
+[site/README.md](site/README.md#deploys) covers the workflow and the secrets it needs.
 
 ![The browser build in Chrome: a live BTCUSD chart from Binance beside a demo-account position](docs/img/web-live-crypto.png)
 
