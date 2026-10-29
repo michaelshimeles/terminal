@@ -2,9 +2,12 @@
 //!
 //! The partner keys (`clientId`, `consumerKey`) and the per-user `userId`/`userSecret` are
 //! stored together as one small JSON document: in the macOS Keychain (generic password,
-//! service `terminal-rs`, account `snaptrade`), or elsewhere in an owner-only (0600) file in
+//! service `terminal`, account `snaptrade`), or elsewhere in an owner-only (0600) file in
 //! the app's data directory. `SNAPTRADE_*` environment variables override stored values
 //! field by field. Nothing is ever written inside the repository.
+//!
+//! Before the app was renamed from terminal-rs, the Keychain service was `terminal-rs`; the
+//! first load moves credentials from there.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -12,7 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const KEYCHAIN_SERVICE: &str = "terminal-rs";
+pub const KEYCHAIN_SERVICE: &str = "terminal";
+/// The service credentials were saved under before the rename.
+pub const LEGACY_KEYCHAIN_SERVICE: &str = "terminal-rs";
 pub const KEYCHAIN_ACCOUNT: &str = "snaptrade";
 
 /// Environment variables that override stored credentials.
@@ -102,8 +107,8 @@ pub fn mask(secret: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
-    /// macOS Keychain generic password.
-    Keychain,
+    /// macOS Keychain generic password under `service`, moved there from `legacy` on first load.
+    Keychain { service: String, legacy: Option<String> },
     /// Owner-only JSON file.
     File(PathBuf),
 }
@@ -119,8 +124,17 @@ impl SecretStore {
     pub fn platform(data_dir: &Path) -> Self {
         let file = Backend::File(data_dir.join("secrets").join("snaptrade.json"));
         let force_file = std::env::var("TR_SECRET_STORE").is_ok_and(|v| v.eq_ignore_ascii_case("file"));
-        let backend = if cfg!(target_os = "macos") && !force_file { Backend::Keychain } else { file };
+        let backend = if cfg!(target_os = "macos") && !force_file {
+            Backend::Keychain { service: KEYCHAIN_SERVICE.into(), legacy: Some(LEGACY_KEYCHAIN_SERVICE.into()) }
+        } else {
+            file
+        };
         Self { backend }
+    }
+
+    /// The Keychain under `service`, taking over an item left under `legacy`.
+    pub fn keychain(service: &str, legacy: Option<&str>) -> Self {
+        Self { backend: Backend::Keychain { service: service.into(), legacy: legacy.map(Into::into) } }
     }
 
     pub fn file(path: impl Into<PathBuf>) -> Self {
@@ -130,14 +144,14 @@ impl SecretStore {
     /// Where credentials live, for the settings screen.
     pub fn describe(&self) -> String {
         match &self.backend {
-            Backend::Keychain => format!("macOS Keychain ({KEYCHAIN_SERVICE} / {KEYCHAIN_ACCOUNT})"),
+            Backend::Keychain { service, .. } => format!("macOS Keychain ({service} / {KEYCHAIN_ACCOUNT})"),
             Backend::File(p) => format!("{} (owner-only)", p.display()),
         }
     }
 
     pub fn load(&self) -> Result<Option<Credentials>> {
         let text = match &self.backend {
-            Backend::Keychain => keychain::get()?,
+            Backend::Keychain { service, legacy } => load_keychain(service, legacy.as_deref())?,
             Backend::File(p) => match std::fs::read_to_string(p) {
                 Ok(t) => Some(t),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -155,7 +169,7 @@ impl SecretStore {
     pub fn save(&self, creds: &Credentials) -> Result<()> {
         let json = serde_json::to_string(&creds.trimmed())?;
         match &self.backend {
-            Backend::Keychain => keychain::set(&json),
+            Backend::Keychain { service, .. } => keychain::set(service, &json),
             Backend::File(p) => write_private(p, &json),
         }
     }
@@ -163,13 +177,35 @@ impl SecretStore {
     /// Remove stored credentials (environment variables are unaffected).
     pub fn clear(&self) -> Result<()> {
         match &self.backend {
-            Backend::Keychain => keychain::delete(),
+            Backend::Keychain { service, legacy } => {
+                keychain::delete(service)?;
+                // The old item too, or the credentials would come back from it on the next load.
+                legacy.as_deref().map_or(Ok(()), keychain::delete)
+            }
             Backend::File(p) => match std::fs::remove_file(p) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
                 _ => Ok(()),
             },
         }
     }
+}
+
+/// Reads the Keychain item under `service`. If there is none, the item under `legacy` moves
+/// there: it is deleted only after the copy is written, so a failed move leaves it in place.
+fn load_keychain(service: &str, legacy: Option<&str>) -> Result<Option<String>> {
+    if let Some(text) = keychain::get(service)? {
+        return Ok(Some(text));
+    }
+    let Some(legacy) = legacy else { return Ok(None) };
+    let Some(text) = keychain::get(legacy)? else { return Ok(None) };
+    match keychain::set(service, &text) {
+        Ok(()) => match keychain::delete(legacy) {
+            Ok(()) => tracing::info!("moved SnapTrade credentials from Keychain service {legacy} to {service}"),
+            Err(e) => tracing::warn!("removing SnapTrade credentials from Keychain service {legacy}: {e:#}"),
+        },
+        Err(e) => tracing::warn!("moving SnapTrade credentials to Keychain service {service}: {e:#}"),
+    }
+    Ok(Some(text))
 }
 
 /// Write `text` to `path` readable only by the owner (0700 directory, 0600 file), replacing it
@@ -204,26 +240,26 @@ mod keychain {
     use anyhow::{Context, Result};
     use security_framework::passwords::{delete_generic_password, get_generic_password, set_generic_password};
 
-    use super::{KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE};
+    use super::KEYCHAIN_ACCOUNT;
 
     /// `errSecItemNotFound`.
     const NOT_FOUND: i32 = -25300;
 
-    pub fn get() -> Result<Option<String>> {
-        match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+    pub fn get(service: &str) -> Result<Option<String>> {
+        match get_generic_password(service, KEYCHAIN_ACCOUNT) {
             Ok(bytes) => Ok(Some(String::from_utf8(bytes).context("Keychain item is not UTF-8")?)),
             Err(e) if e.code() == NOT_FOUND => Ok(None),
             Err(e) => Err(anyhow::anyhow!("reading the Keychain: {e}")),
         }
     }
 
-    pub fn set(value: &str) -> Result<()> {
-        set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, value.as_bytes())
+    pub fn set(service: &str, value: &str) -> Result<()> {
+        set_generic_password(service, KEYCHAIN_ACCOUNT, value.as_bytes())
             .map_err(|e| anyhow::anyhow!("writing the Keychain: {e}"))
     }
 
-    pub fn delete() -> Result<()> {
-        match delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+    pub fn delete(service: &str) -> Result<()> {
+        match delete_generic_password(service, KEYCHAIN_ACCOUNT) {
             Err(e) if e.code() != NOT_FOUND => Err(anyhow::anyhow!("deleting from the Keychain: {e}")),
             _ => Ok(()),
         }
@@ -234,13 +270,13 @@ mod keychain {
 mod keychain {
     use anyhow::{Result, bail};
 
-    pub fn get() -> Result<Option<String>> {
+    pub fn get(_: &str) -> Result<Option<String>> {
         bail!("the Keychain is only available on macOS")
     }
-    pub fn set(_: &str) -> Result<()> {
+    pub fn set(_: &str, _: &str) -> Result<()> {
         bail!("the Keychain is only available on macOS")
     }
-    pub fn delete() -> Result<()> {
+    pub fn delete(_: &str) -> Result<()> {
         bail!("the Keychain is only available on macOS")
     }
 }
@@ -253,7 +289,7 @@ mod tests {
         Credentials {
             client_id: "PARTNER-ID".into(),
             consumer_key: "consumer-key-0123456789".into(),
-            user_id: "terminal-rs-1".into(),
+            user_id: "terminal-1".into(),
             user_secret: "user-secret-abcdef".into(),
         }
     }
@@ -312,5 +348,32 @@ mod tests {
         store.clear().unwrap();
         assert_eq!(store.load().unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes throwaway items (dummy credentials) to the login Keychain, so it runs only when
+    /// asked: `cargo test -p tr-broker -- --ignored keychain`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes to the login Keychain"]
+    fn keychain_moves_credentials_from_the_old_service() {
+        let pid = std::process::id();
+        let (service, legacy) = (format!("terminal-test-{pid}"), format!("terminal-rs-test-{pid}"));
+        let store = SecretStore::keychain(&service, Some(&legacy));
+        let new_only = SecretStore::keychain(&service, None);
+        let old_only = SecretStore::keychain(&legacy, None);
+        old_only.save(&creds()).unwrap();
+
+        assert_eq!(store.load().unwrap(), Some(creds()), "found under the old service");
+        assert_eq!(new_only.load().unwrap(), Some(creds()), "and moved to the new one");
+        assert_eq!(old_only.load().unwrap(), None, "the old item is gone");
+
+        // A stale item under the old service never replaces what the new one holds.
+        old_only.save(&Credentials { client_id: "STALE".into(), ..creds() }).unwrap();
+        assert_eq!(store.load().unwrap(), Some(creds()));
+
+        // Forgetting credentials removes both, so the old item can't bring them back.
+        store.clear().unwrap();
+        assert_eq!(old_only.load().unwrap(), None);
+        assert_eq!(store.load().unwrap(), None);
     }
 }

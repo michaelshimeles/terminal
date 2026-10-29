@@ -7,7 +7,7 @@ export const MIN_MACOS = '11';
 export const NAME = 'Terminal';
 /** `static/robots.txt` and `static/sitemap.xml` repeat this origin. */
 export const SITE_URL = 'https://terminal.rasmic.xyz';
-export const REPO_URL = 'https://github.com/michaelshimeles/terminal-rs';
+export const REPO_URL = 'https://github.com/michaelshimeles/terminal';
 export const DOWNLOAD_URL = `${REPO_URL}/releases/latest/download/Terminal.dmg`;
 
 export const TITLE = `${NAME}: a fast market terminal for the Mac`;

@@ -37,7 +37,7 @@ npm run check
   plus the name, title and description used by the page's metadata. Update it with each release.
   `static/robots.txt` and `static/sitemap.xml` repeat the site URL.
 - `src/routes/download/+server.ts` answers `GET /download` with a 302 to
-  `https://github.com/michaelshimeles/terminal-rs/releases/latest/download/Terminal.dmg`.
+  `https://github.com/michaelshimeles/terminal/releases/latest/download/Terminal.dmg`.
   That URL works only once a GitHub release includes an asset named exactly `Terminal.dmg`.
 - The download buttons open `src/lib/DownloadDialog.svelte`, which asks for an email, sends it to
   `POST /download`, then starts the download with `GET /download`. The browser remembers that it

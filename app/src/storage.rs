@@ -11,9 +11,86 @@ use std::path::{Path, PathBuf};
 
 pub use imp::*;
 
+/// Saved documents keyed by path, as the browser keeps them.
+#[cfg(any(target_arch = "wasm32", test))]
+trait KeyStore {
+    fn keys(&self) -> Vec<String>;
+    fn get(&self, key: &str) -> Option<String>;
+    /// False when the store refuses the write (full or blocked).
+    fn set(&mut self, key: &str, value: &str) -> bool;
+    fn remove(&mut self, key: &str);
+}
+
+/// Copies every key under `old/` to the same path under `new/`, once. Returns whether to use
+/// `new`. Keys already under `new/` are never overwritten, and the old keys stay as they are. A
+/// marker key records that the copy finished, so a file deleted afterwards doesn't come back on
+/// the next load. If the store refuses a write, the copies made so far are removed and this
+/// returns false, so the page keeps its complete old set and the next load tries again.
+#[cfg(any(target_arch = "wasm32", test))]
+fn copy_keys(store: &mut impl KeyStore, old: &str, new: &str) -> bool {
+    let marker = format!("{new}/.migrated");
+    if store.get(&marker).is_some() {
+        return true;
+    }
+    let keys: Vec<(String, String)> = store
+        .keys()
+        .into_iter()
+        .filter_map(|k| Some((format!("{new}/{}", k.strip_prefix(old)?.strip_prefix('/')?), k)))
+        .collect();
+    if keys.is_empty() {
+        return true;
+    }
+    let mut copied = Vec::new();
+    let mut ok = true;
+    for (to, from) in keys {
+        if store.get(&to).is_some() {
+            continue;
+        }
+        let Some(value) = store.get(&from) else { continue };
+        if !store.set(&to, &value) {
+            ok = false;
+            break;
+        }
+        copied.push(to);
+    }
+    if ok && store.set(&marker, old) {
+        tracing::info!("copied {} saved files from {old}/ to {new}/", copied.len());
+        return true;
+    }
+    for k in &copied {
+        store.remove(k);
+    }
+    tracing::warn!("browser storage refused copying saved files from {old}/ to {new}/; using {old}/ for now");
+    false
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use super::*;
+
+    /// Moves the data folder from `old` (its name before the app was renamed) to `new` the first
+    /// time, and leaves a link at the old path so builds that still use the old name find the
+    /// same files. Returns the folder to use: `new`, or `old` if it couldn't be moved. Never
+    /// replaces an existing `new`.
+    pub fn migrate(old: &Path, new: &Path) -> PathBuf {
+        if new.exists() || !old.is_dir() {
+            return new.to_path_buf();
+        }
+        if let Err(e) = std::fs::rename(old, new) {
+            // Another copy of the app may have moved it first.
+            if new.is_dir() {
+                return new.to_path_buf();
+            }
+            tracing::warn!("could not move {} to {} ({e}); using it where it is", old.display(), new.display());
+            return old.to_path_buf();
+        }
+        tracing::info!("moved {} to {}", old.display(), new.display());
+        #[cfg(unix)]
+        if let Err(e) = std::os::unix::fs::symlink(new, old) {
+            tracing::warn!("linking {} to {}: {e}", old.display(), new.display());
+        }
+        new.to_path_buf()
+    }
 
     pub fn read(path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
@@ -77,6 +154,28 @@ mod imp {
 
     fn key(path: &Path) -> String {
         path.to_string_lossy().into_owned()
+    }
+
+    impl KeyStore for web_sys::Storage {
+        fn keys(&self) -> Vec<String> {
+            (0..self.length().unwrap_or(0)).filter_map(|i| self.key(i).ok().flatten()).collect()
+        }
+        fn get(&self, key: &str) -> Option<String> {
+            self.get_item(key).ok().flatten()
+        }
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            self.set_item(key, value).is_ok()
+        }
+        fn remove(&mut self, key: &str) {
+            let _ = self.remove_item(key);
+        }
+    }
+
+    /// Copies what the page saved under `old/` (its prefix before the app was renamed) to
+    /// `new/`, once (see [`copy_keys`]). Returns the prefix to use.
+    pub fn migrate(old: &Path, new: &Path) -> PathBuf {
+        let Ok(mut s) = store() else { return new.to_path_buf() };
+        if copy_keys(&mut s, &key(old), &key(new)) { new.to_path_buf() } else { old.to_path_buf() }
     }
 
     pub fn read(path: &Path) -> io::Result<Vec<u8>> {
@@ -169,5 +268,141 @@ mod tests {
         remove(&b).unwrap();
         assert!(list(&dir.join("sub")).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tr-migrate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn migrate_moves_the_old_folder_and_links_it() {
+        let root = scratch("move");
+        let (old, new) = (root.join("terminal-rs"), root.join("terminal"));
+        write_atomic(&old.join("layouts/Desk.json"), b"{}").unwrap();
+        assert_eq!(migrate(&old, &new), new);
+        assert_eq!(read(&new.join("layouts/Desk.json")).unwrap(), b"{}");
+        #[cfg(unix)]
+        {
+            assert!(old.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(read(&old.join("layouts/Desk.json")).unwrap(), b"{}", "old builds still find the files");
+        }
+        // Later launches find the new folder and leave everything as it is.
+        write_atomic(&new.join("settings.json"), b"[]").unwrap();
+        assert_eq!(migrate(&old, &new), new);
+        assert_eq!(read(&new.join("settings.json")).unwrap(), b"[]");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migrate_never_replaces_an_existing_folder() {
+        let root = scratch("keep");
+        let (old, new) = (root.join("terminal-rs"), root.join("terminal"));
+        write_atomic(&old.join("settings.json"), b"old").unwrap();
+        write_atomic(&new.join("settings.json"), b"new").unwrap();
+        assert_eq!(migrate(&old, &new), new);
+        assert_eq!(read(&new.join("settings.json")).unwrap(), b"new");
+        assert_eq!(read(&old.join("settings.json")).unwrap(), b"old", "the old folder is left alone");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migrate_without_an_old_folder_creates_nothing() {
+        let root = scratch("fresh");
+        let (old, new) = (root.join("terminal-rs"), root.join("terminal"));
+        assert_eq!(migrate(&old, &new), new);
+        assert!(!old.exists() && !new.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_keeps_using_the_old_folder_when_it_cannot_move() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("stuck");
+        let (old, new) = (root.join("terminal-rs"), root.join("terminal"));
+        write_atomic(&old.join("settings.json"), b"{}").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::create_dir(root.join("probe")).is_ok() {
+            // Running as root, where a read-only folder doesn't stop the move.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let used = migrate(&old, &new);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(used, old);
+        assert_eq!(read(&old.join("settings.json")).unwrap(), b"{}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `localStorage` stand-in: a map that refuses writes once it holds `room` keys.
+    struct Keys {
+        map: std::collections::BTreeMap<String, String>,
+        room: usize,
+    }
+
+    impl Keys {
+        fn new(entries: &[(&str, &str)]) -> Self {
+            Self { map: entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), room: usize::MAX }
+        }
+    }
+
+    impl KeyStore for Keys {
+        fn keys(&self) -> Vec<String> {
+            self.map.keys().cloned().collect()
+        }
+        fn get(&self, key: &str) -> Option<String> {
+            self.map.get(key).cloned()
+        }
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            if !self.map.contains_key(key) && self.map.len() >= self.room {
+                return false;
+            }
+            self.map.insert(key.into(), value.into());
+            true
+        }
+        fn remove(&mut self, key: &str) {
+            self.map.remove(key);
+        }
+    }
+
+    #[test]
+    fn copy_keys_copies_once_without_overwriting() {
+        let mut s = Keys::new(&[
+            ("terminal-rs/settings.json", "old settings"),
+            ("terminal-rs/layouts/Desk.json", "desk"),
+            ("terminal/settings.json", "newer settings"),
+            ("other-site-key", "untouched"),
+        ]);
+        assert!(copy_keys(&mut s, "terminal-rs", "terminal"));
+        assert_eq!(s.get("terminal/settings.json").as_deref(), Some("newer settings"), "newer data wins");
+        assert_eq!(s.get("terminal/layouts/Desk.json").as_deref(), Some("desk"));
+        assert_eq!(s.get("terminal-rs/layouts/Desk.json").as_deref(), Some("desk"), "the old keys stay");
+        assert_eq!(s.get("other-site-key").as_deref(), Some("untouched"));
+        // A layout deleted after the copy doesn't come back on the next load.
+        s.remove("terminal/layouts/Desk.json");
+        assert!(copy_keys(&mut s, "terminal-rs", "terminal"));
+        assert_eq!(s.get("terminal/layouts/Desk.json"), None);
+    }
+
+    #[test]
+    fn copy_keys_undoes_a_partial_copy() {
+        let mut s = Keys::new(&[("terminal-rs/a.json", "a"), ("terminal-rs/b.json", "b")]);
+        s.room = 3;
+        assert!(!copy_keys(&mut s, "terminal-rs", "terminal"), "storage is full: keep using the old keys");
+        assert_eq!(s.keys(), ["terminal-rs/a.json", "terminal-rs/b.json"]);
+        s.room = usize::MAX;
+        assert!(copy_keys(&mut s, "terminal-rs", "terminal"));
+        assert_eq!(s.get("terminal/b.json").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn copy_keys_with_nothing_saved_writes_nothing() {
+        let mut s = Keys::new(&[]);
+        assert!(copy_keys(&mut s, "terminal-rs", "terminal"));
+        assert!(s.keys().is_empty());
     }
 }

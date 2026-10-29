@@ -1,6 +1,6 @@
 [package]
 name = "tr-macos"
-description = "macOS window chrome for terminal-rs: unified toolbar, vibrancy, accent colour, updates"
+description = "macOS window chrome for Terminal: unified toolbar, vibrancy, accent colour, updates"
 version.workspace = true
 edition.workspace = true
 

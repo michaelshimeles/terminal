@@ -1,9 +1,9 @@
 [package]
-name = "terminal-rs"
+name = "terminal"
 description = "Bloomberg-style trading terminal with GPU charts and congressional trade tracking"
 version.workspace = true
 edition.workspace = true
-default-run = "terminal-rs"
+default-run = "terminal"
 
 [features]
 # Browser build only: add wgpu's WebGL2 backend for browsers without WebGPU (about 1 MB more,

@@ -1,4 +1,4 @@
-//! GPU chart rendering for terminal-rs.
+//! GPU chart rendering for Terminal.
 //!
 //! - [`viewport`]: bar-index/price <-> pixel math, pan and zoom.
 //! - [`lod`]: level-of-detail pyramids that bound per-frame work to the plot width.

@@ -1,6 +1,6 @@
 [package]
 name = "tr-core"
-description = "Core market types, timeframes, indicators and sample data for terminal-rs"
+description = "Core market types, timeframes, indicators and sample data for Terminal"
 version.workspace = true
 edition.workspace = true
 

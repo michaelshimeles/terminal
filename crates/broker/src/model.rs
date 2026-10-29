@@ -46,7 +46,7 @@ pub struct Connection {
     pub disabled: bool,
     pub created: Option<DateTime<Utc>>,
     pub updated: Option<DateTime<Utc>>,
-    /// Whether the connection allows trading (terminal-rs only trades when the user enables it).
+    /// Whether the connection allows trading (Terminal only trades when the user enables it).
     pub trading: bool,
 }
 

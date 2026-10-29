@@ -1,4 +1,4 @@
-# terminal-rs
+# Terminal
 
 A fast, keyboard-driven market terminal in pure Rust: TradingView-class GPU charting with a
 Bloomberg Terminal look (dense tiled panes, monospace numbers, a command line like `AAPL <GO>`)
@@ -9,7 +9,7 @@ systems** and **your own brokerage accounts through [SnapTrade](https://snaptrad
 to Solarized, and a fully dockable
 workspace with saved layouts.
 
-![terminal-rs: AAPL chart with congress trade markers and RSI, the Congress trades feed, world markets and a multi-asset watchlist](docs/img/overview.png)
+![Terminal: AAPL chart with congress trade markers and RSI, the Congress trades feed, world markets and a multi-asset watchlist](docs/img/overview.png)
 
 > **Built from reverse-engineering research.** Chart UX was studied behaviourally on
 > tradingview.com with [REA](https://github.com/morluto/rea) in website mode (passive captures of
@@ -122,7 +122,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
     row in a linked watchlist or world-markets pane loads it into the group.
   - **Saved layouts**: save, name, rename, duplicate, delete and switch (`LAYOUT <name>`, the
     sidebar list, ⌥1…⌥9); the active layout autosaves and is restored on launch. Each layout is a
-    JSON file in `~/Library/Application Support/terminal-rs/layouts` (`$XDG_DATA_HOME` on Linux)
+    JSON file in `~/Library/Application Support/terminal/layouts` (`$XDG_DATA_HOME` on Linux)
     and can be imported or exported (`LAYOUT EXPORT`/`IMPORT`, or Settings › Layouts). Per-pane
     settings (chart type, indicators, drawings, filters, depth, link, tab title) and, optionally,
     the theme (`LAYOUT THEME ON`) save with the layout.
@@ -181,9 +181,12 @@ TR_PROVIDER=sample cargo run --release   # offline
 APCA_API_KEY_ID=… APCA_API_SECRET_KEY=… cargo run --release   # Alpaca
 ```
 
-Data lives in `~/Library/Application Support/terminal-rs` (macOS) or
-`$XDG_DATA_HOME/terminal-rs` (Linux), or `TR_DATA_DIR`. The first congress ingest covers the
-current and previous year (a few minutes; it runs in the background while you work).
+Data lives in `~/Library/Application Support/terminal` (macOS) or
+`$XDG_DATA_HOME/terminal` (Linux), or `TR_DATA_DIR`. Versions from before the project was renamed
+used a `terminal-rs` folder in the same place; the first launch moves it to `terminal` and leaves
+a link at the old path, so builds that still use the old name find the same files. The first
+congress ingest covers the current and previous year (a few minutes; it runs in the background
+while you work).
 `cargo run -p tr-congress --example ingest -- congress.sqlite3` runs one ingest from the CLI.
 
 Appearance: `TR_THEME=light|dark|<theme name>` overrides the saved theme, `TR_MSAA=1|2|4|8` sets
@@ -226,7 +229,9 @@ What the browser build can and can't do yet:
   proxy can fix that later.
 - Congress disclosures, SnapTrade accounts and live order entry need the desktop app. The paper
   trading demo account works.
-- Layouts, settings, themes and the demo account are saved in `localStorage` under `terminal-rs/`.
+- Layouts, settings, themes and the demo account are saved in `localStorage` under `terminal/`.
+  The first load copies anything saved under the old `terminal-rs/` prefix, without overwriting
+  newer entries.
 - Charts need WebGPU, since they read bars from storage buffers in the vertex shader. Browsers
   without a WebGPU adapter get a second, larger build on WebGL2 where everything except the chart
   series works.
@@ -268,8 +273,9 @@ the portal, and **Disconnect** removes a connection and its accounts from SnapTr
 explicit confirmation.
 
 **Where credentials live.** On macOS the client ID, consumer key, user ID and user secret are
-stored together in the **Keychain** (generic password, service `terminal-rs`, account
-`snaptrade`). Elsewhere they go in `<data dir>/secrets/snaptrade.json` with owner-only permissions
+stored together in the **Keychain** (generic password, service `terminal`, account
+`snaptrade`); credentials saved under the old service, `terminal-rs`, move there the first time
+the app reads them. Elsewhere they go in `<data dir>/secrets/snaptrade.json` with owner-only permissions
 (0600 in a 0700 directory). They are never written to the repository, layouts, prefs or logs;
 request errors are scrubbed of the URL (which carries the user secret), and the settings screen
 masks secrets. **Forget Credentials** removes them. `SNAPTRADE_CLIENT_ID`,

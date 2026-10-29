@@ -262,7 +262,7 @@ impl SnapTrade {
             bail!("SnapTrade client ID and consumer key are not set");
         }
         let http = reqwest::Client::builder()
-            .user_agent(concat!("terminal-rs/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("terminal/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .build()?;
         let base = Url::parse(base.trim_end_matches('/')).context("invalid SnapTrade base URL")?;

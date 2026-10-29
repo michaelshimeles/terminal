@@ -1,4 +1,4 @@
-//! terminal-rs: a keyboard-driven, Bloomberg-style market terminal with GPU charts and
+//! Terminal: a keyboard-driven, Bloomberg-style market terminal with GPU charts and
 //! congressional (STOCK Act) trade tracking.
 
 mod anim;
@@ -31,7 +31,7 @@ fn create_app(
     msaa: u32,
     t0: Instant,
 ) -> Result<TerminalApp, Box<dyn std::error::Error + Send + Sync>> {
-    let rs = cc.wgpu_render_state.as_ref().ok_or("terminal-rs requires the wgpu renderer")?;
+    let rs = cc.wgpu_render_state.as_ref().ok_or("Terminal requires the wgpu renderer")?;
     // Charts read their series from storage buffers in the vertex shader. WebGL2 has none,
     // so there chart panes keep their axes and labels but draw no series.
     let charts = rs.adapter.get_downlevel_capabilities().flags.contains(eframe::wgpu::DownlevelFlags::VERTEX_STORAGE);
@@ -81,7 +81,7 @@ fn main() -> eframe::Result {
         .unwrap_or(if cfg!(target_os = "macos") { 4 } else { 1 });
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Terminal")
-        .with_app_id("terminal-rs")
+        .with_app_id("terminal")
         .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("app icon"))
         .with_inner_size([1600.0, 960.0])
         .with_min_inner_size([900.0, 560.0]);
@@ -101,7 +101,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "terminal-rs",
+        "terminal",
         options,
         Box::new(move |cc| Ok(Box::new(create_app(cc, tr_data::from_env(), u32::from(msaa), t0)?))),
     )

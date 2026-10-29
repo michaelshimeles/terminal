@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 
 out="${1:-site/static/app}"
 target=wasm32-unknown-unknown
-wasm="target/$target/web/terminal-rs.wasm"
+wasm="target/$target/web/terminal.wasm"
 
 want=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
 have=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }' || true)
@@ -47,7 +47,7 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 25
 build() {
 	local name=$1 tmp="$out/immutable/.$1" hash
 	shift
-	cargo build --profile web --target "$target" -p terminal-rs "$@"
+	cargo build --profile web --target "$target" -p terminal "$@"
 	wasm-bindgen --target web --no-typescript --out-dir "$tmp" --out-name "$name" "$wasm"
 	wasm-opt -Os "${features[@]}" --strip-debug --strip-producers "$tmp/${name}_bg.wasm" -o "$tmp/${name}_bg.wasm"
 	hash=$(cd "$tmp" && find . -type f | LC_ALL=C sort | xargs cat | sha256 | cut -c 1-16)
