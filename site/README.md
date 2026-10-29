@@ -45,6 +45,24 @@ npm run check
   the download starts anyway.
   Without JavaScript the buttons link straight to `/download`.
 
+## Deploys
+
+GitHub Actions deploys the site, not Vercel's Git integration, because the browser app at `/app`
+is built from Rust and Vercel's build doesn't run Rust. `.github/workflows/deploy-site.yml` runs
+`scripts/build-web.sh`, then `vercel build` and `vercel deploy --prebuilt` from the repository
+root. Pushes to `master` deploy to production. Pull requests from branches in this repository
+get a preview, linked from the pull request; pull requests from forks only build the app.
+`vercel.json` turns off Vercel's own Git deployments, so each commit deploys once.
+
+The workflow reads three repository secrets:
+
+- `VERCEL_TOKEN`: a Vercel access token (Account Settings › Tokens) scoped to the goshen-labs team.
+- `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID`: `orgId` and `projectId` from `.vercel/project.json`,
+  which `vercel link --scope goshen-labs --project terminal` writes.
+
+To redeploy without a new commit, run the workflow from the Actions tab. Run on `master`, it
+deploys to production.
+
 ## Emails
 
 `POST /download` adds each email to the `emails` sorted set in Upstash Redis, scored by when the
