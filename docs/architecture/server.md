@@ -374,34 +374,72 @@ Node-built bars cover everything from the first full minute after our node is li
 
 - **Region: Tokyo.** The README says "for lowest latency, run the node in Tokyo, Japan" [doc: NODE], and the Foundation's own node is in AWS `apne1-az1` [doc: FND].
 - **We are likely ineligible for the Foundation node** (it requires 10k staked HYPE and Tier 1 maker volume, and excludes "certain activities involving the U.S. or Ontario") [doc: FND]. So we run our own.
-- **Provider:** pick one of the two options below for node A and the other for node B, so a single provider outage doesn't take out both (§6.6).
-  - **Latitude.sh** (Tokyo: TYO3/TYO4 [third-party listing, unverified per plan]): bare-metal and dedicated VMs, local NVMe, 20 TB egress included [doc: LATITUDE].
-  - **AWS `ap-northeast-1`**: the same zone family as the Foundation node, EBS gp3, and the S3 backfill runs in-region.
+- **Provider:** single-tenant bare metal in Tokyo from two different providers, so a single provider outage doesn't take out both (§6.6). The comparison, prices and recommendation are in §6.3: Vultr for node A and Cherry Servers for node B.
+- **Ruled out:**
+  - Freestyle (freestyle.sh): VMs too small (64 GiB / 256 GB max), and no raw inbound TCP for gossip [doc: FREESTYLE].
+  - OVHcloud: no Japan region [doc: OVH-REGIONS].
+  - Equinix Metal: discontinued [doc: EQX-EOL].
 - **Peers:** mainnet requires at least one root peer in `~/override_gossip_config.json`. Community root peers are mostly in Japan, and a `gossipRootIps` info request lists recent ones [doc: NODE]. The Foundation also lists paid infra providers that offer reliable peering [doc: INFRA-PEERS]. Running "against a reliable peer" is the first latency recommendation [doc: LAT]. Peer addresses live in the host's config, never in this repo or its docs.
 
 ### 6.2 Machine spec and OS
 
 - **Minimum (non-validator):** 16 vCPU, 128 GB RAM, 500 GB SSD [doc: NODE]. "Currently only Ubuntu 24.04 is supported" [doc: NODE].
 - **For low latency:** at least 32 logical cores, 128 GB RAM and 500 MB/s disk [doc: LAT].
-- **Our target per node:** 32 vCPU (dedicated, not burstable), 128 GB, **≥ 2 TB local NVMe**. Disk is sized for ~1–2 days of raw output (§6.4) plus abci states and the candle store. Ubuntu 24.04 LTS. Ingest shares the box (it is CPU-light next to `hl-node`) [unverified until measured].
+- **Our target per node:** bare metal with 16+ physical cores (32+ threads), 128 GB+, **≥ 2 TB local NVMe**. Disk is sized for ~1–2 days of raw output (§6.4) plus abci states and the candle store. Ubuntu 24.04 LTS. Ingest, and in v1 the gateway, share the box (§6.3, "Colocating our Rust server") [unverified until measured].
 - **Network:** gossip ports 4001 and 4002 open publicly [doc: NODE]. Everything else, including the info server and ingest's internal stream, is firewalled, with the internal stream over WireGuard or mTLS. Node bandwidth is undocumented [unverified; measure in week 1].
 - **Install:** `hl-visor` binaries are signed. Verify them with the published GPG key, and run `hl-visor run-non-validator` with `~/visor.json` set to `{"chain": "Mainnet"}` [doc: NODE]. Run both visor and ingest under systemd. `hl-visor` auto-updates `hl-node` [doc: NODE], so we alert on version changes and re-verify ingest parsers after each one.
 
-### 6.3 Cost range (per month)
+### 6.3 Where to host it: providers checked, with published prices
 
-| Option (Tokyo) | Spec | Price | Source |
-|---|---|---|---|
-| AWS `r6i.4xlarge`, on demand | 16 vCPU, 128 GiB | $1.216/h ≈ **$888** | [third-party: vmprices, usage.ai] |
-| AWS `r6i.4xlarge`, 1-yr reserved | same | ≈ **$588** | [third-party: usage.ai] |
-| AWS `r7a.4xlarge`, on demand | 16 vCPU, 128 GiB | $1.468/h ≈ $1,072 | [third-party: cloudcostdb] |
-| + EBS gp3, 2 TB plus throughput to ~500 MB/s | | $0.096/GB-mo ≈ $197, plus ≈ $18 extra throughput | [third-party: AWS Tokyo pricing summaries] |
-| Latitude.sh `vm.xlarge` | 32 vCPU, 128 GB, 1.28 TB local | **$372** (20 TB egress included) | [doc: LATITUDE]. Tokyo stock and price [unverified]. |
-| Latitude.sh `f4.metal.medium` | bare metal, 128 GB, NVMe | **$555** | [doc: LATITUDE]. Tokyo [unverified]. |
+Requirements (§6.2):
+- 16+ physical cores (32+ logical) and 128 GB+ RAM;
+- 500 GB+ local NVMe, ideally 2 TB;
+- Ubuntu 24.04;
+- **raw public TCP on 4001–4002**;
+- high bandwidth;
+- in or near Tokyo.
 
-- **One node:** ≈ **$370–1,100/month** (Latitude VM at the low end; AWS on demand with storage at the high end).
-- **Two nodes (recommended, §6.6):** ≈ **$750–2,200/month**.
-- **AWS egress** to the gateway and clients isn't included [unverified; it depends on §5.9 measurements].
-- **All prices are list or third-party figures as of 2026-10-29, not quotes**, and are marked [unverified] until we get a quote. Tokyo prices on Latitude may differ from the headline page.
+Prices are list prices, checked 2026-10-29, excluding tax. "Stock" is what the provider's inventory showed that day. None of these are quotes.
+
+| Provider and plan (Tokyo unless noted) | Hardware | Monthly price | Bandwidth | Stock | Source |
+|---|---|---|---|---|---|
+| **Vultr bare metal `vbm-24c-256gb-amd`** | EPYC 7443P, 24 cores / 48 threads, 256 GB. The product page also lists 2 × 1.92 TB NVMe; the public plans API lists only the 2 × 480 GB SSDs [confirm at order]. 25 Gbps. | **$725** (hourly $0.993) | 10 TB included, then $0.01/GB | Offered in Tokyo (`nrt`) and Osaka (`itm`) | [doc: VULTR-API, VULTR-BM, VULTR-PRICE] |
+| Vultr bare metal `vbm-24c-384gb-amd5` | EPYC 9255, 24c/48t, 384 GB, NVMe | $995 | 10 TB | Tokyo and Osaka | [doc: VULTR-API] |
+| Vultr bare metal `vbm-8c-132gb` | E-2288G, **8 cores**, 128 GB, 2 × 1.92 TB NVMe | $350 | 10 TB | Tokyo | **Fails** the 16-core minimum [doc: VULTR-API] |
+| **Cherry Servers AMD EPYC 9275F** | 24c/48t at 4.1 GHz, 384 GB, 2 × 1 TB + 2 × 2 TB NVMe, 10 Gbps, Equinix TY15 | **$874.17** | 100 TB free egress | Listed as deployable in Tokyo | [doc: CHERRY-TYO] |
+| Cherry Servers AMD Ryzen 9950X | 16c/32t, 128 GB (non-ECC), 2 × 1 TB NVMe, 10 Gbps | €439 (€373 on a 12-month term) | 100 TB | **Sold out in Tokyo** | [doc: CHERRY-9950X] (third-party tracker) |
+| Latitude.sh `m4.metal.medium` | EPYC 9124, 16c/32t, 128 GB, 2 × 480 GB + 2 × 1.9 TB NVMe, 2 × 10 Gbps | $522 Tokyo ($365 on a 12-month term); $456 US list | 20 TB | **Sold out** in TYO3 and TYO4 | [doc: LATITUDE, LAT-M4] (Tokyo price from a third-party tracker) |
+| Latitude.sh `f4.metal.medium` | EPYC 4564P, 16c/32t at 4.5 GHz, 128 GB, same disks | $715 Tokyo ($501 on term); $555 US list | 20 TB | **Sold out** in Tokyo | [doc: LATITUDE, LAT-F4] |
+| AWS `i4i.4xlarge` (on demand) | 16 vCPU (8 cores), 128 GiB, 1 × 3,750 GB local NVMe | $1.61/h ≈ **$1,175** | Egress billed separately | `ap-northeast-1` | [doc: AWS-PRICE] |
+| AWS `r6i.4xlarge` + 2 TB gp3 | 16 vCPU, 128 GiB, EBS only | $1.216/h ≈ $888, plus ≈ $215 EBS ≈ **$1,100** | Egress billed separately | `ap-northeast-1` | [doc: AWS-PRICE]; EBS from earlier third-party summaries |
+| OVHcloud | — | — | — | **No Japan region.** Its APAC dedicated servers are in Singapore, Sydney and Mumbai only, with metered traffic that is throttled at the quota. | [doc: OVH-REGIONS, OVH-APAC] |
+| Equinix Metal | — | — | — | **Discontinued.** Sunset on 2026-06-30. | [doc: EQX-EOL] |
+| Freestyle (freestyle.sh) VMs | Pro tops out at 32 vCPU / **64 GiB** / **256 GB** per VM | — | — | **Ruled out:** below the 128 GB RAM and 500 GB disk minimums, and inbound traffic only reaches a VM through the TLS/SNI edge on 443, so there's no raw TCP on 4001–4002 for gossip | [doc: FREESTYLE] |
+
+All three bare-metal providers above are single-tenant with full root, so we open 4001–4002 and firewall the rest ourselves with nftables. Ubuntu 24.04 is in Vultr's OS list [doc: VULTR-API] and Cherry's Tokyo FAQ [doc: CHERRY-TYO]. Node bandwidth needs are undocumented [unverified]. Vultr's 10 TB is the tightest allowance, and its overage ($0.01/GB) is cheap.
+
+**Recommendation:**
+- **Node A: Vultr `vbm-24c-256gb-amd` in Tokyo, $725/month.**
+  - 24 cores / 48 threads meets the 32-logical-core latency advice [doc: LAT].
+  - 256 GB of RAM leaves headroom for ingest and the gateway on the same box.
+  - It's orderable today.
+  - Confirm the NVMe drives at order time.
+- **Node B: Cherry Servers EPYC 9275F in Tokyo (Equinix TY15), $874.17/month.**
+  - A different provider and building, so one provider outage doesn't take out both (§6.6).
+  - 100 TB egress, and faster cores.
+  - Alternatively, a second Vultr box in Osaka (`itm`): a different city, but the same provider.
+- **Two-node total ≈ $1,600/month.** Budget path: one node at ≈ $725, or the 16-core Latitude and Cherry boxes ($365–522) once Tokyo stock returns.
+- **AWS works but costs more for less:** 16 vCPU is 8 physical cores, and egress is extra. It mainly helps the S3 backfill (§5.6), which can run from a short-lived AWS instance instead.
+
+**Colocating our Rust server:**
+- **`tr-ingest` runs on the node box** (required: it tails local files and calls `localhost:3001`).
+- **v1: `tr-gateway` on the same box as well.** The node gets most of the cores via systemd `CPUAffinity`/cgroup limits, and ingest plus the gateway get a reserved slice (for example 8 of 48 threads) [target; tune after measuring]. That makes the internal stream loopback, with no extra machine.
+- **When client load grows,** move `tr-gateway` to a small box on the **same provider's private LAN** in the same city (Vultr VPC or Cherry private VLAN [doc: CHERRY-TYO]), so the ingest-to-gateway hop stays sub-millisecond and off the public internet [unverified latency; measure]. Never put the gateway across the Pacific from ingest. The data starts in Tokyo either way (§11).
+
+**Cost summary (per month, list):**
+- **One node:** ≈ **$725** (Vultr bare metal). A 16-core Latitude or Cherry box would be ≈ $365–522 when Tokyo stock returns; AWS is ≈ $1,100–1,175.
+- **Two nodes (recommended, §6.6):** ≈ **$1,600** (Vultr + Cherry). The range is ≈ $1,450–2,050, depending on which pair we use.
+- These are list prices, not quotes. Third-party tracker figures are labelled as such in the table.
 
 ### 6.4 Disk and log rotation (~100 GB/day)
 
@@ -541,27 +579,30 @@ The demo book fills at the server's quotes, which come from Hyperliquid perp pri
 
 ## 11. Deployment and hosting cost
 
-**v1 topology:**
-- **Node hosts A and B** in Tokyo, each running `hl-visor`, `hl-node` and `tr-ingest` (§6). They are on different providers, for example Latitude.sh and AWS `ap-northeast-1` (§6.1).
-- **One gateway** (`tr-gateway` plus the database) in Tokyo, next to the nodes.
-  - Market data starts in Tokyo, so the network hop to North American users is the same whether the gateway sits in Tokyo or in North America. Co-locating keeps the internal link short and gives us one region to operate.
-  - The cost is a longer RTT for document sync from North America, ~150 ms [unverified; to measure], which is fine for that traffic.
-  - Hetzner, the cheapest option in the previous draft, has no Tokyo location (its price list covers DE, FI, US and SG) [doc: HETZNER]. So the gateway runs on a small AWS Tokyo instance, on Fly.io's Tokyo region, or (to start) on node host A.
-  - North American edge gateways can come later, if measurement shows it matters.
+**v1 topology (colocated, §6.3):**
+- **Node host A** (Vultr bare metal, Tokyo) runs `hl-visor`, `hl-node`, `tr-ingest` **and the primary `tr-gateway` plus its database**. Ingest-to-gateway traffic stays on loopback.
+- **Node host B** (Cherry Servers, Tokyo, Equinix TY15) runs `hl-visor`, `hl-node`, `tr-ingest` **and a warm-standby `tr-gateway`**:
+  - Its database receives closed bars and document writes from A (§3.4).
+  - B's ingest streams to A's gateway over WireGuard/mTLS across providers (a short in-city hop [unverified; measure]).
+  - If host A dies, DNS/health-check failover points clients at B's gateway, and clients resync (§6.6, risk 14).
+- **The gateway runs on the node boxes, not a separate cloud VM.** Node A has 24 cores / 48 threads and 256 GB, enough headroom for both [unverified until measured]. The node gets most of the cores via cgroup/`CPUAffinity` limits, so client load can't starve block processing.
+  - If measurement shows contention, the gateway moves to a small box on the **same provider's private LAN** (Vultr VPC, Cherry private VLAN) in Tokyo. It never goes to another region.
+- **Market data starts in Tokyo,** so the hop to North American users is the same whether the gateway is in Tokyo or North America. The cost is a longer RTT for document sync from North America, ~150 ms [unverified; to measure], which is fine for that traffic. North American edge gateways can come later, if measurement shows it matters.
 
-| Item | Rough monthly cost |
+| Item | Monthly cost (list, §6.3) |
 |---|---|
-| Node A + node B, Tokyo (§6.3) | **≈ $750–2,200** [unverified until quoted] |
-| Gateway, Tokyo: a small VM with a volume, or Fly `performance-2x` (from $66 [doc: FLY]; the Tokyo price is [unverified]) | **≈ $70–150** |
+| Node A: Vultr `vbm-24c-256gb-amd`, Tokyo (node + ingest + gateway) | **$725** |
+| Node B: Cherry Servers EPYC 9275F, Tokyo (node + ingest + standby gateway) | **$874.17** |
+| Extra bandwidth beyond Vultr's 10 TB, at $0.01/GB | ≈ $0–50 [unverified; depends on §5.9 measurements] |
 | Object storage for our own fills archive (optional, §6.4) | ≈ $10–30 [unverified] |
 | One-time S3 backfill, requester-pays transfer (§5.6) | One-off; unknown until the bucket size is measured [unverified] |
-| **Total (two nodes)** | **≈ $830–2,400** |
-| Total (single-node budget fallback, §6.6) | ≈ $440–1,250 |
+| **Total (two nodes, gateway colocated)** | **≈ $1,610–1,680** |
+| Total (single-node budget fallback, §6.6) | ≈ $735–805 (Vultr only); ≈ $375–600 on a 16-core Latitude or Cherry box once Tokyo stock returns |
 
 Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 bytes per postcard update ≈ 6 KB/s ≈ **15 GB/month** worst case [unverified, rough]. Most clients are idle or backgrounded most of the time. We measure real numbers in phase 6.
 
 **Recommendation:**
-- Two nodes on two providers, with the gateway co-located in Tokyo.
+- Two bare-metal nodes on two providers in Tokyo (Vultr + Cherry Servers), with `tr-ingest` and `tr-gateway` colocated on the node boxes. Primary on A, warm standby on B.
 - Containerise ingest and the gateway (one Dockerfile each). The node itself runs on the host under systemd, as the README expects.
 - CI deploys from `master` tags, alongside the existing `deploy-site.yml`.
 
@@ -606,7 +647,7 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 11. **Unknown backfill size and cost.** The S3 archive range and size are undocumented, and transfer is requester-pays [doc: HIST]. Mitigation: measure first. The `candleSnapshot` sweep is the cheap fallback.
 12. **Display rights for other feeds.** Coinbase, OKX and Kraken (per the parent's research), Yahoo, and Congress data commercial-use limits. Mitigation: `DisplayPolicy` defaults to off.
 13. **Thin HIP-3 liquidity.** Some markets are small (`abcd` had 1 asset [observed]). Mid prices can be noisy or missing when a book is empty [unverified for specific markets]. We fall back to mark price, with the basis label.
-14. **A single stateful gateway.** Restarting it drops the hot store. Clients reconnect and resync, but it is visible. Mitigation: fast startup from the registry and SQLite, and a later move to a two-instance setup with sticky sessions.
+14. **A single stateful gateway.** Restarting it drops the hot store. Clients reconnect and resync, but it is visible. Mitigation: fast startup from the registry and SQLite, plus a warm-standby gateway on node host B (§11) that clients fail over to. Later, a two-instance setup with sticky sessions. Colocation means a node-host outage also takes out that host's gateway; that's why the standby sits on the other provider.
 15. **Protocol evolution with postcard.** A breaking change needs a version bump. Mitigations: the rules in §4.4 and support for N/N−1.
 
 ---
@@ -637,10 +678,10 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 ## 15. Open questions for Micky
 
 1. **Legal:** who reviews the Hyperliquid ToS (US/Ontario "Restricted Persons") for a Toronto company displaying Hyperliquid data to US and Canadian users? Is it OK to bring the node and server up before that review, given that it's data-only?
-2. **Node budget:** two nodes (≈ $750–2,200/month) or one node to start (≈ $370–1,100)? Is there a monthly ceiling?
-3. **Hosting providers:** Latitude.sh + AWS Tokyo as the two-provider pair, or another pair? Do we need quotes before phase 1?
+2. **Node budget:** two nodes (≈ $1,600/month, list) or one node to start (≈ $725)? Is there a monthly ceiling?
+3. **Hosting providers:** Vultr bare metal + Cherry Servers in Tokyo as the two-provider pair (§6.3), or wait for cheaper 16-core Latitude or Cherry stock in Tokyo? Freestyle, OVHcloud and Equinix Metal are ruled out.
 4. **AWS account for the backfill:** OK to open or use one for requester-pays S3 transfer, and what's the cap on the one-time backfill spend?
-5. **Gateway region:** Tokyo next to the nodes (recommended for v1), or North America from the start?
+5. **Gateway placement:** colocated on the node boxes in Tokyo (recommended for v1, §11), or on a separate same-LAN box from the start?
 6. **Mark price:** OK to show the node-read mark (`activeAssetData`) and fall back to a labelled estimate if that doesn't work?
 7. **If HIP-3 books are missing from node output** (the phase 1 test): pause, or allow the public `l2Book` for HIP-3 only, as a stopgap?
 8. **Default crypto source:** core perp mid (`BTC`) or HL spot (`UBTC/USDC`), and how prominently do we label "perp" for crypto?
@@ -678,14 +719,24 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 - **XYZ-ORACLE**: trade[XYZ] oracle price. https://docs.trade.xyz/perpetuals/mechanics/oracle-price
 - **XYZ-BOUNDS**: trade[XYZ] discovery bounds. https://docs.trade.xyz/perpetuals/mechanics/discovery-bounds
 - **XYZ-TAU**: trade[XYZ] oracle time constant updates. https://docs.trade.xyz/perpetuals/changelog/oracle-time-constant-updates
-- **HETZNER**: Hetzner price adjustment, 15 June 2026. https://docs.hetzner.com/general/infrastructure-and-availability/price-adjustment/
-- **FLY**: Fly.io resource pricing. https://fly.io/docs/about/pricing/
 - **ORACLE**: Oracle. https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/oracle
 - **MARK**: Robust price indices. https://hyperliquid.gitbook.io/hyperliquid-docs/trading/robust-price-indices
 - **FUNDING**: Funding. https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding
 - **HIP3-ACT**: HIP-3 deployer actions. https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions
 - **INFRA-PEERS**: Foundation non-validating node for infra providers. https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/nodes/foundation-non-validating-node-for-infra-providers
 - **LATITUDE**: Latitude.sh pricing. https://www.latitude.sh/pricing
+- **LAT-M4**: Latitude.sh m4.metal.medium (official page; $456 US list) https://www.latitude.sh/pricing/m4-metal-medium. Tokyo price and stock come from a third-party tracker: https://servermarket.dev/providers/latitude/m4-metal-medium
+- **LAT-F4**: Latitude.sh f4.metal.medium, Tokyo price and stock (third-party tracker). https://servermarket.dev/providers/latitude/f4-metal-medium
+- **VULTR-API**: Vultr public plans API (plans, monthly price and locations; `nrt` is Tokyo, `itm` is Osaka) and OS list, read 2026-10-29. https://api.vultr.com/v2/plans-metal, https://api.vultr.com/v2/plans, https://api.vultr.com/v2/os
+- **VULTR-BM**: Vultr bare metal product page. https://www.vultr.com/products/bare-metal/
+- **VULTR-PRICE**: Vultr pricing (bandwidth overage). https://www.vultr.com/pricing/
+- **CHERRY-TYO**: Cherry Servers Tokyo dedicated servers (prices, Equinix TY15, 100 TB egress, Ubuntu 24.04, private VLANs). https://www.cherryservers.com/bare-metal-dedicated-servers/tokyo. Launch post: https://www.cherryservers.com/blog/cherry-servers-tokyo-location-live
+- **CHERRY-9950X**: Cherry Servers Ryzen 9950X price and stock by location (third-party tracker). https://servermarket.dev/providers/cherry/amd-ryzen-9950x. Official page: https://www.cherryservers.com/pricing/dedicated-servers/amd-ryzen-9950x
+- **AWS-PRICE**: AWS EC2 on-demand Linux prices for Asia Pacific (Tokyo), from the price data behind the official pricing page, read 2026-10-29. https://aws.amazon.com/ec2/pricing/on-demand/
+- **OVH-REGIONS**: OVHcloud dedicated-server regions (APAC: Singapore, Mumbai, Sydney). https://www.ovhcloud.com/en/bare-metal/regions-availability/
+- **OVH-APAC**: OVHcloud APAC traffic quotas and throttling. https://support.us.ovhcloud.com/hc/en-us/articles/4404330636819-All-About-APAC-Region-Servers
+- **EQX-EOL**: Equinix Metal sunset (June 30, 2026). https://docs.equinix.com/goodbye-metal/
+- **FREESTYLE**: Freestyle VM pricing and limits, and inbound TLS. https://www.freestyle.sh/docs/vms/pricing-and-limits, https://www.freestyle.sh/docs/vms/network/tls-inbound
 - **AWS prices** (third-party trackers, accessed 2026-10-29, not quotes): r6i.4xlarge Tokyo https://vmprices.com and https://www.usage.ai, r7a.4xlarge https://cloudcostdb.com, EBS gp3 Tokyo summaries. Official structure: https://aws.amazon.com/ec2/pricing/on-demand/ and https://aws.amazon.com/ebs/pricing/
 
 ### Observations log (read-only calls, 2026-10-29 ~17:35 UTC)
@@ -708,3 +759,4 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 - WS `allDexsAssetCtxs` returned ~122 KB messages (2 in 8 s). WS `fastAssetCtxs` returned 10 messages in 8 s (1.9–28 KB), with a first snapshot of 2240 coins after base64 and raw-DEFLATE decoding.
 - No `exchange` endpoint calls, no orders, no user-specific subscriptions.
 - `POST /info {"type":"allPerpMetas"}` returned per-dex universe sizes as listed in §5.7.
+- Hosting research (2026-10-29): read-only GETs of the Vultr public plans and OS APIs (no account), plus AWS's public Tokyo on-demand price data. Nothing was ordered or provisioned.
