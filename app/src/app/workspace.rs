@@ -954,8 +954,8 @@ impl TerminalApp {
                     let dir = if downloads.is_dir() { downloads } else { self.store.dir.join("exports") };
                     dir.join(format!("{}.json", crate::layouts::Store::file_stem(&name)))
                 });
-                self.store.export(&name, &path)?;
-                Ok(format!("Exported {name:?} to {}", path.display()))
+                let to = self.store.export(&name, &path)?;
+                Ok(format!("Exported {name:?} to {to}"))
             }
             LayoutOp::Import(path) => {
                 let name = self.store.import(&path)?;
@@ -964,9 +964,7 @@ impl TerminalApp {
                 Ok(format!("Imported {} as {name:?}", path.display()))
             }
             LayoutOp::OpenFolder => {
-                std::fs::create_dir_all(&self.store.dir)?;
-                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-                std::process::Command::new(opener).arg(&self.store.dir).spawn()?;
+                crate::storage::reveal(&self.store.dir)?;
                 Ok(format!("Opened {}", self.store.dir.display()))
             }
         })();

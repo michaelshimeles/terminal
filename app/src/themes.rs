@@ -10,6 +10,7 @@ use egui::Color32;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::prefs::{Density, MonoFont, UiFont};
+use crate::storage;
 use crate::theme::Palette;
 
 /// Selection that follows the OS appearance using the configured dark/light pair.
@@ -561,11 +562,8 @@ impl ThemeStore {
     /// built-in or earlier name is listed with a suffix rather than shadowing it.
     pub fn load_all(&self) -> Vec<Theme> {
         let mut out = builtins();
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&self.dir)
+        let mut files: Vec<PathBuf> = storage::list(&self.dir)
             .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "toml" || x == "json"))
             .collect();
         files.sort();
@@ -606,7 +604,7 @@ impl ThemeStore {
             .clone()
             .filter(|p| p.extension().is_some_and(|x| x == "toml"))
             .unwrap_or_else(|| self.path(&theme.name));
-        crate::layouts::write_atomic(&path, theme.to_toml().as_bytes())
+        storage::write_atomic(&path, theme.to_toml().as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }
@@ -617,23 +615,33 @@ impl ThemeStore {
             bail!("built-in themes cannot be deleted");
         }
         let path = theme.source.clone().unwrap_or_else(|| self.path(&theme.name));
-        if !path.exists() {
+        if !storage::exists(&path) {
             bail!("no file for theme {:?}", theme.name);
         }
-        Ok(std::fs::remove_file(path)?)
+        Ok(storage::remove(&path)?)
     }
 
-    /// Write a theme to `to` as JSON (`.json`) or TOML (anything else).
-    pub fn export(theme: &Theme, to: &Path) -> Result<()> {
+    /// Write a theme to `to` as JSON (`.json`) or TOML (anything else); a download in the
+    /// browser. Returns where it went.
+    pub fn export(theme: &Theme, to: &Path) -> Result<String> {
         let json = to.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
         let text = if json { theme.to_json() } else { theme.to_toml() };
-        crate::layouts::write_atomic(to, text.as_bytes()).with_context(|| format!("writing {}", to.display()))
+        storage::export(to, text.as_bytes()).with_context(|| format!("writing {}", to.display()))
     }
 }
 
-/// Read a TOML or JSON theme file.
+/// Read a TOML or JSON theme file from the themes folder.
 pub fn load_file(path: &Path) -> Result<Theme> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_file(path, storage::read(path).with_context(|| format!("reading {}", path.display()))?)
+}
+
+/// Read a theme file the user imports.
+pub fn import_file(path: &Path) -> Result<Theme> {
+    parse_file(path, storage::import(path).with_context(|| format!("reading {}", path.display()))?)
+}
+
+fn parse_file(path: &Path, bytes: Vec<u8>) -> Result<Theme> {
+    let text = String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8 text", path.display()))?;
     let json = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
     let mut t = Theme::parse(&text, json)?;
     t.source = Some(path.to_path_buf());

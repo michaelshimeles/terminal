@@ -1,6 +1,10 @@
 //! Background worker. All network, SQLite, indicator and LOD-pyramid work runs on a
 //! tokio runtime; the UI thread only sends [`Request`]s and drains [`Response`]s, so it
 //! never blocks.
+//!
+//! In the browser (`wasm32`) the same requests run as tasks on the page's event loop
+//! ([`tr_data::rt`]). There is no bar cache or Congress ingest there, and CPU work such as
+//! indicators runs inline.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,12 +15,16 @@ use tokio::sync::Mutex;
 use tr_chart::gpu::{LineKind, LineRef};
 use tr_chart::scene::{Overlay, SeriesGpu, line_ref, marker_ref};
 use tr_congress::db::{Alert, PoliticianSummary};
+use tr_congress::model::NewTradeAlert;
 use tr_congress::performance::{self, Performance, TradeReturn};
-use tr_congress::refresh::{self, HttpSource, NewTradeAlert, RefreshConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use tr_congress::refresh::{self, HttpSource, RefreshConfig};
 use tr_congress::{Db, Politician, Trade};
 use tr_core::indicators::registry::{Input, Plot, Tone};
 use tr_core::{Bar, Security, Series, Timeframe};
-use tr_data::{BarCache, Provider, Quote, SearchHit, YieldCurves};
+#[cfg(not(target_arch = "wasm32"))]
+use tr_data::BarCache;
+use tr_data::{Provider, Quote, SearchHit, YieldCurves, rt};
 
 use crate::command::IndicatorSpec;
 use crate::theme;
@@ -268,8 +276,11 @@ pub enum Response {
     },
     Politicians(Vec<PoliticianSummary>),
     Alerts(Vec<Alert>),
+    // Only the desktop's Congress ingest raises these.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     NewAlerts(Vec<NewTradeAlert>),
     Status(String),
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     CongressRefreshed(String),
     Curves(Box<YieldCurves>),
     SearchHits {
@@ -282,6 +293,7 @@ pub enum Response {
 pub struct Worker {
     tx: tokio::sync::mpsc::UnboundedSender<Request>,
     pub rx: mpsc::Receiver<Response>,
+    #[cfg(not(target_arch = "wasm32"))]
     _rt: tokio::runtime::Runtime,
 }
 
@@ -293,6 +305,7 @@ struct Shared {
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
+    #[cfg(not(target_arch = "wasm32"))]
     cache: std::sync::Mutex<Option<BarCache>>,
     db: Mutex<Db>,
     out: mpsc::Sender<Response>,
@@ -306,7 +319,12 @@ impl Shared {
     }
 }
 
+/// Where saved files live. In the browser this is the key prefix in `localStorage` (see
+/// [`crate::storage`]).
 pub fn data_dir() -> PathBuf {
+    if cfg!(target_arch = "wasm32") {
+        return PathBuf::from("terminal-rs");
+    }
     if let Some(d) = std::env::var_os("TR_DATA_DIR") {
         return PathBuf::from(d);
     }
@@ -322,6 +340,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 impl Worker {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
@@ -376,11 +395,28 @@ impl Worker {
         Ok(Self { tx, rx, _rt: rt })
     }
 
+    /// The browser worker: tasks on the page's event loop, no disk cache, an empty Congress store.
+    #[cfg(target_arch = "wasm32")]
+    pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
+        let (tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
+        let (out, rx) = mpsc::channel();
+        let shared =
+            Arc::new(Shared { provider, series: Default::default(), db: Mutex::new(Db::open_in_memory()?), out, ctx });
+        rt::spawn(async move {
+            while let Some(req) = req_rx.recv().await {
+                let s = shared.clone();
+                rt::spawn(async move { handle(&s, req).await });
+            }
+        });
+        Ok(Self { tx, rx })
+    }
+
     pub fn send(&self, req: Request) {
         let _ = self.tx.send(req);
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn congress_refresh(s: &Shared) {
     s.send(Response::Status("Refreshing congressional disclosures (Senate eFD + House Clerk)…".into()));
     let source = match HttpSource::new() {
@@ -398,6 +434,35 @@ async fn congress_refresh(s: &Shared) {
         Err(e) => s.send(Response::Status(format!("congress refresh failed: {e:#}"))),
     }
 }
+
+// TODO(web proxy): Senate eFD and the House Clerk don't allow cross-origin requests.
+#[cfg(target_arch = "wasm32")]
+async fn congress_refresh(s: &Shared) {
+    s.send(Response::Status(crate::congress_view::WEB_NOTE.into()));
+}
+
+/// Bars saved by an earlier session, to paint before the network answers.
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_bars(s: &Shared, symbol: &str, tf: Timeframe, limit: usize) -> Option<Vec<Bar>> {
+    s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(symbol, tf, limit).ok()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cache_bars(s: &Shared, symbol: &str, tf: Timeframe, bars: &[Bar]) {
+    if let Ok(mut c) = s.cache.lock()
+        && let Some(c) = c.as_mut()
+    {
+        let _ = c.store(symbol, tf, bars);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn cached_bars(_: &Shared, _: &str, _: Timeframe, _: usize) -> Option<Vec<Bar>> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+fn cache_bars(_: &Shared, _: &str, _: Timeframe, _: &[Bar]) {}
 
 fn overlay(values: &[f64], color: egui::Color32, kind: LineKind) -> Overlay {
     let line = if kind == LineKind::Dots { marker_ref(values) } else { line_ref(values) };
@@ -486,8 +551,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 return; // a newer load for this pane is already running
             }
             // Paint from the disk cache immediately, then refresh from the network.
-            let cached = s.cache.lock().ok().and_then(|c| c.as_ref().and_then(|c| c.load(&symbol, tf, limit).ok()));
-            if let Some(bars) = cached.filter(|b| !b.is_empty()) {
+            if let Some(bars) = cached_bars(s, &symbol, tf, limit).filter(|b| !b.is_empty()) {
                 let bars = Arc::new(bars);
                 let gpu = build_gpu(bars.clone()).await;
                 s.send(Response::History {
@@ -505,11 +569,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
             match s.provider.history(&symbol, tf, None, limit).await {
                 Ok(bars) if !bars.is_empty() => {
-                    if let Ok(mut c) = s.cache.lock()
-                        && let Some(c) = c.as_mut()
-                    {
-                        let _ = c.store(&symbol, tf, &bars);
-                    }
+                    cache_bars(s, &symbol, tf, &bars);
                     let exhausted = bars.len() < limit / 2;
                     let bars = Arc::new(bars);
                     if !store_series(s, pane, generation, bars.clone()) {
@@ -569,17 +629,15 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             }
         }
         Request::Indicators { pane, generation, bars, tf, specs, palette } => {
-            let built = tokio::task::spawn_blocking(move || build_indicators(&bars, tf, &specs, &palette))
-                .await
-                .unwrap_or_default();
+            let built = rt::blocking(move || build_indicators(&bars, tf, &specs, &palette)).await.unwrap_or_default();
             s.send(Response::Indicators { pane, generation, built });
         }
         Request::Compare { pane, generation, symbol, tf, base } => {
             let limit = base.len().max(100);
             match s.provider.history(&symbol, tf, None, limit).await {
                 Ok(other) => {
-                    let line = tokio::task::spawn_blocking(move || line_ref(&align_compare(&base, &other))).await;
-                    if let Ok(line) = line {
+                    let line = rt::blocking(move || line_ref(&align_compare(&base, &other))).await;
+                    if let Some(line) = line {
                         s.send(Response::Compare { pane, generation, symbol, line });
                     }
                 }
@@ -771,8 +829,8 @@ fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<B
 /// four updates a second. Stops when the pane reloads, closes or the feed ends.
 fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
     let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
+    rt::spawn(async move {
+        let mut tick = rt::interval(Duration::from_millis(250));
         let mut dirty = false;
         loop {
             tokio::select! {
@@ -814,7 +872,7 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
 }
 
 async fn build_gpu(bars: Arc<Vec<Bar>>) -> SeriesGpu {
-    tokio::task::spawn_blocking(move || SeriesGpu::build(&bars)).await.expect("pyramid build task")
+    rt::blocking(move || SeriesGpu::build(&bars)).await.expect("pyramid build task")
 }
 
 fn resolve_politician(db: &Db, query: &str) -> Option<Politician> {

@@ -1,6 +1,6 @@
 //! Pane content for every panel kind.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use tr_data::OrderBook;

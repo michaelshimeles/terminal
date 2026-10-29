@@ -106,8 +106,8 @@ pub struct ChartState {
     hover_marker: Option<usize>,
     /// Resolved security for `symbol`.
     sec: Security,
-    last_live: Option<std::time::Instant>,
-    last_indicator_req: Option<std::time::Instant>,
+    last_live: Option<web_time::Instant>,
+    last_indicator_req: Option<web_time::Instant>,
     /// App-level actions requested from this chart (context menu), drained by the app.
     pub actions: Vec<Action>,
     /// False while a pane is being dragged over the workspace: no crosshair or hover cards.
@@ -404,7 +404,7 @@ impl ChartState {
             return;
         }
         if live {
-            self.last_live = Some(std::time::Instant::now());
+            self.last_live = Some(web_time::Instant::now());
         }
         let old_len = self.bars.len();
         let new_len = bars.len();
@@ -443,7 +443,7 @@ impl ChartState {
         let due = self.last_indicator_req.is_none_or(|t| t.elapsed().as_millis() >= 1500);
         if !live || due {
             self.request_indicators(w);
-            self.last_indicator_req = Some(std::time::Instant::now());
+            self.last_indicator_req = Some(web_time::Instant::now());
         }
         if !live {
             self.request_compare(w);

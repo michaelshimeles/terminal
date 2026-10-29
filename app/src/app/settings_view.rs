@@ -471,7 +471,7 @@ impl TerminalApp {
         match self.theme_store.save(&self.themes[i]) {
             Ok(path) => {
                 if let Some(f) = old_file.filter(|f| *f != path) {
-                    let _ = std::fs::remove_file(f);
+                    let _ = crate::storage::remove(&f);
                 }
                 self.themes[i].source = Some(path);
             }
@@ -519,7 +519,7 @@ impl TerminalApp {
                     expand(given).with_extension(op)
                 };
                 self.status = match themes::ThemeStore::export(&self.themes[idx], &path) {
-                    Ok(()) => format!("Exported {name:?} to {}", path.display()),
+                    Ok(to) => format!("Exported {name:?} to {to}"),
                     Err(e) => format!("Export failed: {e:#}"),
                 };
             }
@@ -551,7 +551,7 @@ impl TerminalApp {
             }
             "import" => {
                 let path = expand(self.theme_io.trim());
-                match themes::load_file(&path) {
+                match themes::import_file(&path) {
                     Ok(mut t) => {
                         t.name = themes::unique_name(&self.themes, &t.name);
                         t.source = None;
@@ -566,9 +566,7 @@ impl TerminalApp {
                 }
             }
             "folder" => {
-                let _ = std::fs::create_dir_all(&self.theme_store.dir);
-                let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-                if let Err(e) = std::process::Command::new(opener).arg(&self.theme_store.dir).spawn() {
+                if let Err(e) = crate::storage::reveal(&self.theme_store.dir) {
                     self.status = format!("Could not open {}: {e}", self.theme_store.dir.display());
                 }
             }

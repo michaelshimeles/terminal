@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="dark light" />
+		<title>Terminal</title>
+		<link rel="icon" href="data:," />
+		<script>
+			// The WebGPU build when the browser has WebGPU, else the larger WebGL2 one (no charts).
+			// Start downloading now; the module below cancels this if there is no WebGPU adapter.
+			window.terminalLoad = { build: 'gpu' in navigator ? 'terminal' : 'terminal-webgl', abort: new AbortController() };
+			terminalLoad.wasm = fetch(`./${terminalLoad.build}_bg.wasm`, { signal: terminalLoad.abort.signal });
+			document.head.append(Object.assign(document.createElement('link'), { rel: 'modulepreload', href: `./${terminalLoad.build}.js` }));
+		</script>
+		<style>
+			html,
+			body {
+				margin: 0;
+				height: 100%;
+				overflow: hidden;
+				background: #1e1e20;
+			}
+			@media (prefers-color-scheme: light) {
+				html,
+				body {
+					background: #f5f5f7;
+				}
+			}
+			canvas {
+				position: fixed;
+				inset: 0;
+				width: 100%;
+				height: 100%;
+				display: block;
+				outline: none;
+			}
+			#status {
+				position: fixed;
+				inset: 0;
+				display: grid;
+				place-items: center;
+				margin: 0;
+				font: 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+				color: #8e8e93;
+				pointer-events: none;
+			}
+		</style>
+	</head>
+	<body>
+		<canvas id="terminal"></canvas>
+		<p id="status">Loading Terminal…</p>
+		<script type="module">
+			const load = window.terminalLoad;
+			if (load.build === 'terminal' && !(await navigator.gpu.requestAdapter().catch(() => null))) {
+				load.wasm.catch(() => {}); // the abort below rejects it
+				load.abort.abort();
+				load.build = 'terminal-webgl';
+				load.wasm = fetch(`./${load.build}_bg.wasm`);
+			}
+			window.terminalBuild = load.build;
+			try {
+				const { default: init } = await import(`./${load.build}.js`);
+				await init({ module_or_path: load.wasm }); // runs the app, which removes #status after its first frame
+			} catch (e) {
+				console.error(e);
+				document.getElementById('status').textContent = `Terminal couldn't start: ${e}`;
+			}
+		</script>
+	</body>
+</html>

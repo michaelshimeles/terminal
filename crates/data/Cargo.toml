@@ -10,14 +10,28 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
 tracing.workspace = true
 async-trait = "0.1"
 futures = "0.3"
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+rusqlite.workspace = true
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+
+# The browser build: no threads, SQLite or raw sockets. Fetch and WebSocket come from the
+# browser, and chrono reads the clock through JavaScript.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+chrono = { workspace = true, features = ["wasmbind"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "WebSocket", "MessageEvent", "CloseEvent", "Event", "BinaryType"] }
+send_wrapper = { version = "0.6", features = ["futures"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

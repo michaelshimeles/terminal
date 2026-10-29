@@ -6,8 +6,9 @@ edition.workspace = true
 
 [dependencies]
 tr-core.workspace = true
-egui = "0.36"
-egui-wgpu = "0.36"
+egui = { version = "0.36", default-features = false }
+# GPU backends come from the app (eframe), so the browser build can leave out WebGL.
+egui-wgpu = { version = "0.36", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 chrono.workspace = true
 serde.workspace = true
@@ -15,6 +16,8 @@ pollster = "0.4"
 
 [dev-dependencies]
 criterion.workspace = true
+# Tests, benches and examples render offscreen on a real backend.
+egui-wgpu = "0.36"
 
 [[bench]]
 name = "frame"

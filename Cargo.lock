@@ -463,8 +463,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -3701,6 +3703,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4093,7 +4104,10 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "egui-wgpu",
+ "epaint_default_fonts",
  "futures",
+ "js-sys",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -4107,6 +4121,11 @@ dependencies = [
  "tr-macos",
  "tracing",
  "tracing-subscriber",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "wgpu",
 ]
 
 [[package]]
@@ -4476,15 +4495,21 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "js-sys",
  "reqwest",
  "rusqlite",
  "rustls",
+ "send_wrapper",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tr-core",
  "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::db::{Db, FilingRecord, FilingStatus, NewPolitician};
 use crate::house::{self, IndexEntry, PdfError};
+pub use crate::model::NewTradeAlert;
 use crate::model::{Chamber, Party};
 use crate::roster::{self, Roster};
 use crate::senate::{self, ReportKind, ReportRef};
@@ -56,14 +57,6 @@ impl RefreshConfig {
         };
         Self { house_years, senate_since, max_new_per_chamber: 2_000, concurrency: 4 }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct NewTradeAlert {
-    pub politician_id: i64,
-    pub politician: String,
-    pub filing_id: String,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, Default)]

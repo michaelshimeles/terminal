@@ -684,7 +684,8 @@ impl Default for Prefs {
 
 impl Prefs {
     pub fn load(path: &std::path::Path) -> Prefs {
-        let mut p: Prefs = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut p: Prefs =
+            crate::storage::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         p.migrate();
         p.hotkeys = p.hotkeys.with_defaults();
         p.appearance.font_scale = p.appearance.font_scale.clamp(0.7, 1.6);
@@ -756,7 +757,7 @@ impl Prefs {
     }
 
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        crate::layouts::write_atomic(path, &serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)
+        crate::storage::write_atomic(path, &serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)
     }
 }
 

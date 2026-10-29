@@ -198,6 +198,50 @@ for Updates… or `UPDATE` checks at once. `scripts/check-macos-cross.sh` compil
 and lints the whole workspace for aarch64-apple-darwin from Linux (zig as the C cross-compiler;
 linking needs the macOS SDK).
 
+## In the browser
+
+The same code also builds for WebAssembly and runs in a browser tab on WebGPU:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked   # must match Cargo.lock
+brew install binaryen                                       # wasm-opt
+scripts/build-web.sh                                        # writes site/static/app
+cd site && npm run dev                                      # then open http://localhost:5173/app
+```
+
+`scripts/build-web.sh <dir>` writes somewhere else instead; any static file server works. Add
+`?sample` to the URL to run offline on sample data, or `?fps` for the frame-time readout.
+
+![The browser build in Chrome: a live BTCUSD chart from Binance beside a demo-account position](docs/img/web-live-crypto.png)
+
+What the browser build can and can't do yet:
+
+- Crypto is live, because Binance and Coinbase allow cross-origin requests. History, quotes, order
+  books and websocket bars all come from them. Yahoo, Treasury.gov, Alpaca and CoinDesk don't allow
+  them, so every other market shows sample data and the toolbar says "Crypto live". A same-origin
+  proxy can fix that later.
+- Congress disclosures, SnapTrade accounts and live order entry need the desktop app. The paper
+  trading demo account works.
+- Layouts, settings, themes and the demo account are saved in `localStorage` under `terminal-rs/`.
+- Charts need WebGPU, since they read bars from storage buffers in the vertex shader. Browsers
+  without a WebGPU adapter get a second, larger build on WebGL2 where everything except the chart
+  series works.
+
+Measured with Playwright driving Chrome 155 on an Apple M4 Pro:
+
+| | WebGPU build | WebGL2 build |
+|---|---|---|
+| `.wasm` | 5.60 MB (2.26 MB gzip, 1.69 MB brotli) | 7.48 MB (2.99 MB gzip, 2.22 MB brotli) |
+| JS glue | 115 KB | 169 KB |
+
+- A cold load from localhost draws its first frame 91 to 97 ms after navigation, the medians of
+  three runs of 9 loads, two headless and one in a Retina window. On a 50 Mbit/s link with 40 ms
+  of latency it takes 446 ms, and 1.64 s on 10 Mbit/s with 80 ms.
+- Panning and zooming a chart costs 1.3 to 1.5 ms of CPU in the UI code and 2.4 to 3.3 ms for the
+  whole frame (medians across runs), and holds the display's 60 Hz.
+- egui's two emoji fonts, 740 KB together, load after the first frame instead of inside the `.wasm`.
+
 ## Brokerage setup (SnapTrade)
 
 Everything happens in **Settings › Brokerage**, with no commands needed. Open it from the sidebar
@@ -327,10 +371,14 @@ app/            eframe shell: command line, docked panes, chart widget, panels
   themes.rs     theme model, built-in themes, TOML/JSON theme files and the themes folder
   app/          workspace (drag and drop, pop-out windows, link groups), panels, settings, chrome
   worker.rs     tokio runtime: all network, SQLite, pyramid and indicator work (UI never blocks)
+  storage.rs    saved files: the data folder on desktop, localStorage in the browser
+  web.rs        browser entry point (eframe web runner), console logging, frame timings
+  web/          the page that hosts the browser build
 crates/core     Bar/Series, timeframes, market keys + security catalog, indicators and their
                 registry (codes, parameters, panes, levels), sample data
 crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.gov/FRED, Yahoo,
-                Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache
+                Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache;
+                the browser router (crypto live, the rest sampled) and a tokio/browser task shim
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
 crates/congress Senate eFD + House Clerk parsers, rosters, SQLite store, refresh, alerts, performance
 crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),

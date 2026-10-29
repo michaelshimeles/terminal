@@ -156,17 +156,24 @@ impl DemoBook {
     /// the caller can keep it aside instead of overwriting the user's history.
     pub fn load(path: &Path, now: DateTime<Utc>) -> Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => {
-                let mut b: DemoBook = serde_json::from_slice(&bytes).context("the demo account file is damaged")?;
-                b.version = FILE_VERSION;
-                if !b.cash.is_finite() || !b.starting_cash.is_finite() {
-                    anyhow::bail!("the demo account file has invalid balances");
-                }
-                Ok(b)
-            }
+            Ok(bytes) => Self::from_json(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new(now)),
             Err(e) => Err(e).context("reading the demo account"),
         }
+    }
+
+    /// Parse a saved account, rejecting damaged files.
+    pub fn from_json(bytes: &[u8]) -> Result<Self> {
+        let mut b: DemoBook = serde_json::from_slice(bytes).context("the demo account file is damaged")?;
+        b.version = FILE_VERSION;
+        if !b.cash.is_finite() || !b.starting_cash.is_finite() {
+            anyhow::bail!("the demo account file has invalid balances");
+        }
+        Ok(b)
+    }
+
+    pub fn to_json(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec_pretty(self)?)
     }
 
     /// Write atomically (temporary file, then rename).
@@ -175,7 +182,7 @@ impl DemoBook {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::write(&tmp, self.to_json()?)?;
         std::fs::rename(&tmp, path).context("saving the demo account")
     }
 

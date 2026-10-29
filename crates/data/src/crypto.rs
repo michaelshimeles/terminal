@@ -6,13 +6,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::DateTime;
-use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 use tr_core::{Bar, Security, Timeframe, catalog};
 
-use crate::{LiveFeed, Quote};
+use crate::ws::Socket;
+use crate::{LiveFeed, Quote, rt};
 
 const BINANCE_REST: [&str; 2] = ["https://data-api.binance.vision", "https://api.binance.com"];
 const BINANCE_WS: [&str; 2] = ["wss://data-stream.binance.vision/ws", "wss://stream.binance.com:9443/ws"];
@@ -186,25 +185,37 @@ pub fn parse_coinbase_book(json: &str, symbol: &str, depth: usize) -> Result<cra
     Ok(b)
 }
 
+const TIMEOUT: Duration = Duration::from_secs(20);
+
 pub struct CryptoProvider {
     client: reqwest::Client,
 }
 
 impl CryptoProvider {
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("terminal-rs/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(20))
-            .build()?;
-        Ok(Self { client })
+        let client = reqwest::Client::builder();
+        // Browsers set their own User-Agent, and fetch takes its timeout per request.
+        #[cfg(not(target_arch = "wasm32"))]
+        let client = client.user_agent(concat!("terminal-rs/", env!("CARGO_PKG_VERSION"))).timeout(TIMEOUT);
+        Ok(Self { client: client.build()? })
     }
 
     async fn get(&self, url: &str, query: &[(&str, String)]) -> Result<String> {
-        let resp = self.client.get(url).query(query).send().await?;
-        if !resp.status().is_success() {
-            bail!("GET {url}: HTTP {}", resp.status());
-        }
-        Ok(resp.text().await?)
+        let req = self.client.get(url).query(query);
+        #[cfg(target_arch = "wasm32")]
+        let req = req.timeout(TIMEOUT);
+        let fetch = async move {
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                bail!("GET {url}: HTTP {}", resp.status());
+            }
+            Ok(resp.text().await?)
+        };
+        // A browser fetch holds JavaScript values, which are not `Send`. The web build has
+        // one thread, so asserting it is sound and keeps the provider traits shared.
+        #[cfg(target_arch = "wasm32")]
+        let fetch = send_wrapper::SendWrapper::new(fetch);
+        fetch.await
     }
 
     async fn binance_history(
@@ -363,7 +374,7 @@ impl CryptoProvider {
         let (tx, rx) = mpsc::channel(256);
         let stream = format!("{}@kline_{}", binance_symbol(sec).to_ascii_lowercase(), binance_interval(tf));
         let product = coinbase_product(sec);
-        tokio::spawn(async move {
+        rt::spawn(async move {
             let mut backoff = 1;
             let mut attempt = 0usize;
             while !tx.is_closed() {
@@ -378,7 +389,7 @@ impl CryptoProvider {
                     tracing::debug!("live feed {stream}: {e:#}");
                 }
                 attempt += 1;
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                rt::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
             }
         });
@@ -387,32 +398,25 @@ impl CryptoProvider {
 }
 
 async fn binance_ws(url: &str, tx: &mpsc::Sender<Bar>) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.context("binance websocket")?;
-    while let Some(msg) = ws.next().await {
-        match msg? {
-            Message::Text(t) => {
-                if let Some(bar) = parse_binance_ws(t.as_str())
-                    && tx.send(bar).await.is_err()
-                {
-                    return Ok(());
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
+    let mut ws = Socket::connect(url).await.context("binance websocket")?;
+    while let Some(text) = ws.next().await {
+        if let Some(bar) = parse_binance_ws(&text?)
+            && tx.send(bar).await.is_err()
+        {
+            return Ok(());
         }
     }
     bail!("binance websocket closed")
 }
 
 async fn coinbase_ws(product: &str, tf: Timeframe, tx: &mpsc::Sender<Bar>) -> Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(COINBASE_WS).await.context("coinbase websocket")?;
+    let mut ws = Socket::connect(COINBASE_WS).await.context("coinbase websocket")?;
     let sub = serde_json::json!({"type": "subscribe", "product_ids": [product], "channels": ["ticker"]});
-    ws.send(Message::Text(sub.to_string().into())).await?;
+    ws.send(sub.to_string()).await?;
     // Aggregate ticks into the current bar; the chart merges partial bars into history.
     let mut bar: Option<Bar> = None;
-    while let Some(msg) = ws.next().await {
-        let Message::Text(t) = msg? else { continue };
-        let Some((ts, px, size)) = parse_coinbase_ws(t.as_str()) else { continue };
+    while let Some(text) = ws.next().await {
+        let Some((ts, px, size)) = parse_coinbase_ws(&text?) else { continue };
         let bucket = tf.bucket_start(ts);
         let b = match bar.as_mut() {
             Some(b) if b.ts == bucket => {

@@ -2,11 +2,12 @@
 //! configured dark/light pair), cycle, the THEME command, copy-on-write edits of built-ins,
 //! and debounced saving of edited custom themes.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::TerminalApp;
 use crate::prefs::{Density, UiFont};
 use crate::themes::{self, SYSTEM, Theme};
+use web_time::Instant;
 
 impl TerminalApp {
     /// Index of the theme currently in effect.

@@ -243,6 +243,36 @@ pub fn normalize_ticker(raw: &str) -> Option<String> {
     RE.is_match(&t).then_some(t)
 }
 
+/// An alert raised when a tracked politician files new trades.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alert {
+    pub id: i64,
+    pub politician_id: i64,
+    pub politician: String,
+    pub filing_id: String,
+    pub created_at: i64,
+    pub message: String,
+    pub seen: bool,
+}
+
+/// A politician with aggregate trade counts, for list views.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PoliticianSummary {
+    pub politician: Politician,
+    pub trades: i64,
+    pub last_filed: Option<NaiveDate>,
+    pub tracked: bool,
+}
+
+/// A new filing by a tracked politician, found during a refresh.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NewTradeAlert {
+    pub politician_id: i64,
+    pub politician: String,
+    pub filing_id: String,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

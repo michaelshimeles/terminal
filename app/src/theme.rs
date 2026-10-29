@@ -53,6 +53,9 @@ thread_local! {
     static DENSITY: Cell<f32> = const { Cell::new(1.0) };
     static UI_MONO: Cell<bool> = const { Cell::new(false) };
     static FONTS: Cell<Option<MonoFont>> = const { Cell::new(None) };
+    /// Fonts fetched after start-up (the browser build's emoji fallbacks).
+    #[cfg(target_arch = "wasm32")]
+    static LATE_FONTS: std::cell::RefCell<Vec<(String, std::sync::Arc<FontData>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Spacing multiplier from the density preference (compact < 1 < comfortable).
@@ -176,13 +179,49 @@ pub fn ui_font(size: f32) -> FontId {
 pub const CARD_RADIUS: u8 = 10;
 pub const CONTROL_RADIUS: u8 = 6;
 
+/// egui's bundled fonts. The browser build starts with only the two text fonts, which keeps
+/// the emoji fonts out of the download; they arrive later through [`add_late_font`].
+pub fn base_fonts() -> FontDefinitions {
+    #[cfg(not(target_arch = "wasm32"))]
+    let fonts = FontDefinitions::default();
+    #[cfg(target_arch = "wasm32")]
+    let fonts = {
+        use std::sync::Arc;
+        let mut f = FontDefinitions::empty();
+        f.font_data.insert("Hack".into(), Arc::new(FontData::from_static(epaint_default_fonts::HACK_REGULAR)));
+        f.font_data.insert("Ubuntu-Light".into(), Arc::new(FontData::from_static(epaint_default_fonts::UBUNTU_LIGHT)));
+        f.families.insert(FontFamily::Monospace, vec!["Hack".into(), "Ubuntu-Light".into()]);
+        f.families.insert(FontFamily::Proportional, vec!["Ubuntu-Light".into()]);
+        LATE_FONTS.with_borrow(|late| {
+            for (name, data) in late {
+                f.font_data.insert(name.clone(), data.clone());
+                for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                    f.families.entry(family).or_default().push(name.clone());
+                }
+            }
+        });
+        f
+    };
+    fonts
+}
+
+/// Add a font fetched after start-up as the last fallback of every family.
+#[cfg(target_arch = "wasm32")]
+pub fn add_late_font(ctx: &egui::Context, name: &str, data: FontData) {
+    LATE_FONTS.with_borrow_mut(|late| late.push((name.to_owned(), std::sync::Arc::new(data))));
+    // Reinstall with the current monospace choice (or let the first configure pick it up).
+    if let Some(mono) = FONTS.take() {
+        install_fonts(ctx, mono);
+    }
+}
+
 /// Use the system UI fonts when present (read from the OS at runtime, not bundled).
 fn install_fonts(ctx: &egui::Context, mono: MonoFont) {
     if FONTS.with(Cell::get) == Some(mono) {
         return;
     }
     FONTS.with(|f| f.set(Some(mono)));
-    let mut fonts = FontDefinitions::default();
+    let mut fonts = base_fonts();
     let ui_paths: &[&str] = &[
         "/System/Library/Fonts/SFNS.ttf",
         "/System/Library/Fonts/SFNSText.ttf",
