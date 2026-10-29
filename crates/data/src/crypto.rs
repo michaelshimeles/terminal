@@ -196,7 +196,7 @@ impl CryptoProvider {
         let client = reqwest::Client::builder();
         // Browsers set their own User-Agent, and fetch takes its timeout per request.
         #[cfg(not(target_arch = "wasm32"))]
-        let client = client.user_agent(concat!("terminal-rs/", env!("CARGO_PKG_VERSION"))).timeout(TIMEOUT);
+        let client = client.user_agent(concat!("terminal/", env!("CARGO_PKG_VERSION"))).timeout(TIMEOUT);
         Ok(Self { client: client.build()? })
     }
 

@@ -1,6 +1,6 @@
 //! Named, saved workspace layouts: the dock tree, each pane's kind and settings, link
 //! groups and popped-out windows. Stored one JSON file per layout in
-//! `<data dir>/layouts/` (`~/Library/Application Support/terminal-rs/layouts` on macOS),
+//! `<data dir>/layouts/` (`~/Library/Application Support/terminal/layouts` on macOS),
 //! so they can be shared, hand-edited, imported and exported.
 
 use std::collections::HashSet;

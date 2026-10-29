@@ -6,7 +6,7 @@
 //! [`check_for_updates`] reports that it couldn't check.
 
 /// The project's releases on GitHub.
-pub const RELEASES: &str = "https://github.com/michaelshimeles/terminal-rs/releases";
+pub const RELEASES: &str = "https://github.com/michaelshimeles/terminal/releases";
 
 /// Starts Sparkle, which checks the feed once a day and shows its update window when a newer
 /// release is out, and adds "Check for Updates…" to the app menu. Main thread; later calls do

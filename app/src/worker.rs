@@ -320,23 +320,30 @@ impl Shared {
 }
 
 /// Where saved files live. In the browser this is the key prefix in `localStorage` (see
-/// [`crate::storage`]).
+/// [`crate::storage`]). The first call moves files saved under the app's old name, terminal-rs,
+/// to the new one ([`crate::storage::migrate`]).
 pub fn data_dir() -> PathBuf {
-    if cfg!(target_arch = "wasm32") {
-        return PathBuf::from("terminal-rs");
-    }
-    if let Some(d) = std::env::var_os("TR_DATA_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/terminal-rs")
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
-            .join("terminal-rs")
-    }
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        // Unit tests never read, write or move the real folder.
+        if cfg!(test) {
+            return std::env::temp_dir().join(format!("tr-test-data-{}", std::process::id()));
+        }
+        let parent = if cfg!(target_arch = "wasm32") {
+            PathBuf::new()
+        } else if let Some(d) = std::env::var_os("TR_DATA_DIR") {
+            return PathBuf::from(d);
+        } else {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+            if cfg!(target_os = "macos") {
+                home.join("Library/Application Support")
+            } else {
+                std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"))
+            }
+        };
+        crate::storage::migrate(&parent.join("terminal-rs"), &parent.join("terminal"))
+    })
+    .clone()
 }
 
 impl Worker {

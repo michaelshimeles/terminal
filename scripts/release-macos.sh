@@ -20,6 +20,9 @@
 #   target/sparkle/<version>/bin/generate_keys --account terminal-rs -x terminal-rs-sparkle.key
 #   target/sparkle/<version>/bin/generate_keys --account terminal-rs -f terminal-rs-sparkle.key  # on a new Mac
 #
+# The notary profile and the signing key's account keep the project's old name, terminal-rs,
+# because they name items that already exist in the release Mac's keychain.
+#
 #   SIGN_IDENTITY    signing identity (default: the first "Developer ID Application" in the keychain)
 #   NOTARY_PROFILE   notarytool keychain profile (default: terminal-rs-notary)
 #   NOTARY_KEYCHAIN  keychain holding that profile (default: the login keychain)
@@ -39,7 +42,7 @@ if [ "$notarize" = 1 ] && ! xcrun notarytool history "${notary[@]}" >/dev/null; 
 fi
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-repo=https://github.com/michaelshimeles/terminal-rs
+repo=https://github.com/michaelshimeles/terminal
 sparkle=$(scripts/fetch-sparkle.sh)
 sparkle_account=${SPARKLE_ACCOUNT:-terminal-rs}
 sparkle_key=$(sed -n 's/^sparkle_key=//p' scripts/bundle-macos.sh)
@@ -78,14 +81,14 @@ notarize() {
 }
 
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
-  cargo build --release --locked --target "$target" -p terminal-rs
+  cargo build --release --locked --target "$target" -p terminal
 done
 out=target/universal-apple-darwin/release
 mkdir -p "$out"
 rm -f "$out"/Terminal-*.zip "$out/appcast.xml"
-lipo -create -output "$out/terminal-rs" \
-  target/aarch64-apple-darwin/release/terminal-rs target/x86_64-apple-darwin/release/terminal-rs
-scripts/bundle-macos.sh "$out/terminal-rs"
+lipo -create -output "$out/terminal" \
+  target/aarch64-apple-darwin/release/terminal target/x86_64-apple-darwin/release/terminal
+scripts/bundle-macos.sh "$out/terminal"
 app=$out/Terminal.app
 framework=$app/Contents/Frameworks/Sparkle.framework
 

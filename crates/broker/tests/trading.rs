@@ -80,7 +80,7 @@ async fn mock(seen: Log, failures: Log) -> String {
                 let body: Option<Value> = (!body.is_empty()).then(|| serde_json::from_slice(&body).unwrap());
                 let sig = headers.iter().find(|(k, _)| k == "signature").map(|(_, v)| v.clone()).unwrap_or_default();
                 let ok = sig == signature(CONSUMER_KEY, path, query, body.as_ref())
-                    && param(query, "userId").as_deref() == Some("terminal-rs-test")
+                    && param(query, "userId").as_deref() == Some("terminal-test")
                     && param(query, "userSecret").as_deref() == Some("s3cr3t");
                 let entry = Seen { method: method.clone(), path: path.to_string(), body: body.clone() };
                 if !ok {
@@ -161,7 +161,7 @@ fn client(base: &str) -> SnapTrade {
     let creds = Credentials {
         client_id: "TEST-CLIENT".into(),
         consumer_key: CONSUMER_KEY.into(),
-        user_id: "terminal-rs-test".into(),
+        user_id: "terminal-test".into(),
         user_secret: "s3cr3t".into(),
     };
     SnapTrade::with_base(creds, base).unwrap()

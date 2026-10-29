@@ -101,7 +101,11 @@ pub struct BrokerState {
 
 impl BrokerState {
     pub fn load(offline: bool) -> Self {
-        let store = SecretStore::platform(&data_dir());
+        Self::with_store(SecretStore::platform(&data_dir()), offline)
+    }
+
+    /// [`Self::load`] with credentials from `store` instead of the platform's.
+    pub fn with_store(store: SecretStore, offline: bool) -> Self {
         let mut message = None;
         // The browser build can't reach SnapTrade, and keys don't belong in page storage.
         let stored = if cfg!(target_arch = "wasm32") { Ok(None) } else { store.load() };
@@ -190,7 +194,7 @@ pub fn new_user_id() -> String {
     // Browsers have no process ids.
     let pid = if cfg!(target_arch = "wasm32") { 0 } else { std::process::id() };
     let mix = nanos ^ (u128::from(pid) << 64);
-    format!("terminal-rs-{:016x}", (mix as u64) ^ ((mix >> 64) as u64))
+    format!("terminal-{:016x}", (mix as u64) ^ ((mix >> 64) as u64))
 }
 
 impl TerminalApp {
@@ -802,7 +806,7 @@ mod tests {
         let a = new_user_id();
         std::thread::sleep(Duration::from_millis(1));
         let b = new_user_id();
-        assert!(a.starts_with("terminal-rs-") && a.len() == "terminal-rs-".len() + 16);
+        assert!(a.starts_with("terminal-") && a.len() == "terminal-".len() + 16);
         assert_ne!(a, b);
     }
 

@@ -561,7 +561,7 @@ impl TerminalApp {
         let head = Rect::from_min_size(rect.min, vec2(rect.width(), self.toolbar_h()));
         window_drag_region(ui, head, "sidebar");
         if !cfg!(target_os = "macos") {
-            p.text(head.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, "TERMINAL-RS", mono(12.5), amber());
+            p.text(head.left_center() + vec2(14.0, 0.0), Align2::LEFT_CENTER, "TERMINAL", mono(12.5), amber());
         }
 
         let body = Rect::from_min_max(pos2(rect.left(), head.bottom()), rect.max);

@@ -50,7 +50,7 @@ mod imp {
         let Some(window) = view.window() else { return false };
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
-        let toolbar = NSToolbar::initWithIdentifier(NSToolbar::alloc(mtm), &NSString::from_str("terminal-rs.toolbar"));
+        let toolbar = NSToolbar::initWithIdentifier(NSToolbar::alloc(mtm), &NSString::from_str("terminal.toolbar"));
         window.setToolbar(Some(&toolbar));
         // Compact unified toolbar: one slim row shared with the traffic lights.
         window.setToolbarStyle(NSWindowToolbarStyle::UnifiedCompact);

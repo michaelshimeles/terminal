@@ -25,7 +25,7 @@ impl YahooProvider {
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
             // Yahoo rejects requests without a browser-like user agent.
-            .user_agent("Mozilla/5.0 (compatible; terminal-rs)")
+            .user_agent("Mozilla/5.0 (compatible; terminal)")
             .timeout(Duration::from_secs(20))
             .cookie_store(true)
             .build()?;

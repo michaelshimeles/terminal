@@ -1,4 +1,4 @@
-//! Core market types shared across terminal-rs: bars, timeframes, securities and
+//! Core market types shared across Terminal: bars, timeframes, securities and
 //! market keys, the security catalog, technical indicators and sample data.
 
 pub mod bar;

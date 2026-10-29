@@ -1174,7 +1174,9 @@ mod tests {
     #[test]
     fn renders_every_view_without_panicking() {
         let ctx = egui::Context::default();
-        let mut b = BrokerState::load(true);
+        // A store that holds nothing, so the test never reads (or moves) the user's Keychain item.
+        let none = std::env::temp_dir().join(format!("tr-portfolio-test-{}/snaptrade.json", std::process::id()));
+        let mut b = BrokerState::with_store(tr_broker::SecretStore::file(none), true);
         b.creds = tr_broker::Credentials::default();
         b.portfolio = Some(Box::new(tr_broker::sample::portfolio()));
         let quotes = HashMap::new();

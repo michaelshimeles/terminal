@@ -58,7 +58,7 @@ fn client(base: &str) -> SnapTrade {
     let creds = Credentials {
         client_id: "TEST".into(),
         consumer_key: "key".into(),
-        user_id: "terminal-rs-test".into(),
+        user_id: "terminal-test".into(),
         user_secret: "s".into(),
     };
     SnapTrade::with_base(creds, base).unwrap()

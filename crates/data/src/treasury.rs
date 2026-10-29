@@ -113,7 +113,7 @@ pub struct TreasuryProvider {
 impl TreasuryProvider {
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; terminal-rs)")
+            .user_agent("Mozilla/5.0 (compatible; terminal)")
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self { client, years: Mutex::new(HashMap::new()) })
