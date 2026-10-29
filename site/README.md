@@ -63,6 +63,18 @@ The workflow reads three repository secrets:
 To redeploy without a new commit, run the workflow from the Actions tab. Run on `master`, it
 deploys to production.
 
+`vercel.json` also routes the browser app. `/app` redirects once to `/app/`, which serves
+`static/app/index.html` without a redirect, so the page's relative URLs resolve under `/app/`.
+`scripts/build-web.sh` puts each build's JS and wasm in `static/app/immutable/<hash>/`, named
+after a hash of those files, and the browser caches everything under `/app/immutable/` for a
+year. A new build gets new URLs, so a page never loads one build's JS with another build's wasm.
+`index.html` and the fonts keep Vercel's default `max-age=0, must-revalidate`, so the browser
+checks them on every visit. A request under `/app/immutable/` for a file that doesn't exist gets a
+404 with `no-store`, so that year-long header never sticks to a 404. `vercel.json` uses `routes`
+rather than `headers` and `rewrites` because only `routes` can add that rule after the filesystem
+check, the same way the SvelteKit adapter guards `/_app/immutable/`. `npm run dev` doesn't apply
+`vercel.json`; open `/app/index.html` there.
+
 ## Emails
 
 `POST /download` adds each email to the `emails` sorted set in Upstash Redis, scored by when the

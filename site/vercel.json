@@ -2,5 +2,21 @@
 	"$schema": "https://openapi.vercel.sh/vercel.json",
 	"git": {
 		"deploymentEnabled": false
-	}
+	},
+	"routes": [
+		{ "src": "^/app$", "status": 308, "headers": { "Location": "/app/" } },
+		{
+			"src": "^/app/immutable/.+",
+			"headers": { "Cache-Control": "public, max-age=31536000, immutable" },
+			"continue": true
+		},
+		{ "handle": "filesystem" },
+		{ "src": "^/app/$", "dest": "/app/index.html", "check": true },
+		{
+			"src": "^/app/immutable/.+",
+			"status": 404,
+			"headers": { "Cache-Control": "no-store" },
+			"continue": false
+		}
+	]
 }

@@ -10,8 +10,11 @@
 			// The WebGPU build when the browser has WebGPU, else the larger WebGL2 one (no charts).
 			// Start downloading now; the module below cancels this if there is no WebGPU adapter.
 			window.terminalLoad = { build: 'gpu' in navigator ? 'terminal' : 'terminal-webgl', abort: new AbortController() };
-			terminalLoad.wasm = fetch(`./${terminalLoad.build}_bg.wasm`, { signal: terminalLoad.abort.signal });
-			document.head.append(Object.assign(document.createElement('link'), { rel: 'modulepreload', href: `./${terminalLoad.build}.js` }));
+			// Each build's JS and wasm sit in a folder named after a hash of its files, so they can be
+			// cached for good; scripts/build-web.sh fills in these paths.
+			terminalLoad.paths = { terminal: './{terminal}', 'terminal-webgl': './{terminal-webgl}' };
+			terminalLoad.wasm = fetch(`${terminalLoad.paths[terminalLoad.build]}_bg.wasm`, { signal: terminalLoad.abort.signal });
+			document.head.append(Object.assign(document.createElement('link'), { rel: 'modulepreload', href: `${terminalLoad.paths[terminalLoad.build]}.js` }));
 		</script>
 		<style>
 			html,
@@ -56,11 +59,11 @@
 				load.wasm.catch(() => {}); // the abort below rejects it
 				load.abort.abort();
 				load.build = 'terminal-webgl';
-				load.wasm = fetch(`./${load.build}_bg.wasm`);
+				load.wasm = fetch(`${load.paths[load.build]}_bg.wasm`);
 			}
 			window.terminalBuild = load.build;
 			try {
-				const { default: init } = await import(`./${load.build}.js`);
+				const { default: init } = await import(`${load.paths[load.build]}.js`);
 				await init({ module_or_path: load.wasm }); // runs the app, which removes #status after its first frame
 			} catch (e) {
 				console.error(e);
