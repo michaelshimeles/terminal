@@ -213,6 +213,8 @@ cd site && npm run dev                                      # then open http://l
 `scripts/build-web.sh <dir>` writes somewhere else instead; any static file server works. Add
 `?sample` to the URL to run offline on sample data, or `?fps` for the frame-time readout.
 
+![The browser build in Chrome: a live BTCUSD chart from Binance beside a demo-account position](docs/img/web-live-crypto.png)
+
 What the browser build can and can't do yet:
 
 - Crypto is live, because Binance and Coinbase allow cross-origin requests. History, quotes, order
