@@ -49,4 +49,17 @@ chrono = { workspace = true, features = ["wasmbind"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location", "Performance", "Response", "Storage", "console"] }
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "Document",
+    "Element",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "Location",
+    "Performance",
+    "Response",
+    "Storage",
+    "Url",
+    "Window",
+    "console",
+] }

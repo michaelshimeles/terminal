@@ -400,16 +400,16 @@ impl Store {
         (2..).map(|i| format!("{base} {i}")).find(|n| !self.exists(n)).expect("unbounded")
     }
 
-    /// Write a layout to an arbitrary path.
-    pub fn export(&self, name: &str, to: &Path) -> Result<()> {
+    /// Write a layout to an arbitrary path (a download in the browser). Returns where it went.
+    pub fn export(&self, name: &str, to: &Path) -> Result<String> {
         let doc = self.load(name)?;
-        storage::write_atomic(to, &doc.to_json()).with_context(|| format!("writing {}", to.display()))
+        storage::export(to, &doc.to_json()).with_context(|| format!("writing {}", to.display()))
     }
 
     /// Copy a layout file into the store (renaming on conflict). Returns its name.
     pub fn import(&self, from: &Path) -> Result<String> {
         let mut doc =
-            LayoutDoc::from_json(&storage::read(from).with_context(|| format!("reading {}", from.display()))?)?;
+            LayoutDoc::from_json(&storage::import(from).with_context(|| format!("reading {}", from.display()))?)?;
         if doc.name.trim().is_empty() {
             doc.name = from.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         }

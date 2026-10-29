@@ -8,16 +8,10 @@
 		<link rel="icon" href="data:," />
 		<script>
 			// The WebGPU build when the browser has WebGPU, else the larger WebGL2 one (no charts).
-			// Start downloading now; the module below confirms there is an adapter.
-			window.terminalBuild = 'gpu' in navigator ? 'terminal' : 'terminal-webgl';
-			for (const [rel, file] of [
-				['modulepreload', `${terminalBuild}.js`],
-				['preload', `${terminalBuild}_bg.wasm`]
-			]) {
-				const link = Object.assign(document.createElement('link'), { rel, href: `./${file}` });
-				if (rel === 'preload') Object.assign(link, { as: 'fetch', type: 'application/wasm', crossOrigin: '' });
-				document.head.append(link);
-			}
+			// Start downloading now; the module below cancels this if there is no WebGPU adapter.
+			window.terminalLoad = { build: 'gpu' in navigator ? 'terminal' : 'terminal-webgl', abort: new AbortController() };
+			terminalLoad.wasm = fetch(`./${terminalLoad.build}_bg.wasm`, { signal: terminalLoad.abort.signal });
+			document.head.append(Object.assign(document.createElement('link'), { rel: 'modulepreload', href: `./${terminalLoad.build}.js` }));
 		</script>
 		<style>
 			html,
@@ -57,13 +51,17 @@
 		<canvas id="terminal"></canvas>
 		<p id="status">Loading Terminal…</p>
 		<script type="module">
-			let build = window.terminalBuild;
-			if (build === 'terminal' && !(await navigator.gpu.requestAdapter().catch(() => null))) {
-				build = 'terminal-webgl';
+			const load = window.terminalLoad;
+			if (load.build === 'terminal' && !(await navigator.gpu.requestAdapter().catch(() => null))) {
+				load.wasm.catch(() => {}); // the abort below rejects it
+				load.abort.abort();
+				load.build = 'terminal-webgl';
+				load.wasm = fetch(`./${load.build}_bg.wasm`);
 			}
+			window.terminalBuild = load.build;
 			try {
-				const { default: init } = await import(`./${build}.js`);
-				await init(); // Runs the app; it removes #status after its first frame.
+				const { default: init } = await import(`./${load.build}.js`);
+				await init({ module_or_path: load.wasm }); // runs the app, which removes #status after its first frame
 			} catch (e) {
 				console.error(e);
 				document.getElementById('status').textContent = `Terminal couldn't start: ${e}`;

@@ -1,6 +1,10 @@
 //! Where preferences, settings, layouts, themes, palette history and the demo account are
 //! kept: files under the data directory on the desktop, `localStorage` entries keyed by path
 //! in the browser. Every saved document is UTF-8 text (JSON or TOML).
+//!
+//! [`export`], [`import`] and [`reveal`] are for files the user names: on the desktop they are
+//! ordinary files and folders; in the browser an export is a download, and there is no import
+//! or folder yet.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,6 +44,24 @@ mod imp {
 
     pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    /// Write a file the user exports. Returns where it went, for the status line.
+    pub fn export(path: &Path, bytes: &[u8]) -> io::Result<String> {
+        write_atomic(path, bytes)?;
+        Ok(path.display().to_string())
+    }
+
+    /// Read a file the user imports.
+    pub fn import(path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    /// Open a folder in the system file manager, creating it first.
+    pub fn reveal(dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(opener).arg(dir).spawn().map(|_| ())
     }
 }
 
@@ -96,6 +118,33 @@ mod imp {
     pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
         write_atomic(to, &read(from)?)?;
         remove(from)
+    }
+
+    /// Download the exported file under its file name. Returns where it went, for the status line.
+    pub fn export(path: &Path, bytes: &[u8]) -> io::Result<String> {
+        use wasm_bindgen::JsCast;
+        let fail = |what: &str| io::Error::other(format!("the browser refused the download ({what})"));
+        let name = path.file_name().map_or_else(|| "export".into(), |n| n.to_string_lossy().into_owned());
+        let doc = web_sys::window().and_then(|w| w.document()).ok_or_else(|| fail("no document"))?;
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+        let blob = web_sys::Blob::new_with_u8_array_sequence(&parts).map_err(|_| fail("blob"))?;
+        let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(|_| fail("object URL"))?;
+        let link: web_sys::HtmlAnchorElement =
+            doc.create_element("a").map_err(|_| fail("link"))?.dyn_into().map_err(|_| fail("link"))?;
+        link.set_href(&url);
+        link.set_download(&name);
+        link.click();
+        let _ = web_sys::Url::revoke_object_url(&url);
+        Ok(format!("your downloads as {name}"))
+    }
+
+    // TODO(web): read imports through a file picker instead of a typed path.
+    pub fn import(_path: &Path) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "importing files needs the desktop app for now"))
+    }
+
+    pub fn reveal(_dir: &Path) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "the browser keeps these in its local storage, not a folder"))
     }
 }
 

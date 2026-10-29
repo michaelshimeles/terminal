@@ -621,18 +621,27 @@ impl ThemeStore {
         Ok(storage::remove(&path)?)
     }
 
-    /// Write a theme to `to` as JSON (`.json`) or TOML (anything else).
-    pub fn export(theme: &Theme, to: &Path) -> Result<()> {
+    /// Write a theme to `to` as JSON (`.json`) or TOML (anything else); a download in the
+    /// browser. Returns where it went.
+    pub fn export(theme: &Theme, to: &Path) -> Result<String> {
         let json = to.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
         let text = if json { theme.to_json() } else { theme.to_toml() };
-        storage::write_atomic(to, text.as_bytes()).with_context(|| format!("writing {}", to.display()))
+        storage::export(to, text.as_bytes()).with_context(|| format!("writing {}", to.display()))
     }
 }
 
-/// Read a TOML or JSON theme file.
+/// Read a TOML or JSON theme file from the themes folder.
 pub fn load_file(path: &Path) -> Result<Theme> {
-    let text = String::from_utf8(storage::read(path).with_context(|| format!("reading {}", path.display()))?)
-        .with_context(|| format!("{} is not UTF-8 text", path.display()))?;
+    parse_file(path, storage::read(path).with_context(|| format!("reading {}", path.display()))?)
+}
+
+/// Read a theme file the user imports.
+pub fn import_file(path: &Path) -> Result<Theme> {
+    parse_file(path, storage::import(path).with_context(|| format!("reading {}", path.display()))?)
+}
+
+fn parse_file(path: &Path, bytes: Vec<u8>) -> Result<Theme> {
+    let text = String::from_utf8(bytes).with_context(|| format!("{} is not UTF-8 text", path.display()))?;
     let json = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"));
     let mut t = Theme::parse(&text, json)?;
     t.source = Some(path.to_path_buf());
