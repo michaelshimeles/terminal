@@ -1399,7 +1399,9 @@ impl TerminalApp {
             self.last_feed = Some(Instant::now());
         }
         self.save_dirty_themes(false);
-        if self.last_save.elapsed() > Duration::from_secs(10) {
+        // A browser tab can close without an exit callback, so save sooner there.
+        let every = Duration::from_secs(if cfg!(target_arch = "wasm32") { 2 } else { 10 });
+        if self.last_save.elapsed() > every {
             self.autosave();
             self.last_save = Instant::now();
         }

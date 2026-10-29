@@ -23,13 +23,13 @@ serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 futures = "0.3"
-egui = "0.36"
-eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features", "default_fonts", "wayland", "x11"] }
+egui = { version = "0.36", default-features = false }
+eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features", "wayland", "x11"] }
 tr-macos.workspace = true
 web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["wgpu"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
 tokio.workspace = true
 tracing-subscriber.workspace = true
 
@@ -41,10 +41,12 @@ raw-window-handle = "0.6"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["webgpu", "wgsl"] }
 egui-wgpu = { version = "0.36", default-features = false, features = ["fragile-send-sync-non-atomic-wasm"] }
+# egui's text fonts only; the page fetches its emoji fonts after start-up (see theme::base_fonts).
+epaint_default_fonts = "0.36"
 tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 chrono = { workspace = true, features = ["wasmbind"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location", "Performance", "Storage", "console"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location", "Performance", "Response", "Storage", "console"] }

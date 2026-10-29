@@ -49,7 +49,11 @@ fn create_app(
     let mut app = TerminalApp::new(&cc.egui_ctx, worker, name);
     if !charts {
         tracing::warn!("this GPU backend has no vertex storage buffers; charts are off");
-        app.set_status("Charts need WebGPU, which this browser doesn't offer (it fell back to WebGL2).".into());
+        app.set_status(if cfg!(target_arch = "wasm32") {
+            "Charts need WebGPU. This browser fell back to WebGL2, so they are off.".into()
+        } else {
+            "This GPU backend has no vertex storage buffers, so charts are off.".into()
+        });
     }
     Ok(app)
 }

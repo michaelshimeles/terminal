@@ -6,7 +6,7 @@ edition.workspace = true
 
 [dependencies]
 tr-core.workspace = true
-egui = "0.36"
+egui = { version = "0.36", default-features = false }
 # GPU backends come from the app (eframe), so the browser build can leave out WebGL.
 egui-wgpu = { version = "0.36", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }

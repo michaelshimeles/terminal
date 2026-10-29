@@ -26,6 +26,9 @@ pub fn start() {
                 canvas,
                 eframe::WebOptions::default(),
                 Box::new(move |cc| {
+                    // The first frame needs fonts; set them before it (set_fonts applies from the next pass).
+                    cc.egui_ctx.set_fonts(crate::theme::base_fonts());
+                    wasm_bindgen_futures::spawn_local(load_emoji_fonts(cc.egui_ctx.clone()));
                     let mut app = crate::create_app(cc, tr_data::for_browser(offline), 1, t0)?;
                     if perf {
                         app.show_perf();
@@ -38,6 +41,38 @@ pub fn start() {
             fail(&format!("{e:?}"));
         }
     });
+}
+
+/// Fetch egui's emoji fonts, which scripts/build-web.sh puts in `fonts/` next to the page, and
+/// add them as fallbacks. Until they arrive, emoji and some symbols draw as boxes.
+async fn load_emoji_fonts(ctx: egui::Context) {
+    let fonts = [("NotoEmoji-Regular", 0.81), ("emoji-icon-font", 0.90)];
+    let fetched = futures::future::join_all(fonts.iter().map(|(name, _)| fetch(format!("fonts/{name}.ttf")))).await;
+    for ((name, scale), bytes) in fonts.into_iter().zip(fetched) {
+        match bytes {
+            Ok(bytes) => {
+                let tweak = egui::FontTweak { scale, ..Default::default() };
+                crate::theme::add_late_font(&ctx, name, egui::FontData::from_owned(bytes).tweak(tweak));
+            }
+            Err(e) => tracing::warn!("font {name}: {e}"),
+        }
+    }
+    ctx.request_repaint();
+}
+
+async fn fetch(url: String) -> Result<Vec<u8>, String> {
+    use wasm_bindgen_futures::JsFuture;
+    let window = web_sys::window().ok_or("no window")?;
+    let resp: web_sys::Response = JsFuture::from(window.fetch_with_str(&url))
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into()
+        .map_err(|_| "not a response")?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let buf = JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
+    Ok(js_sys::Uint8Array::new(&buf).to_vec())
 }
 
 fn has_flag(query: &str, flag: &str) -> bool {

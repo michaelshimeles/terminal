@@ -198,6 +198,47 @@ for Updates… or `UPDATE` checks at once. `scripts/check-macos-cross.sh` compil
 and lints the whole workspace for aarch64-apple-darwin from Linux (zig as the C cross-compiler;
 linking needs the macOS SDK).
 
+## In the browser
+
+The same code also builds for WebAssembly and runs in a browser tab on WebGPU:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked   # must match Cargo.lock
+brew install binaryen                                       # wasm-opt
+scripts/build-web.sh                                        # writes site/static/app
+cd site && npm run dev                                      # then open http://localhost:5173/app
+```
+
+`scripts/build-web.sh <dir>` writes somewhere else instead; any static file server works. Add
+`?sample` to the URL to run offline on sample data, or `?fps` for the frame-time readout.
+
+What the browser build can and can't do yet:
+
+- Crypto is live, because Binance and Coinbase allow cross-origin requests. History, quotes, order
+  books and websocket bars all come from them. Yahoo, Treasury.gov, Alpaca and CoinDesk don't allow
+  them, so every other market shows sample data and the toolbar says "Crypto live". A same-origin
+  proxy can fix that later.
+- Congress disclosures, SnapTrade accounts and live order entry need the desktop app. The paper
+  trading demo account works.
+- Layouts, settings, themes and the demo account are saved in `localStorage` under `terminal-rs/`.
+- Charts need WebGPU, since they read bars from storage buffers in the vertex shader. Browsers
+  without a WebGPU adapter get a second, larger build on WebGL2 where everything except the chart
+  series works.
+
+Measured with Playwright driving Chrome 155 on an Apple M4 Pro:
+
+| | WebGPU build | WebGL2 build |
+|---|---|---|
+| `.wasm` | 5.60 MB (2.26 MB gzip, 1.69 MB brotli) | 7.48 MB (2.99 MB gzip, 2.22 MB brotli) |
+| JS glue | 115 KB | 169 KB |
+
+- A cold load draws its first frame 95 ms after navigation from localhost, the median of 9 loads.
+  On a 50 Mbit/s link with 40 ms of latency it takes 446 ms, and 1.65 s on 10 Mbit/s with 80 ms.
+- Panning and zooming a chart costs 1.2 to 1.4 ms of CPU in the UI code and 2.7 to 2.9 ms for the
+  whole frame, and holds the display's 60 Hz.
+- egui's two emoji fonts, 740 KB together, load after the first frame instead of inside the `.wasm`.
+
 ## Brokerage setup (SnapTrade)
 
 Everything happens in **Settings › Brokerage**, with no commands needed. Open it from the sidebar

@@ -30,7 +30,7 @@ features=(--enable-bulk-memory --enable-bulk-memory-opt --enable-call-indirect-o
 	--enable-mutable-globals --enable-nontrapping-float-to-int --enable-reference-types --enable-sign-ext)
 
 mkdir -p "$out"
-rm -f "$out"/terminal*.js "$out"/terminal*.wasm
+rm -rf "$out"/terminal* "$out/fonts"
 
 # build <name> [cargo args...]
 build() {
@@ -43,6 +43,14 @@ build() {
 build terminal
 build terminal-webgl --features webgl
 cp app/web/index.html "$out/index.html"
+
+# egui's emoji fonts, which the page fetches after start-up (see app/src/web.rs), with their licenses.
+fonts=$(cargo metadata --format-version 1 --locked --filter-platform "$target" | python3 -c '
+import json, os, sys
+pkgs = json.load(sys.stdin)["packages"]
+print(next(os.path.dirname(p["manifest_path"]) for p in pkgs if p["name"] == "epaint_default_fonts"))')/fonts
+mkdir -p "$out/fonts"
+cp "$fonts"/{NotoEmoji-Regular.ttf,OFL.txt,emoji-icon-font.ttf,emoji-icon-font-mit-license.txt} "$out/fonts/"
 
 size() { wc -c <"$1" | tr -d ' '; }
 echo "wrote $out"
