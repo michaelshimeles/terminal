@@ -236,8 +236,8 @@ Measured with Playwright driving Chrome 155 on an Apple M4 Pro:
 | JS glue | 115 KB | 169 KB |
 
 - A cold load from localhost draws its first frame 91 to 97 ms after navigation, the medians of
-  three runs of 9 loads (headless twice, and a Retina window). On a 50 Mbit/s link with 40 ms of latency it takes 446 ms, and 1.64 s on
-  10 Mbit/s with 80 ms.
+  three runs of 9 loads, two headless and one in a Retina window. On a 50 Mbit/s link with 40 ms
+  of latency it takes 446 ms, and 1.64 s on 10 Mbit/s with 80 ms.
 - Panning and zooming a chart costs 1.3 to 1.5 ms of CPU in the UI code and 2.4 to 3.3 ms for the
   whole frame (medians across runs), and holds the display's 60 Hz.
 - egui's two emoji fonts, 740 KB together, load after the first frame instead of inside the `.wasm`.
