@@ -183,7 +183,7 @@ pub struct Palette {
 impl Palette {
     /// Load recent picks from `path` (missing or unreadable files start empty).
     pub fn load(path: &Path) -> Self {
-        let recents = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let recents = crate::storage::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         Self { recents, path: Some(path.to_path_buf()), ..Default::default() }
     }
 
@@ -230,7 +230,7 @@ impl Palette {
         self.recents.truncate(MAX_RECENTS);
         if let Some(path) = &self.path
             && let Ok(json) = serde_json::to_vec_pretty(&self.recents)
-            && let Err(e) = crate::layouts::write_atomic(path, &json)
+            && let Err(e) = crate::storage::write_atomic(path, &json)
         {
             tracing::warn!("saving palette recents: {e}");
         }

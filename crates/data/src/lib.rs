@@ -11,14 +11,26 @@
 //!
 //! The router is wrapped in [`Fallback`], which serves sample data if a source is
 //! unreachable, so the terminal always has something to draw.
+//!
+//! The browser build (`wasm32`) can only reach sources that allow cross-origin requests:
+//! [`for_browser`] serves live crypto through [`web::WebMarkets`] and sample data for the
+//! rest. It has no SQLite bar cache.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod alpaca;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod cache;
 pub mod crypto;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod markets;
 pub mod rss;
+pub mod rt;
 pub mod sample;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod treasury;
+pub mod web;
+mod ws;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod yahoo;
 
 use std::sync::Arc;
@@ -29,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tr_core::{AssetClass, Bar, Security, Timeframe, catalog};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use cache::BarCache;
 
 /// Latest quote for a symbol.
@@ -384,6 +397,7 @@ pub fn security(symbol: &str) -> Security {
 }
 
 /// Build the provider described in the crate docs from environment variables.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn from_env() -> Provider {
     // reqwest and the websocket client both use rustls; pin one crypto provider.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -402,6 +416,18 @@ pub fn from_env() -> Provider {
         Ok(m) => Arc::new(Fallback::new(m)),
         Err(_) => Arc::new(sample::SampleProvider::default().with_live_ticks()),
     }
+}
+
+/// The browser build's provider: sample data only when `offline`, otherwise live crypto
+/// with sample data for everything else.
+pub fn for_browser(offline: bool) -> Provider {
+    if !offline {
+        match web::WebMarkets::new() {
+            Ok(m) => return Arc::new(Fallback::new(m)),
+            Err(e) => tracing::warn!("crypto sources unavailable, using sample data: {e:#}"),
+        }
+    }
+    Arc::new(sample::SampleProvider::default().with_live_ticks())
 }
 
 /// Keep at most `limit` bars ending at or before `end`.

@@ -3,9 +3,10 @@
 //! refresh scheduling and the `PORT`/`ACCT`/`POS`/`ORD`/`ACTV` commands. Order entry is in
 //! `trading`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tr_broker::{Credentials, Portfolio, Position, SecretStore};
+use web_time::Instant;
 
 use super::{PaneKind, TerminalApp};
 use crate::command::PortView;
@@ -102,7 +103,9 @@ impl BrokerState {
     pub fn load(offline: bool) -> Self {
         let store = SecretStore::platform(&data_dir());
         let mut message = None;
-        let stored = match store.load() {
+        // The browser build can't reach SnapTrade, and keys don't belong in page storage.
+        let stored = if cfg!(target_arch = "wasm32") { Ok(None) } else { store.load() };
+        let stored = match stored {
             Ok(c) => c.unwrap_or_default(),
             Err(e) => {
                 tracing::warn!("SnapTrade credentials unavailable: {e:#}");
@@ -112,7 +115,9 @@ impl BrokerState {
         };
         let mut creds = stored.clone();
         let from_env = creds.apply_env(|k| std::env::var(k).ok());
-        let simulate = offline || std::env::var("TR_BROKER").is_ok_and(|v| v.eq_ignore_ascii_case("sample"));
+        let simulate = offline
+            || cfg!(target_arch = "wasm32")
+            || std::env::var("TR_BROKER").is_ok_and(|v| v.eq_ignore_ascii_case("sample"));
         Self {
             store,
             saved: stored,
@@ -157,6 +162,7 @@ impl BrokerState {
 }
 
 /// Open a URL or path with the system handler.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn open_external(target: &str) -> std::io::Result<()> {
     let opener = if cfg!(target_os = "macos") {
         "open"
@@ -168,10 +174,22 @@ pub fn open_external(target: &str) -> std::io::Result<()> {
     std::process::Command::new(opener).arg(target).spawn().map(|_| ())
 }
 
+/// Open a URL in a new browser tab.
+#[cfg(target_arch = "wasm32")]
+pub fn open_external(target: &str) -> std::io::Result<()> {
+    let window = web_sys::window().ok_or_else(|| std::io::Error::other("no browser window"))?;
+    window
+        .open_with_url_and_target_and_features(target, "_blank", "noopener")
+        .map(|_| ())
+        .map_err(|_| std::io::Error::other("the browser blocked the new tab"))
+}
+
 /// A stable, non-identifying SnapTrade user id for this installation.
 pub fn new_user_id() -> String {
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let mix = nanos ^ (u128::from(std::process::id()) << 64);
+    let nanos = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    // Browsers have no process ids.
+    let pid = if cfg!(target_arch = "wasm32") { 0 } else { std::process::id() };
+    let mix = nanos ^ (u128::from(pid) << 64);
     format!("terminal-rs-{:016x}", (mix as u64) ^ ((mix >> 64) as u64))
 }
 

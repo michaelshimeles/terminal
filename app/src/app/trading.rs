@@ -23,7 +23,7 @@
 //! quietly when SnapTrade rate-limits.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::{Color32, RichText, Ui};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use tr_broker::trading::{
     self, Amount, Capability, OrderPreview, OrderRequest, OrderType, PlaceError, Side, TimeInForce,
 };
 use tr_broker::{Account, InstrumentKind, Order, demo};
+use web_time::Instant;
 
 use super::TerminalApp;
 use super::broker::{BrokerMode, open_external};
@@ -322,7 +323,8 @@ impl TerminalApp {
         if std::mem::replace(&mut self.trading.caps_loaded, true) {
             return;
         }
-        let cached: Option<CapsCache> = std::fs::read(caps_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let cached: Option<CapsCache> =
+            crate::storage::read(&caps_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
         if self.trading.caps.is_none() {
             self.trading.caps = cached;
         }
@@ -370,7 +372,7 @@ impl TerminalApp {
             Ok(caps) => {
                 let cache = CapsCache { fetched: Some(chrono::Utc::now()), caps };
                 if let Ok(json) = serde_json::to_vec_pretty(&cache)
-                    && let Err(e) = crate::layouts::write_atomic(&caps_path(), &json)
+                    && let Err(e) = crate::storage::write_atomic(&caps_path(), &json)
                 {
                     tracing::warn!("saving trading access: {e}");
                 }

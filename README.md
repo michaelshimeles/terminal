@@ -327,10 +327,14 @@ app/            eframe shell: command line, docked panes, chart widget, panels
   themes.rs     theme model, built-in themes, TOML/JSON theme files and the themes folder
   app/          workspace (drag and drop, pop-out windows, link groups), panels, settings, chrome
   worker.rs     tokio runtime: all network, SQLite, pyramid and indicator work (UI never blocks)
+  storage.rs    saved files: the data folder on desktop, localStorage in the browser
+  web.rs        browser entry point (eframe web runner), console logging, frame timings
+  web/          the page that hosts the browser build
 crates/core     Bar/Series, timeframes, market keys + security catalog, indicators and their
                 registry (codes, parameters, panes, levels), sample data
 crates/data     MarketData trait; per-class router (Binance/Coinbase, Treasury.gov/FRED, Yahoo,
-                Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache
+                Alpaca), websocket live feeds, sample provider with simulated ticks; bar cache;
+                the browser router (crypto live, the rest sampled) and a tokio/browser task shim
 crates/chart    wgpu renderer, LOD pyramids, viewport math, axes, drawings, egui paint callback
 crates/congress Senate eFD + House Clerk parsers, rosters, SQLite store, refresh, alerts, performance
 crates/broker   SnapTrade client (request signing, accounts, balances, positions, orders, activity),

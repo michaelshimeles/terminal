@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tr_core::{Bar, Timeframe, sample};
 
-use crate::{LiveFeed, MarketData, OptionChain, OrderBook, security};
+use crate::{LiveFeed, MarketData, OptionChain, OrderBook, rt, security};
 
 /// Deterministic synthetic data anchored at a fixed "now" per process, so paging is
 /// consistent: page N+1 is exactly the bars preceding page N. Levels and volatility
@@ -74,8 +74,8 @@ impl MarketData for SampleProvider {
         let (tx, rx) = mpsc::channel(64);
         let tick_vol = sec.class.sample_vol() * (0.4 / (365.0 * 86_400.0f64)).sqrt() * 8.0;
         let mut rng = sample::Rng::new(sample::seed_for(symbol) ^ 0x5eed);
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_millis(400));
+        rt::spawn(async move {
+            let mut iv = rt::interval(Duration::from_millis(400));
             loop {
                 iv.tick().await;
                 let now = chrono::Utc::now().timestamp();

@@ -1,13 +1,14 @@
 //! Window chrome in the style of a SwiftUI macOS app: a unified toolbar holding the
 //! command line, a translucent (vibrancy) sidebar, rounded pane cards and a status bar.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Id, Key, Modifiers, Rect, RichText, Sense, Shadow, Stroke, StrokeKind,
     Ui, UiBuilder, ViewportCommand, pos2, vec2,
 };
 use tr_data::SearchHit;
+use web_time::Instant;
 
 use super::{PaneKind, TerminalApp};
 use crate::anim;
@@ -101,8 +102,8 @@ impl TerminalApp {
         resp.context_menu(|ui| self.view_menu(ui));
 
         // Data source chip (the window title itself is redundant in a compact toolbar).
-        let live = !self.provider.eq_ignore_ascii_case("sample");
-        let chip_text = p.layout_no_wrap(if live { "Live" } else { "Offline" }.into(), ui_font(11.0), muted());
+        let (label, live) = self.source_chip();
+        let chip_text = p.layout_no_wrap(label.into(), ui_font(11.0), muted());
         let chip = Rect::from_min_size(pos2(x, cy - 9.0), vec2(chip_text.size().x + 20.0, 18.0));
         p.rect_filled(chip, 9.0, theme::control());
         p.circle_filled(pos2(chip.left() + 8.0, cy), 3.0, if live { theme::up() } else { amber() });
@@ -281,9 +282,28 @@ impl TerminalApp {
         }
     }
 
+    /// The data-source chip's label, and whether any of the data is live.
+    fn source_chip(&self) -> (&'static str, bool) {
+        let n = self.provider.to_lowercase();
+        if n == "sample" {
+            ("Offline", false)
+        } else if n.contains("sample") {
+            ("Crypto live", true)
+        } else {
+            ("Live", true)
+        }
+    }
+
     fn provider_label(&self) -> String {
         let n = self.provider.to_lowercase();
-        if n.contains("sample") { "Offline · sample data".into() } else { format!("Live · {}", self.provider) }
+        if n == "sample" {
+            "Offline · sample data".into()
+        } else if n.contains("sample") {
+            // The browser build (tr_data::web::WebMarkets).
+            "Live crypto from Binance and Coinbase; every other market is sample data in the browser".into()
+        } else {
+            format!("Live · {}", self.provider)
+        }
     }
 
     /// The Bloomberg command line, drawn as a rounded macOS search field.

@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 default-run = "terminal-rs"
 
+[features]
+# Browser build only: add wgpu's WebGL2 backend for browsers without WebGPU (about 1 MB more,
+# and charts stay off there because WebGL2 has no storage buffers).
+webgl = ["eframe/wgpu"]
+
 [dependencies]
 tr-core.workspace = true
 tr-broker.workspace = true
@@ -16,13 +21,30 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 futures = "0.3"
 egui = "0.36"
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features", "default_fonts", "wayland", "x11"] }
 tr-macos.workspace = true
+web-time = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["wgpu"] }
+tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 raw-window-handle = "0.6"
+
+# The browser build (see `src/web.rs` and scripts/build-web.sh): WebGPU only, unless the
+# `webgl` feature adds the WebGL2 fallback.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["webgpu", "wgsl"] }
+egui-wgpu = { version = "0.36", default-features = false, features = ["fragile-send-sync-non-atomic-wasm"] }
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
+chrono = { workspace = true, features = ["wasmbind"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "Location", "Performance", "Storage", "console"] }

@@ -256,6 +256,7 @@ impl SnapTrade {
         Self::with_base(creds, &base)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_base(creds: Credentials, base: &str) -> Result<Self> {
         if !creds.has_keys() {
             bail!("SnapTrade client ID and consumer key are not set");
@@ -266,6 +267,14 @@ impl SnapTrade {
             .build()?;
         let base = Url::parse(base.trim_end_matches('/')).context("invalid SnapTrade base URL")?;
         Ok(Self { http, base, creds })
+    }
+
+    /// SnapTrade doesn't answer cross-origin requests, so the browser build can't make a client
+    /// (and so never sends an order).
+    /// TODO(web proxy): call SnapTrade through a same-origin proxy that keeps the keys server-side.
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_base(_creds: Credentials, _base: &str) -> Result<Self> {
+        bail!("SnapTrade isn't available in the browser yet; use the desktop app for brokerage accounts")
     }
 
     pub fn credentials(&self) -> &Credentials {

@@ -36,3 +36,13 @@ debug = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# The browser build (scripts/build-web.sh): one fully optimised unit, no debug info, so the
+# .wasm is as small as it gets before wasm-opt.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = true

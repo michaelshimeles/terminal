@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::{NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+pub use crate::model::{Alert, PoliticianSummary};
 use crate::model::{AmountRange, Chamber, ParsedTrade, Party, Politician, Trade, TxType};
 
 const SCHEMA: &str = r#"
@@ -111,32 +112,12 @@ pub struct FilingRecord {
     pub is_amendment: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Alert {
-    pub id: i64,
-    pub politician_id: i64,
-    pub politician: String,
-    pub filing_id: String,
-    pub created_at: i64,
-    pub message: String,
-    pub seen: bool,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     pub politicians: i64,
     pub filings: i64,
     pub trades: i64,
     pub scanned: i64,
-}
-
-/// A politician with aggregate trade counts, for list views.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PoliticianSummary {
-    pub politician: Politician,
-    pub trades: i64,
-    pub last_filed: Option<NaiveDate>,
-    pub tracked: bool,
 }
 
 pub struct Db {

@@ -16,6 +16,7 @@ use crate::command::IndicatorSpec;
 use crate::congress_view::FeedFilter;
 use crate::dock::{Node, PaneId};
 use crate::layout::Layout;
+use crate::storage;
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -276,16 +277,6 @@ pub fn chart_settings(symbol: &str, d: &crate::prefs::PanelDefaults) -> PaneSett
     }
 }
 
-/// Write via a temp file and rename, so a crash never leaves a half-written file.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(tmp, path)
-}
-
 /// The layouts folder and its files.
 pub struct Store {
     pub dir: PathBuf,
@@ -314,19 +305,17 @@ impl Store {
     /// Saved layout names, sorted case-insensitively. Names come from the documents, so a
     /// file copied in under any file name keeps its display name.
     pub fn list(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.dir)
+        let mut names: Vec<String> = storage::list(&self.dir)
             .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .filter_map(|e| {
-                let bytes = std::fs::read(e.path()).ok()?;
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .filter_map(|p| {
+                let bytes = storage::read(&p).ok()?;
                 let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
                 Some(
                     doc["name"]
                         .as_str()
                         .map(str::to_string)
-                        .unwrap_or_else(|| e.path().file_stem().unwrap_or_default().to_string_lossy().into_owned()),
+                        .unwrap_or_else(|| p.file_stem().unwrap_or_default().to_string_lossy().into_owned()),
                 )
             })
             .collect();
@@ -343,12 +332,12 @@ impl Store {
     /// that name (e.g. dropped into the folder by hand).
     fn find_file(&self, name: &str) -> Option<PathBuf> {
         let p = self.path(name);
-        if p.exists() {
+        if storage::exists(&p) {
             return Some(p);
         }
-        std::fs::read_dir(&self.dir).ok()?.flatten().map(|e| e.path()).find(|p| {
+        storage::list(&self.dir).into_iter().find(|p| {
             p.extension().is_some_and(|x| x == "json")
-                && std::fs::read(p)
+                && storage::read(p)
                     .ok()
                     .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                     .is_some_and(|v| v["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))
@@ -357,7 +346,7 @@ impl Store {
 
     pub fn load(&self, name: &str) -> Result<LayoutDoc> {
         let path = self.find_file(name).with_context(|| format!("no saved layout named {name:?}"))?;
-        let mut doc = LayoutDoc::from_json(&std::fs::read(&path)?).with_context(|| format!("{}", path.display()))?;
+        let mut doc = LayoutDoc::from_json(&storage::read(&path)?).with_context(|| format!("{}", path.display()))?;
         if doc.name.trim().is_empty() {
             doc.name = name.to_string();
         }
@@ -366,13 +355,13 @@ impl Store {
 
     pub fn save(&self, doc: &LayoutDoc) -> Result<PathBuf> {
         let path = self.path(&doc.name);
-        write_atomic(&path, &doc.to_json()).with_context(|| format!("writing {}", path.display()))?;
+        storage::write_atomic(&path, &doc.to_json()).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }
 
     pub fn delete(&self, name: &str) -> Result<()> {
         let path = self.find_file(name).with_context(|| format!("no saved layout named {name:?}"))?;
-        std::fs::remove_file(path)?;
+        storage::remove(&path)?;
         Ok(())
     }
 
@@ -414,13 +403,13 @@ impl Store {
     /// Write a layout to an arbitrary path.
     pub fn export(&self, name: &str, to: &Path) -> Result<()> {
         let doc = self.load(name)?;
-        write_atomic(to, &doc.to_json()).with_context(|| format!("writing {}", to.display()))
+        storage::write_atomic(to, &doc.to_json()).with_context(|| format!("writing {}", to.display()))
     }
 
     /// Copy a layout file into the store (renaming on conflict). Returns its name.
     pub fn import(&self, from: &Path) -> Result<String> {
         let mut doc =
-            LayoutDoc::from_json(&std::fs::read(from).with_context(|| format!("reading {}", from.display()))?)?;
+            LayoutDoc::from_json(&storage::read(from).with_context(|| format!("reading {}", from.display()))?)?;
         if doc.name.trim().is_empty() {
             doc.name = from.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         }

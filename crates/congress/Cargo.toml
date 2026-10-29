@@ -6,11 +6,14 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-thiserror.workspace = true
 chrono.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 regex.workspace = true
+
+# Ingest and storage: desktop only (the browser build has no SQLite and can't reach the sources).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+thiserror.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

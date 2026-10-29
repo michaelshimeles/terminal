@@ -24,3 +24,6 @@ vite.config.ts.timestamp-*
 
 # Page screenshots for review
 /review
+
+# Browser build output (scripts/build-web.sh)
+/static/app

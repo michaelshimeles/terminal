@@ -471,7 +471,7 @@ impl TerminalApp {
         match self.theme_store.save(&self.themes[i]) {
             Ok(path) => {
                 if let Some(f) = old_file.filter(|f| *f != path) {
-                    let _ = std::fs::remove_file(f);
+                    let _ = crate::storage::remove(&f);
                 }
                 self.themes[i].source = Some(path);
             }

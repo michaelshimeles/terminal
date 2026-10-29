@@ -12,13 +12,54 @@ mod layouts;
 mod markets_view;
 mod palette;
 mod prefs;
+mod storage;
 mod theme;
 mod themes;
+#[cfg(target_arch = "wasm32")]
+mod web;
 mod widgets;
 mod worker;
 
-use std::time::Instant;
+use app::TerminalApp;
+use web_time::Instant;
 
+/// Build the terminal once eframe has a GPU: register the chart renderer, start the worker
+/// and restore the saved workspace. Shared by the desktop and browser entry points.
+fn create_app(
+    cc: &eframe::CreationContext<'_>,
+    provider: tr_data::Provider,
+    msaa: u32,
+    t0: Instant,
+) -> Result<TerminalApp, Box<dyn std::error::Error + Send + Sync>> {
+    let rs = cc.wgpu_render_state.as_ref().ok_or("terminal-rs requires the wgpu renderer")?;
+    // Charts read their series from storage buffers in the vertex shader. WebGL2 has none,
+    // so there chart panes keep their axes and labels but draw no series.
+    let charts = rs.adapter.get_downlevel_capabilities().flags.contains(eframe::wgpu::DownlevelFlags::VERTEX_STORAGE);
+    if charts {
+        rs.renderer.write().callback_resources.insert(tr_chart::gpu::ChartRenderer::new(
+            &rs.device,
+            rs.target_format,
+            msaa,
+        ));
+    }
+    let name = provider.name().to_string();
+    let worker = worker::Worker::spawn(cc.egui_ctx.clone(), provider)?;
+    let info = rs.adapter.get_info();
+    tracing::info!("window + GPU ready in {:?} (adapter: {}, backend: {:?})", t0.elapsed(), info.name, info.backend);
+    let mut app = TerminalApp::new(&cc.egui_ctx, worker, name);
+    if !charts {
+        tracing::warn!("this GPU backend has no vertex storage buffers; charts are off");
+        app.set_status("Charts need WebGPU, which this browser doesn't offer (it fell back to WebGL2).".into());
+    }
+    Ok(app)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    web::start();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let t0 = Instant::now();
     tracing_subscriber::fmt()
@@ -58,18 +99,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "terminal-rs",
         options,
-        Box::new(move |cc| {
-            let rs = cc.wgpu_render_state.as_ref().ok_or("terminal-rs requires the wgpu renderer")?;
-            rs.renderer.write().callback_resources.insert(tr_chart::gpu::ChartRenderer::new(
-                &rs.device,
-                rs.target_format,
-                u32::from(msaa),
-            ));
-            let provider = tr_data::from_env();
-            let name = provider.name().to_string();
-            let worker = worker::Worker::spawn(cc.egui_ctx.clone(), provider)?;
-            tracing::info!("window + GPU ready in {:?} (adapter: {})", t0.elapsed(), rs.adapter.get_info().name);
-            Ok(Box::new(app::TerminalApp::new(&cc.egui_ctx, worker, name)))
-        }),
+        Box::new(move |cc| Ok(Box::new(create_app(cc, tr_data::from_env(), u32::from(msaa), t0)?))),
     )
 }

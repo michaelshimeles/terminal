@@ -7,11 +7,13 @@
 //! demo change is saved at once to `demo-account.json` in the app data folder.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use anyhow::Context;
 use tr_broker::demo::{DemoBook, Event, STARTING_CASH};
 use tr_broker::trading::OrderRequest;
 use tr_broker::{InstrumentKind, Order, Portfolio};
+use web_time::Instant;
 
 use super::TerminalApp;
 use crate::prefs::AccountMode;
@@ -49,11 +51,16 @@ impl DemoState {
     /// account starts; the returned message says so.
     pub fn load(path: PathBuf) -> (Self, Option<String>) {
         let now = chrono::Utc::now();
-        let (book, note) = match DemoBook::load(&path, now) {
+        let saved = match crate::storage::read(&path) {
+            Ok(bytes) => DemoBook::from_json(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DemoBook::new(now)),
+            Err(e) => Err(anyhow::Error::new(e).context("reading the demo account")),
+        };
+        let (book, note) = match saved {
             Ok(b) => (b, None),
             Err(e) => {
                 let aside = path.with_extension(format!("damaged-{}.json", now.format("%Y%m%d%H%M%S")));
-                let moved = std::fs::rename(&path, &aside).is_ok();
+                let moved = crate::storage::rename(&path, &aside).is_ok();
                 tracing::warn!("demo account: {e:#}");
                 let note = if moved {
                     format!(
@@ -91,7 +98,11 @@ impl DemoState {
     /// Save now. Returns whether the book is on disk.
     pub fn save(&mut self) -> bool {
         self.last_save_try = Some(Instant::now());
-        match self.book.save(&self.path) {
+        let saved = self
+            .book
+            .to_json()
+            .and_then(|json| crate::storage::write_atomic(&self.path, &json).context("saving the demo account"));
+        match saved {
             Ok(()) => {
                 self.save_error = None;
                 true

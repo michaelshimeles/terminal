@@ -9,6 +9,10 @@ use tr_congress::{Chamber, Party, Trade, TxType};
 use crate::theme::{self, amber, mono, muted, text, ui_font};
 use crate::worker::Profile;
 
+/// Shown instead of Congress data in the browser build, which can't fetch disclosures yet.
+pub const WEB_NOTE: &str =
+    "Congress data needs the desktop app for now: browsers can't reach Senate eFD or the House Clerk.";
+
 /// What a click inside a panel asks the app to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -192,7 +196,12 @@ pub fn feed(ui: &mut Ui, trades: &[Trade], filter: &mut FeedFilter, status: &str
     header(ui, "FILED    TRADED   LAG  POLITICIAN             PTY  C  TYPE TICKER AMOUNT        OWNER    ASSET");
     let rows: Vec<&Trade> = trades.iter().filter(|t| filter.matches(t)).collect();
     if rows.is_empty() {
-        plain(ui, "No disclosures yet. Ingest runs in the background (REFRESH to force).", muted());
+        let empty = if cfg!(target_arch = "wasm32") {
+            WEB_NOTE
+        } else {
+            "No disclosures yet. Ingest runs in the background (REFRESH to force)."
+        };
+        plain(ui, empty, muted());
     }
     let row_h = 16.0;
     ScrollArea::both().id_salt("feed").auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {

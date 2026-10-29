@@ -20,7 +20,7 @@ mod workspace;
 pub use broker::PosSort;
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::{Color32, Event, Key, Modifiers, Rect, Ui, UiBuilder, pos2, vec2};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ use tr_chart::drawings::Tool;
 use tr_congress::Trade;
 use tr_congress::db::{Alert, PoliticianSummary};
 use tr_data::{NewsItem, OrderBook, Quote, SearchHit, YieldCurves};
+use web_time::Instant;
 
 use crate::anim;
 use crate::chart_view::ChartState;
@@ -568,7 +569,7 @@ impl TerminalApp {
             };
         }
         let settings: Option<Settings> =
-            std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            crate::storage::read(&settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
         let broker = broker::BrokerState::load(provider.eq_ignore_ascii_case("sample"));
         let (demo, demo_note) = demo::DemoState::load(demo::demo_path());
         let mut app = Self {
@@ -681,6 +682,17 @@ impl TerminalApp {
         app
     }
 
+    /// Replace the status bar message.
+    pub fn set_status(&mut self, status: String) {
+        self.status = status;
+    }
+
+    /// Show the frame-time readout (as F12 does); the browser's `?fps` flag.
+    #[cfg(target_arch = "wasm32")]
+    pub fn show_perf(&mut self) {
+        self.show_perf = true;
+    }
+
     fn save_settings(&self) {
         let s = Settings {
             watchlist: self.watchlist.clone(),
@@ -690,7 +702,7 @@ impl TerminalApp {
             panes: None,
         };
         if let Ok(json) = serde_json::to_vec_pretty(&s)
-            && let Err(e) = crate::layouts::write_atomic(&settings_path(), &json)
+            && let Err(e) = crate::storage::write_atomic(&settings_path(), &json)
         {
             tracing::warn!("saving settings: {e}");
         }
@@ -1086,6 +1098,9 @@ impl TerminalApp {
 
     /// Freshness line for the Congress feed: last check, newest filing, next check.
     fn congress_freshness(&self) -> String {
+        if cfg!(target_arch = "wasm32") {
+            return "desktop app only for now".into();
+        }
         let newest = self.latest.iter().map(|t| t.filed_date).max();
         let minutes = std::env::var("TR_CONGRESS_REFRESH_MIN")
             .ok()
@@ -1560,6 +1575,13 @@ impl eframe::App for TerminalApp {
         }
         let cpu = frame_start.elapsed().as_secs_f64() * 1e3;
         self.perf_cpu_ms = self.perf_cpu_ms * 0.9 + cpu * 0.1;
+        #[cfg(target_arch = "wasm32")]
+        crate::web::record_frame(&crate::web::FrameStats {
+            ui_ms: self.perf_cpu_ms,
+            interval_ms: self.perf_dt_ms,
+            last_cpu_ms: frame.info().cpu_usage.map_or(0.0, |s| f64::from(s) * 1e3),
+            frames: ctx.cumulative_frame_nr(),
+        });
         if self.show_perf {
             // Measure continuously while the readout is visible.
             ctx.request_repaint();
