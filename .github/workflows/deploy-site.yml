@@ -27,7 +27,7 @@ jobs:
     name: Build the browser app
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Pull requests build the branch head, like Vercel's Git previews did, not the merge commit.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -51,7 +51,7 @@ jobs:
           tar xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/binaryen-$BINARYEN/bin" >> "$GITHUB_PATH"
       - run: scripts/build-web.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: web-app
           path: site/static/app
@@ -84,14 +84,14 @@ jobs:
             fi
           done
           exit $missing
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: web-app
           path: site/static/app
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm

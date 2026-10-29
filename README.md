@@ -207,13 +207,13 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked   # must match Cargo.lock
 brew install binaryen                                       # wasm-opt
 scripts/build-web.sh                                        # writes site/static/app
-cd site && npm run dev                                      # then open http://localhost:5173/app
+cd site && npm run dev                                      # then open http://localhost:5173/app/index.html
 ```
 
 `scripts/build-web.sh <dir>` writes somewhere else instead; any static file server works. Add
 `?sample` to the URL to run offline on sample data, or `?fps` for the frame-time readout.
 Every push to `master` builds it and deploys it with the site to
-[terminal.rasmic.xyz/app](https://terminal.rasmic.xyz/app). Pull requests get a preview;
+[terminal.rasmic.xyz/app](https://terminal.rasmic.xyz/app/). Pull requests get a preview;
 [site/README.md](site/README.md#deploys) covers the workflow and the secrets it needs.
 
 ![The browser build in Chrome: a live BTCUSD chart from Binance beside a demo-account position](docs/img/web-live-crypto.png)

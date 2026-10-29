@@ -7,6 +7,11 @@
 # WebGL2 fallback, which is larger and draws no charts). The page loads the second only when
 # the browser has no WebGPU adapter.
 #
+# Each build's JS glue and wasm go in immutable/<hash>/, a folder named after a hash of its
+# files, and index.html points at those folders. A new build gets new URLs, so the site can
+# cache everything under immutable/ for good (site/vercel.json), and a page can't pair one
+# build's JS with another build's wasm.
+#
 # Needs the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown),
 # wasm-bindgen-cli at the version pinned in Cargo.lock, and wasm-opt from binaryen.
 set -euo pipefail
@@ -30,19 +35,32 @@ features=(--enable-bulk-memory --enable-bulk-memory-opt --enable-call-indirect-o
 	--enable-mutable-globals --enable-nontrapping-float-to-int --enable-reference-types --enable-sign-ext)
 
 mkdir -p "$out"
-rm -rf "$out"/terminal* "$out/fonts"
+rm -rf "$out"/terminal* "$out/immutable" "$out/fonts"
+
+# sed expressions that replace each {name} in index.html with that build's path
+paths=()
+
+# SHA-256 of stdin. Older macOS has shasum but no sha256sum.
+sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
 
 # build <name> [cargo args...]
 build() {
-	local name=$1
+	local name=$1 tmp="$out/immutable/.$1" hash
 	shift
 	cargo build --profile web --target "$target" -p terminal-rs "$@"
-	wasm-bindgen --target web --no-typescript --out-dir "$out" --out-name "$name" "$wasm"
-	wasm-opt -Os "${features[@]}" --strip-debug --strip-producers "$out/${name}_bg.wasm" -o "$out/${name}_bg.wasm"
+	wasm-bindgen --target web --no-typescript --out-dir "$tmp" --out-name "$name" "$wasm"
+	wasm-opt -Os "${features[@]}" --strip-debug --strip-producers "$tmp/${name}_bg.wasm" -o "$tmp/${name}_bg.wasm"
+	hash=$(cd "$tmp" && find . -type f | LC_ALL=C sort | xargs cat | sha256 | cut -c 1-16)
+	mv "$tmp" "$out/immutable/$hash"
+	paths+=(-e "s#{$name}#immutable/$hash/$name#g")
 }
 build terminal
 build terminal-webgl --features webgl
-cp app/web/index.html "$out/index.html"
+sed "${paths[@]}" app/web/index.html >"$out/index.html"
+if grep -n '{terminal[a-z-]*}' "$out/index.html" >&2; then
+	echo "index.html names a build that this script doesn't make" >&2
+	exit 1
+fi
 
 # egui's emoji fonts, which the page fetches after start-up (see app/src/web.rs), with their licenses.
 fonts=$(cargo metadata --format-version 1 --locked --filter-platform "$target" | python3 -c '
@@ -54,9 +72,8 @@ cp "$fonts"/{NotoEmoji-Regular.ttf,OFL.txt,emoji-icon-font.ttf,emoji-icon-font-m
 
 size() { wc -c <"$1" | tr -d ' '; }
 echo "wrote $out"
-for name in terminal terminal-webgl; do
-	f="$out/${name}_bg.wasm"
+for f in "$out"/immutable/*/*_bg.wasm; do
 	gz=$(gzip -9c "$f" | wc -c | tr -d ' ')
 	br=$(command -v brotli >/dev/null && brotli -c -q 11 "$f" | wc -c | tr -d ' ' || echo "n/a")
-	echo "${name}_bg.wasm: $(size "$f") bytes raw, $gz gzip -9, $br brotli -q 11; ${name}.js: $(size "$out/$name.js") bytes"
+	echo "${f#"$out"/}: $(size "$f") bytes raw, $gz gzip -9, $br brotli -q 11; $(basename "${f%_bg.wasm}").js: $(size "${f%_bg.wasm}.js") bytes"
 done
