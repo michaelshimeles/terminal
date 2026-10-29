@@ -40,6 +40,9 @@ rm -rf "$out"/terminal* "$out/immutable" "$out/fonts"
 # sed expressions that replace each {name} in index.html with that build's path
 paths=()
 
+# SHA-256 of stdin. Older macOS has shasum but no sha256sum.
+sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+
 # build <name> [cargo args...]
 build() {
 	local name=$1 tmp="$out/immutable/.$1" hash
@@ -47,7 +50,7 @@ build() {
 	cargo build --profile web --target "$target" -p terminal-rs "$@"
 	wasm-bindgen --target web --no-typescript --out-dir "$tmp" --out-name "$name" "$wasm"
 	wasm-opt -Os "${features[@]}" --strip-debug --strip-producers "$tmp/${name}_bg.wasm" -o "$tmp/${name}_bg.wasm"
-	hash=$(cd "$tmp" && find . -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -c 1-16)
+	hash=$(cd "$tmp" && find . -type f | LC_ALL=C sort | xargs cat | sha256 | cut -c 1-16)
 	mv "$tmp" "$out/immutable/$hash"
 	paths+=(-e "s#{$name}#immutable/$hash/$name#g")
 }
