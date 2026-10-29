@@ -28,7 +28,7 @@ How facts are marked:
 
 ### Non-goals (for this design)
 
-- **No trading through the server.** The server is data only. It never signs, routes or places orders on Hyperliquid or anywhere else. That includes the SnapTrade order paths in `crates/broker/src/trading.rs`, which stay client-side and out of scope. The reasons are the legal flag in §13 (Hyperliquid's Terms of Use) and Micky's steer. The demo account is paper trading against our own quotes and never touches a venue.
+- **No trading through the server.** The server is data only. It never signs, routes or places orders on Hyperliquid or anywhere else. The SnapTrade order paths in `crates/broker/src/trading.rs` stay client-side on the desktop, with the user's local credentials. They are unchanged and out of scope (§9). The reasons are the legal flag in §13 (Hyperliquid's Terms of Use) and Micky's steer. The demo account is paper trading against our own quotes and never touches a venue.
 - No licensed stock or options data yet. Only the interface for it is in scope (§3.1).
 - No public API for third parties. The protocol is for our own clients.
 - No running of a Hyperliquid **validator**. A non-validator node is discussed in §6.
@@ -117,7 +117,7 @@ Adapters at launch:
 |---|---|---|
 | `HlProvider` | Hyperliquid public WS and `/info` (later, a local node) | §5 and §6 |
 | `CongressProvider` | Senate eFD and House Clerk | Reuses `tr-congress` unchanged (§9) |
-| `SnapTradeProvider` | SnapTrade, read-only | Per-user and private, so it is not a market-data topic (§9) |
+| `SnapTradeProvider` | SnapTrade, read-only server mode | Per-user and private, so it is not a market-data topic. Desktop local mode is unchanged (§9). |
 | `CryptoProvider` (existing) | Binance and Coinbase | Off for public display |
 | `TreasuryProvider` (existing) | Treasury.gov, with FRED as fallback | Yield curves |
 
@@ -134,7 +134,8 @@ This converts provider payloads into the shared types in `tr-core` and `tr-data`
 ### 3.3 In-memory hot store with fan-out
 
 - The store is a **topic table** keyed by `Topic` (for example `Quote(MarketKey)`, `Bars(MarketKey, Timeframe)`, `Book(MarketKey, depth, group)`, `Trades(MarketKey)`, `Ctx(MarketKey)`, `Congress(Latest)`, `Doc(UserId, DocId)`).
-- **State topics** (quote, book, ctx, the forming bar) use `tokio::sync::watch` style "latest value wins". A slow reader skips intermediate values, which conflates naturally.
+- **State topics** (quote, book, ctx) use `tokio::sync::watch` style "latest value wins". A slow reader skips intermediate values, which conflates naturally.
+- **Bars are a hybrid, not a pure state topic.** Updates to the *forming* bar may be conflated, but only within the same bar `ts`. When the upstream bar `ts` advances, the server first emits a non-conflatable `BarClosed { bar }` event with the previous bar's final OHLCV, then the new forming bar. `BarClosed` goes through the event ring like trades, so a slow client can never skip a closed bar's final values. If it overflows, the client gets `Resync` and a fresh history snapshot (§4.3).
 - **Event topics** (trades, congress alerts, document ops) use a bounded `broadcast` ring with a per-topic sequence number. A reader that falls behind the ring gets `Resync` (§4.3).
 - Each topic keeps a **refcount** of client subscribers. The upstream subscription is created when the count goes from 0 to 1, and dropped after a **linger** period (start at 60 s [target]) once the count returns to 0. This absorbs pane flicker and reconnect storms.
 - Snapshots are served from memory, so a new client gets the current book or quote without touching the upstream.
@@ -174,7 +175,7 @@ pub enum ClientMsg {
     Unsubscribe { id: SubId },
     Resync { id: SubId },                                 // client detected a gap; ask for a fresh snapshot
     Request { id: ReqId, req: Rpc },                      // one-shot: History{key,tf,end,limit}, Search, Options…
-    DocOp { id: ReqId, doc: DocId, base_rev: u64, op: DocOperation },   // user-sync writes (§8)
+    DocOp { id: ReqId, op_id: OpId, doc: DocId, base_rev: u64, op: DocOperation },   // user-sync writes (§8); op_id is a client UUID, stable across retries
     Ping { t: u64 },
 }
 
@@ -206,7 +207,7 @@ pub enum TopicReq {
 - Every subscription has its own `seq`. A `Snapshot` sets it, and each `Delta` increments it by 1.
 - **The client checks continuity.** On a gap, or on a `Delta` before its `Snapshot`, the client sends `Resync`. The server answers with a new `Snapshot`.
 - **The server sends `Resync` itself** when an event topic's ring overflowed for that client (§5.3), or after upstream recovery (§5.4), because the server's own state may have jumped.
-- **For state topics a delta is just the new value** (a quote or a book), so a lost delta is harmless and those topics never need a resync on overflow. Bars deltas carry the forming bar; a new `ts` means the previous bar closed. This is the same contract as today's `LiveFeed`, so `chart_view` merges with `Bar::absorb` unchanged.
+- **For state topics a delta is just the new value** (a quote or a book), so a lost delta is harmless and those topics never need a resync on overflow. Bars deltas are `Forming(bar)` (conflatable within one `ts`) or `Closed(bar)` (never conflated, always delivered before the first `Forming` of the next `ts`). The client applies `Closed` by *replacing* the bar with that `ts`, which repairs any partial bar it had. Today's `Series::apply_live` only appends a newer bar, so `RemoteMarkets` must apply `Closed` with a replace before forwarding to the existing `LiveFeed` consumer. A test in phase 5 covers a slow reader across a boundary.
 - **Reconnect:** `Hello.resume` holds the previous session's resume token. The server re-attaches the subscriptions and sends a fresh `Snapshot` for each one. Clients never replay old deltas.
 
 ### 4.4 Encoding
@@ -449,7 +450,7 @@ Each file in `storage.rs` becomes a server document `(user_id, kind, name)` with
 | Prefs, themes, hotkeys, palette history | TOML/JSON files | Key-level merge | Last-writer-wins per key |
 | Demo portfolio | `DemoBook` JSON | **Server-authoritative.** Clients send commands, and the server fills against its own hot quotes and broadcasts the book. | No merge needed: one writer. Paper only; it never routes to a venue. |
 
-Offline behaviour: clients keep today's local files as a cache and an outbox. On reconnect, they replay queued `DocOp`s with their `base_rev`, and conflicts resolve as above. The first sign-in uploads the local documents. If the server already has documents, the user chooses "merge" or "keep server".
+Offline behaviour: clients keep today's local files as a cache and an outbox. Each queued `DocOp` carries an `op_id` (a UUID generated once, when the edit is made, and persisted with the outbox entry). The server records `(user_id, op_id) → result (rev or conflict outcome)` **in the same transaction as the write**, and keeps it for at least 30 days [target]. On reconnect, clients replay queued `DocOp`s with their original `op_id` and `base_rev`. If the server has already applied that `op_id`, it returns the original `DocAck` or `DocConflict` instead of re-evaluating `base_rev`. So a lost acknowledgement never creates a spurious conflict copy. Genuine conflicts resolve as above. The first sign-in uploads the local documents. If the server already has documents, the user chooses "merge" or "keep server".
 
 The demo book fills at the server's quotes, which come from Hyperliquid perp prices (§7). So the demo account must show the same `PERP` labelling, and its fills can happen off-hours, a behaviour change from today [unverified UX decision].
 
@@ -460,7 +461,7 @@ The demo book fills at the server's quotes, which come from Hyperliquid perp pri
 | Feed | Today | Server |
 |---|---|---|
 | Congress (Senate eFD, House Clerk) | Each desktop ingests every 30 min. The web gets nothing. | One `CongressProvider` runs `tr_congress::refresh` on schedule into the server DB. Topics: `Congress(Latest)`, `Congress(Ticker)`, `Congress(Politician)`. Tracking alerts are per-user pushes. The web gets the full feature. **Legal note:** the reports carry statutory limits on commercial use (Ethics in Government Act) [unverified for our use; needs legal review]. |
-| SnapTrade (read-only) | Partner keys (`clientId`, `consumerKey`) and the user secret sit on each machine | Partner keys **live only on the server**. Each Terminal user maps to a SnapTrade `userId` and an encrypted `userSecret`. The server proxies the read-only endpoints (accounts, positions, orders, activities) and the Connection Portal link. Portfolio pushes on refresh. Order placement stays out (§1). |
+| SnapTrade | Partner keys (`clientId`, `consumerKey`) and the user secret sit on each machine. The desktop uses them for reads *and* for order preview, place and cancel (`crates/broker/src/trading.rs`). | **Two modes.** (a) *Server mode* (web, mobile, and opt-in desktop): partner keys live only on the server. Each Terminal user maps to a SnapTrade `userId` and an encrypted `userSecret`, and the server proxies only the read-only endpoints (accounts, positions, orders, activities) plus the Connection Portal link. No trading in this mode. (b) *Local mode* (desktop, today's behaviour, unchanged): the local credentials stay in the Keychain or the 0600 file, and the desktop keeps calling SnapTrade directly for reads and for its existing order paths. This design does not migrate or remove local credentials, so existing desktop trading keeps working. Moving trading server-side is out of scope (§1) and would need its own design. |
 | Yahoo, Treasury, FRED, Alpaca, RSS | Client-side; the web gets sample data | Server-side adapters with `DisplayPolicy` (§3.1). Yahoo and RSS are off for public display until reviewed [unverified]. |
 | Binance and Coinbase crypto | Client-side websockets | Server-side, `public_display: false` (§3.1). Hyperliquid core perps and spot become the default crypto source. |
 
@@ -511,7 +512,7 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 | 7 | Auth (sign-in) and accounts. Document sync for layouts, prefs and watchlists, with the conflict rules. | Two devices stay in sync, and conflicts never lose work. |
 | 8 | Drawings (stable ids) and a server-authoritative demo book | Real-time cross-device drawings. One paper book. |
 | 9 | `CongressProvider` server-side. The web gets the Congress panes. | Congress data reaches the web and the stub is deleted. |
-| 10 | `SnapTradeProvider` server-side, with partner keys only on the server | No partner secrets in clients. |
+| 10 | `SnapTradeProvider` server-side (read-only server mode). Desktop local mode is left untouched. | Web and mobile get portfolios with no partner secrets in those clients. Desktop trading still works. |
 | 11 | Deploy (staging and prod), metrics, dashboards and alerts | It runs unattended and we can see when it doesn't. |
 | 12 | (Later) `HlNodeProvider` (§6) and a licensed equities and options `Provider` | The provider interface holds up against a second real source. |
 
