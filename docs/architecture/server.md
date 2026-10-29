@@ -582,9 +582,18 @@ The demo book fills at the server's quotes, which come from Hyperliquid perp pri
 **v1 topology (colocated, §6.3):**
 - **Node host A** (Vultr bare metal, Tokyo) runs `hl-visor`, `hl-node`, `tr-ingest` **and the primary `tr-gateway` plus its database**. Ingest-to-gateway traffic stays on loopback.
 - **Node host B** (Cherry Servers, Tokyo, Equinix TY15) runs `hl-visor`, `hl-node`, `tr-ingest` **and a warm-standby `tr-gateway`**:
-  - Its database receives closed bars and document writes from A (§3.4).
   - B's ingest streams to A's gateway over WireGuard/mTLS across providers (a short in-city hop [unverified; measure]).
-  - If host A dies, DNS/health-check failover points clients at B's gateway, and clients resync (§6.6, risk 14).
+  - **Market data fails over automatically.** B builds its own books and bars (§6.6). If A's health check fails, DNS points clients at B, and they resync the market topics.
+- **User writes have exactly one writer, with synchronous replication and an epoch fence:**
+  - **One writer.** Document ops, their `(user_id, op_id)` results (§8) and demo-book commands are accepted by the **writer** gateway only. The writer is A in v1, holding writer epoch `e`. B's gateway rejects writes while it's a standby; clients keep them in their outbox (§8).
+  - **Synchronous ack.** The writer sends `DocAck`/`DocConflict` only after the change **and its `op_id` result** are committed locally **and** confirmed durable on the other host, tagged with epoch `e`. So an acknowledged edit always exists on both hosts, and a client never drops from its outbox an edit the survivor lacks.
+  - **If the other host can't confirm, the writer stops acking.** Clients queue edits offline (§8) until replication returns. Market data is unaffected. We trade write availability for never losing acknowledged edits [target; revisit after measuring].
+  - **Promotion is operator-initiated in v1** (a runbook step, not a health check):
+    1. The operator promotes B to epoch `e+1`.
+    2. From then on, B refuses replication with any epoch `≤ e`.
+    3. A can no longer get confirmations, so it **cannot ack any further write** even if some clients can still reach it. When A reconnects, it sees the higher epoch and demotes itself to standby. That prevents split-brain divergence of documents and the demo book.
+  - Clients replay their outbox against the new writer, and `op_id` dedupe returns the original result for edits that had been acked (§8).
+- **Bars and other derived data** are rebuilt per host from node output, so they need no write fence (§3.4, §6.6).
 - **The gateway runs on the node boxes, not a separate cloud VM.** Node A has 24 cores / 48 threads and 256 GB, enough headroom for both [unverified until measured]. The node gets most of the cores via cgroup/`CPUAffinity` limits, so client load can't starve block processing.
   - If measurement shows contention, the gateway moves to a small box on the **same provider's private LAN** (Vultr VPC, Cherry private VLAN) in Tokyo. It never goes to another region.
 - **Market data starts in Tokyo,** so the hop to North American users is the same whether the gateway is in Tokyo or North America. The cost is a longer RTT for document sync from North America, ~150 ms [unverified; to measure], which is fine for that traffic. North American edge gateways can come later, if measurement shows it matters.
@@ -647,7 +656,7 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 11. **Unknown backfill size and cost.** The S3 archive range and size are undocumented, and transfer is requester-pays [doc: HIST]. Mitigation: measure first. The `candleSnapshot` sweep is the cheap fallback.
 12. **Display rights for other feeds.** Coinbase, OKX and Kraken (per the parent's research), Yahoo, and Congress data commercial-use limits. Mitigation: `DisplayPolicy` defaults to off.
 13. **Thin HIP-3 liquidity.** Some markets are small (`abcd` had 1 asset [observed]). Mid prices can be noisy or missing when a book is empty [unverified for specific markets]. We fall back to mark price, with the basis label.
-14. **A single stateful gateway.** Restarting it drops the hot store. Clients reconnect and resync, but it is visible. Mitigation: fast startup from the registry and SQLite, plus a warm-standby gateway on node host B (§11) that clients fail over to. Later, a two-instance setup with sticky sessions. Colocation means a node-host outage also takes out that host's gateway; that's why the standby sits on the other provider.
+14. **A single stateful gateway.** Restarting it drops the hot store. Clients reconnect and resync, but it is visible. Mitigation: fast startup from the registry and SQLite, plus a warm-standby gateway on node host B (§11). Market data fails over automatically. User writes need synchronous replication with an epoch fence, and promotion is operator-initiated, so acknowledged edits are never lost and the two hosts never diverge. The cost is that edits queue in client outboxes while replication or promotion is pending. Later, a two-instance setup with sticky sessions. Colocation means a node-host outage also takes out that host's gateway; that's why the standby sits on the other provider.
 15. **Protocol evolution with postcard.** A breaking change needs a version bump. Mitigations: the rules in §4.4 and support for N/N−1.
 
 ---
