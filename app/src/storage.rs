@@ -28,7 +28,7 @@ trait KeyStore {
 /// returns false, so the page keeps its complete old set and the next load tries again.
 #[cfg(any(target_arch = "wasm32", test))]
 fn copy_keys(store: &mut impl KeyStore, old: &str, new: &str) -> bool {
-    let marker = format!("{new}/.migrated");
+    let marker = marker(new);
     if store.get(&marker).is_some() {
         return true;
     }
@@ -64,6 +64,25 @@ fn copy_keys(store: &mut impl KeyStore, old: &str, new: &str) -> bool {
     false
 }
 
+/// The key [`copy_keys`] sets once everything under `new/` is in place.
+#[cfg(any(target_arch = "wasm32", test))]
+fn marker(new: &str) -> String {
+    format!("{new}/.migrated")
+}
+
+/// Where a page that kept the old prefix (because [`copy_keys`] failed) should read and write
+/// `key`. Once another tab has finished the copy, keys under `old` map to `new`, so this page's
+/// saves land where later loads look instead of under keys they no longer read.
+#[cfg(any(target_arch = "wasm32", test))]
+fn redirect(store: &impl KeyStore, old: &str, new: &str, key: String) -> String {
+    match key.strip_prefix(old) {
+        Some(rest) if (rest.is_empty() || rest.starts_with('/')) && store.get(&marker(new)).is_some() => {
+            format!("{new}{rest}")
+        }
+        _ => key,
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use super::*;
@@ -86,8 +105,16 @@ mod imp {
         }
         tracing::info!("moved {} to {}", old.display(), new.display());
         #[cfg(unix)]
-        if let Err(e) = std::os::unix::fs::symlink(new, old) {
-            tracing::warn!("linking {} to {}: {e}", old.display(), new.display());
+        {
+            // Name the sibling rather than repeating `new`, which may be relative (an unset HOME
+            // or a relative XDG_DATA_HOME) and would then resolve from the link's folder.
+            let target = match new.file_name() {
+                Some(name) if old.parent() == new.parent() => PathBuf::from(name),
+                _ => std::path::absolute(new).unwrap_or_else(|_| new.to_path_buf()),
+            };
+            if let Err(e) = std::os::unix::fs::symlink(&target, old) {
+                tracing::warn!("linking {} to {}: {e}", old.display(), target.display());
+            }
         }
         new.to_path_buf()
     }
@@ -152,8 +179,18 @@ mod imp {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "browser storage is unavailable"))
     }
 
+    thread_local! {
+        /// The old and new prefixes while this page keeps the old one (see [`migrate`]).
+        static FALLBACK: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+    }
+
     fn key(path: &Path) -> String {
-        path.to_string_lossy().into_owned()
+        let key = path.to_string_lossy().into_owned();
+        let Some((old, new)) = FALLBACK.with_borrow(Clone::clone) else { return key };
+        match store() {
+            Ok(s) => redirect(&s, &old, &new, key),
+            Err(_) => key,
+        }
     }
 
     impl KeyStore for web_sys::Storage {
@@ -172,10 +209,17 @@ mod imp {
     }
 
     /// Copies what the page saved under `old/` (its prefix before the app was renamed) to
-    /// `new/`, once (see [`copy_keys`]). Returns the prefix to use.
+    /// `new/`, once (see [`copy_keys`]). Returns the prefix to use. If the copy fails, the page
+    /// keeps `old`, and its keys follow [`redirect`] from then on, in case another tab finishes
+    /// the copy while this one is open.
     pub fn migrate(old: &Path, new: &Path) -> PathBuf {
         let Ok(mut s) = store() else { return new.to_path_buf() };
-        if copy_keys(&mut s, &key(old), &key(new)) { new.to_path_buf() } else { old.to_path_buf() }
+        let (old, new) = (key(old), key(new));
+        if copy_keys(&mut s, &old, &new) {
+            return PathBuf::from(new);
+        }
+        FALLBACK.with_borrow_mut(|f| *f = Some((old.clone(), new)));
+        PathBuf::from(old)
     }
 
     pub fn read(path: &Path) -> io::Result<Vec<u8>> {
@@ -286,7 +330,7 @@ mod tests {
         assert_eq!(read(&new.join("layouts/Desk.json")).unwrap(), b"{}");
         #[cfg(unix)]
         {
-            assert!(old.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_link(&old).unwrap(), Path::new("terminal"), "relative to the link's folder");
             assert_eq!(read(&old.join("layouts/Desk.json")).unwrap(), b"{}", "old builds still find the files");
         }
         // Later launches find the new folder and leave everything as it is.
@@ -397,6 +441,23 @@ mod tests {
         s.room = usize::MAX;
         assert!(copy_keys(&mut s, "terminal-rs", "terminal"));
         assert_eq!(s.get("terminal/b.json").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_page_left_on_the_old_prefix_follows_another_tabs_copy() {
+        let mut s = Keys::new(&[("terminal-rs/settings.json", "a")]);
+        s.room = 1;
+        // Tab A can't copy, so it keeps the old prefix.
+        assert!(!copy_keys(&mut s, "terminal-rs", "terminal"));
+        let key = |s: &Keys, k: &str| redirect(s, "terminal-rs", "terminal", k.into());
+        assert_eq!(key(&s, "terminal-rs/settings.json"), "terminal-rs/settings.json");
+        // Space frees up and tab B finishes the copy; tab A's saves now go where loads read.
+        s.room = usize::MAX;
+        assert!(copy_keys(&mut s, "terminal-rs", "terminal"));
+        assert_eq!(key(&s, "terminal-rs/settings.json"), "terminal/settings.json");
+        assert_eq!(key(&s, "terminal-rs/layouts"), "terminal/layouts");
+        assert_eq!(key(&s, "terminal-rs"), "terminal");
+        assert_eq!(key(&s, "terminal-rsx/a.json"), "terminal-rsx/a.json", "only that prefix");
     }
 
     #[test]
