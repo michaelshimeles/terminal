@@ -301,6 +301,9 @@ impl TerminalApp {
         } else if n.contains("sample") {
             // The browser build (tr_data::web::WebMarkets).
             "Live crypto from Binance and Coinbase; every other market is sample data in the browser".into()
+        } else if let Some(rest) = self.provider.strip_prefix("server+") {
+            // TR_SERVER_URL is set (tr_data::remote::RemoteMarkets).
+            format!("Live · crypto from Hyperliquid perps through the Terminal server; other markets from {rest}")
         } else {
             format!("Live · {}", self.provider)
         }

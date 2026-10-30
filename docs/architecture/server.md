@@ -1,11 +1,23 @@
 # Terminal data server: design
 
-Status: **draft for review**. This PR adds no server code.
+Status: **draft for review**. The first server code runs on an interim public feed (see [Interim: public feed](#interim-public-feed)).
 Author: Grok Bot, for Micky. Research date: 2026-10-29. Times are UTC unless marked.
 
 Terminal today fetches all of its own data: Yahoo, Binance and Coinbase websockets, Treasury.gov, Senate eFD and the House Clerk, and SnapTrade. Each desktop process opens its own connections. The browser build serves sample data wherever a source blocks cross-origin requests (`TODO(web proxy)` in `crates/data/src/web.rs` and `crates/congress/src/db_web.rs`). This doc proposes the replacement Micky asked for: **one Rust server that every client (desktop, web, later mobile) connects to, so market data and user state sync in real time**. Hyperliquid is the first market-data source, and the design leaves a clean provider interface for licensed equities and options later.
 
 **Decision (Micky, 2026-10-29): Terminal runs on our own Hyperliquid non-validator node(s) and our own systems from day one.** Live data comes only from the node's output files and its local info server: books, trades, candles, mids, marks, oracle prices and funding. The public Hyperliquid API is used for nothing live. At most, it serves a one-time history backfill (§5.6).
+
+## Interim: public feed
+
+On 2026-10-29 Micky approved starting on Hyperliquid's public API, because a node box (about $735 a month, §6.3) costs too much for now. Until the node is up, this is what runs:
+
+- `tr-gateway` (`server/`) with `HlPublicProvider`, which implements the `Provider` trait (§3.1) over `wss://api.hyperliquid.xyz/ws` and the public `info` endpoint. Clients speak `tr-proto` (§4) and can't tell providers apart, so `HlNodeProvider` replaces it later with no client or protocol change.
+- One set of upstream connections serves every client. Mids for the core dex and for every HIP-3 dex with listed markets stay subscribed. The gateway subscribes a market's book, trades and candles only while a client watches it, and drops them 20 s after the last one leaves.
+- The gateway keeps its own budgets under Hyperliquid's per-IP limits [doc: RL]: at most 8 of 10 connections, 950 of 1000 subscriptions, 1800 of 2000 sent messages a minute and 1100 of 1200 REST weight a minute (defaults 3, 900, 1000 and 800). It refuses a client subscription past the budget, and it never rotates IPs or uses proxies [doc: TOU §3.1.8].
+- Hyperliquid closes the whole websocket when asked for a coin it doesn't list, with no error message [observed 2026-10-29]. The gateway only subscribes coins that have a live mid, and keeps the permanent mids on a connection of their own.
+- History comes from `candleSnapshot`, so it stops at the most recent 5000 bars per interval [doc: INFO]. For 1m bars that is about 3.5 days. Node-built candles (§5.3) lift the cap.
+- It makes read-only public calls only. No `exchange` endpoint, no user subscriptions, no orders.
+- The desktop opts in with `TR_SERVER_URL` (§4.6). Crypto keys such as `BTCUSD Curncy` then come from Hyperliquid core perps, and the order book pane names the source. Everything else is unchanged. The web build doesn't use the server yet.
 
 How facts are marked:
 

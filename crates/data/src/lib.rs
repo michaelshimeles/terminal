@@ -12,6 +12,10 @@
 //! The router is wrapped in [`Fallback`], which serves sample data if a source is
 //! unreachable, so the terminal always has something to draw.
 //!
+//! `TR_SERVER_URL` (`ws://` or `wss://`) opts in to the Terminal data server
+//! ([`remote::RemoteMarkets`]): crypto markets then come from Hyperliquid perps through the
+//! server, and everything else, or anything the server can't serve, from the sources above.
+//!
 //! The browser build (`wasm32`) can only reach sources that allow cross-origin requests:
 //! [`for_browser`] serves live crypto through [`web::WebMarkets`] and sample data for the
 //! rest. It has no SQLite bar cache.
@@ -23,6 +27,8 @@ pub mod cache;
 pub mod crypto;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod markets;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod remote;
 pub mod rss;
 pub mod rt;
 pub mod sample;
@@ -412,9 +418,17 @@ pub fn from_env() -> Provider {
         }
         _ => None,
     };
-    match markets::Markets::new(alpaca) {
-        Ok(m) => Arc::new(Fallback::new(m)),
-        Err(_) => Arc::new(sample::SampleProvider::default().with_live_ticks()),
+    let markets = match markets::Markets::new(alpaca) {
+        Ok(m) => Fallback::new(m),
+        Err(_) => return Arc::new(sample::SampleProvider::default().with_live_ticks()),
+    };
+    match var("TR_SERVER_URL") {
+        Some(url) => {
+            // The URL itself stays out of the logs.
+            tracing::info!("TR_SERVER_URL is set: crypto markets come through the Terminal server");
+            Arc::new(remote::RemoteMarkets::new(url.trim(), markets))
+        }
+        None => Arc::new(markets),
     }
 }
 
