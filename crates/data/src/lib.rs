@@ -202,7 +202,9 @@ pub struct OptionChain {
 }
 
 /// Live bar updates for one symbol and timeframe: each message is the latest state of
-/// the current (possibly still forming) bar. The feed stops when the receiver is dropped.
+/// the current (possibly still forming) bar, or, after an outage, an older bar that fills the
+/// gap ([`tr_core::Series::apply_live`] slots it in). The feed stops when the receiver is
+/// dropped.
 pub type LiveFeed = mpsc::Receiver<Bar>;
 
 /// Pick curve snapshots from per-date rows: latest, nearest at or before -30d and -365d.

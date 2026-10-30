@@ -89,18 +89,24 @@ impl Series {
         i.checked_sub(1)
     }
 
-    /// Apply one live bar: absorb it into the last bar if it is the same period, append it
-    /// if newer, ignore it if older. Returns true if the series changed.
+    /// Apply one live bar by its `ts`: absorb it into the bar of the same period, append it if
+    /// newer, or insert it where a period is missing (a feed backfilling a gap after an outage).
+    /// Bars older than the whole series are ignored; paging loads those. Returns true if the
+    /// series changed.
     pub fn apply_live(bars: &mut Vec<Bar>, live: Bar) -> bool {
-        match bars.last_mut() {
-            Some(last) if last.ts == live.ts => {
-                let before = *last;
-                last.absorb(&live);
-                *last != before
+        if bars.last().is_none_or(|last| last.ts < live.ts) {
+            bars.push(live);
+            return true;
+        }
+        match bars.binary_search_by_key(&live.ts, |b| b.ts) {
+            Ok(i) => {
+                let before = bars[i];
+                bars[i].absorb(&live);
+                bars[i] != before
             }
-            Some(last) if last.ts > live.ts => false,
-            _ => {
-                bars.push(live);
+            Err(0) => false,
+            Err(i) => {
+                bars.insert(i, live);
                 true
             }
         }
@@ -148,6 +154,14 @@ mod tests {
         assert!(!Series::apply_live(&mut v, Bar::new(0, 1.0, 1.0, 1.0, 1.0, 1.0)));
         assert!(Series::apply_live(&mut v, Bar::new(120, 11.5, 11.6, 11.4, 11.6, 5.0)));
         assert_eq!(v.len(), 2);
+        // A feed backfilling after an outage: a missing period is inserted, an older bar it
+        // still holds is completed, and nothing older than the series is added.
+        assert!(Series::apply_live(&mut v, Bar::new(240, 12.0, 12.0, 12.0, 12.0, 1.0)));
+        assert!(Series::apply_live(&mut v, Bar::new(180, 11.6, 11.9, 11.5, 11.8, 7.0)));
+        assert!(Series::apply_live(&mut v, Bar::new(120, 11.5, 11.7, 11.4, 11.65, 6.0)));
+        assert_eq!(v.iter().map(|b| b.ts).collect::<Vec<_>>(), [60, 120, 180, 240]);
+        assert_eq!((v[1].high, v[1].close, v[1].volume), (11.7, 11.65, 6.0));
+        assert!(!Series::apply_live(&mut v, Bar::new(180, 11.6, 11.9, 11.5, 11.8, 7.0)), "no change");
     }
 
     #[test]

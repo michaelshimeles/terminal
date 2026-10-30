@@ -549,12 +549,36 @@ async fn book_feed(
 }
 
 /// The bars from `from` (Unix seconds, the bar open) up to now.
-async fn backfill(client: &Client, key: &MarketKey, tf: Timeframe, from: i64) -> Result<Vec<Bar>, ApiError> {
+async fn history_since(client: &Client, key: &MarketKey, tf: Timeframe, from: i64) -> Result<Vec<Bar>, ApiError> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(from);
     let limit = ((now - from).max(0) / tf.seconds() + 2).min(5000) as u32;
     match client.request(Rpc::History { key: key.clone(), tf, end: None, limit }).await? {
         RpcResult::History(bars) => Ok(bars),
         _ => Err(ApiError { code: ErrorCode::Internal, message: "unexpected reply".into() }),
+    }
+}
+
+/// Send the bars in `[from, until)` on `tx`, retrying with backoff until history comes back or
+/// the feed is dropped. `from` itself is included: the worker holds only its partial state.
+async fn backfill(client: Client, key: MarketKey, tf: Timeframe, from: i64, until: i64, tx: mpsc::Sender<Bar>) {
+    let mut wait = Duration::from_secs(1);
+    loop {
+        match history_since(&client, &key, tf, from).await {
+            Ok(bars) => {
+                for b in bars.into_iter().filter(|b| b.ts >= from && b.ts < until) {
+                    if tx.send(b).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
+            Err(e) => tracing::debug!("terminal server, backfilling {key}: {e}; retrying in {wait:?}"),
+        }
+        if tx.is_closed() {
+            return;
+        }
+        rt::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -626,7 +650,7 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
             let mut last: Option<i64> = None;
             let mut broken = false;
             while let Some(u) = sub.next().await {
-                let mut bars = match u.event {
+                let bars = match u.event {
                     Event::Resync(_) | Event::Reconnecting => {
                         broken = true;
                         continue;
@@ -638,19 +662,14 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
                     Event::Delta(TopicDelta::Bar(BarDelta::Forming(b) | BarDelta::Closed(b))) => vec![b],
                     _ => continue,
                 };
-                // After an outage the stream picks up at the current bar. Fetch the bars that
-                // closed in between first, so the chart has no hole.
+                let Some(resume) = bars.iter().map(|b| b.ts).min() else { continue };
+                // After an outage the stream picks up at the current bar. The bars from the last
+                // one sent up to it come from history, in the background, and the worker slots
+                // them into the gap; the live bars don't wait.
                 if std::mem::take(&mut broken)
-                    && let Some(from) = last
+                    && let Some(from) = last.filter(|&f| f < resume)
                 {
-                    match backfill(&client, &key, tf, from).await {
-                        Ok(mut missed) => {
-                            missed.retain(|b| b.ts >= from);
-                            missed.extend(bars);
-                            bars = missed;
-                        }
-                        Err(e) => tracing::debug!("terminal server, backfilling {key}: {e}"),
-                    }
+                    rt::spawn(backfill(client.clone(), key.clone(), tf, from, resume, tx.clone()));
                 }
                 for b in bars {
                     last = Some(last.map_or(b.ts, |l| l.max(b.ts)));

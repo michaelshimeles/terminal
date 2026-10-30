@@ -36,6 +36,8 @@ struct Mock {
     conns: Mutex<Vec<MockConn>>,
     /// Connections open right now.
     open: AtomicUsize,
+    /// Answer this many `candleSnapshot` requests with HTTP 500.
+    fail_candles: Mutex<usize>,
 }
 
 /// Counts a mock connection as open until its task ends.
@@ -144,7 +146,17 @@ fn interval_s(i: &str) -> i64 {
     }
 }
 
-async fn mock_info(axum::Json(req): axum::Json<Value>) -> axum::Json<Value> {
+async fn mock_info(State(m): State<Arc<Mock>>, axum::Json(req): axum::Json<Value>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let fail = req["type"] == "candleSnapshot" && {
+        let mut n = m.fail_candles.lock().unwrap();
+        let fail = *n > 0;
+        *n = n.saturating_sub(1);
+        fail
+    };
+    if fail {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     axum::Json(match req["type"].as_str().unwrap() {
         "perpDexs" => json!([null, {"name": "xyz"}]),
         "metaAndAssetCtxs" if req["dex"] == "xyz" => {
@@ -172,6 +184,7 @@ async fn mock_info(axum::Json(req): axum::Json<Value>) -> axum::Json<Value> {
         }
         other => panic!("unexpected info request {other}"),
     })
+    .into_response()
 }
 
 async fn start_mock() -> (Arc<Mock>, SocketAddr) {
@@ -546,12 +559,18 @@ async fn desktop_charts_backfill_bars_missed_in_an_outage() {
     assert_eq!(got.ts, before);
     s.mock.drop_all();
     s.mock.until("candle resubscribed", |mk| mk.count("subscribe candle:BTC:1m") == 2).await;
-    // ...and back on the current bar after: the two bars in between come from history.
+    // ...and back on the current bar after. The first history request for the gap fails: the
+    // live bar goes on at once, and the two bars in between follow when the retry works.
+    *s.mock.fail_candles.lock().unwrap() = 1;
     s.mock.push("candle:BTC:1m", "candle", candle(now));
+    let mut chart = vec![got];
     let mut ts = Vec::new();
-    while ts.last() != Some(&now) || ts.len() < 3 {
-        ts.push(tokio::time::timeout(WAIT, feed.recv()).await.unwrap().unwrap().ts);
+    while !(ts.contains(&(before + 60)) && ts.contains(&(before + 120))) {
+        let b = tokio::time::timeout(WAIT, feed.recv()).await.expect("the gap fills").unwrap();
+        ts.push(b.ts);
+        tr_core::Series::apply_live(&mut chart, b);
     }
-    assert!(ts.contains(&(before + 60)) && ts.contains(&(before + 120)), "missed bars backfilled: {ts:?}");
-    assert!(ts.windows(2).all(|w| w[0] <= w[1]), "in order: {ts:?}");
+    assert_eq!(ts.first(), Some(&now), "the live bar didn't wait for history: {ts:?}");
+    assert_eq!(*s.mock.fail_candles.lock().unwrap(), 0, "the first attempt failed");
+    assert_eq!(chart.iter().map(|b| b.ts).collect::<Vec<_>>(), [before, before + 60, before + 120, now], "no hole");
 }
