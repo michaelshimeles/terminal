@@ -439,7 +439,7 @@ impl ChartState {
         }
         self.apply_range();
         // Live ticks only move the last bar: refresh indicators at most every 1.5 s and
-        // leave the compare series alone.
+        // leave the compare series alone. (A live feed filling a gap arrives as a refresh.)
         let due = self.last_indicator_req.is_none_or(|t| t.elapsed().as_millis() >= 1500);
         if !live || due {
             self.request_indicators(w);

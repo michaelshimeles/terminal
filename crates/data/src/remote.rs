@@ -558,27 +558,84 @@ async fn history_since(client: &Client, key: &MarketKey, tf: Timeframe, from: i6
     }
 }
 
-/// Send the bars in `[from, until)` on `tx`, retrying with backoff until history comes back or
-/// the feed is dropped. `from` itself is included: the worker holds only its partial state.
-async fn backfill(client: Client, key: MarketKey, tf: Timeframe, from: i64, until: i64, tx: mpsc::Sender<Bar>) {
+type Fetch = std::pin::Pin<Box<dyn Future<Output = Result<Vec<Bar>, ApiError>> + Send>>;
+
+/// The server's bar stream, onto the worker's live feed. Live bars go straight through. After an
+/// outage the stream picks up at the current bar, so the bars from the last one sent up to it
+/// come from history: one request at a time per feed, retried with backoff, every outstanding
+/// gap merged into one range. The worker slots those bars into the gap. Everything stops when
+/// the worker drops the feed.
+async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Subscription, tx: mpsc::Sender<Bar>) {
+    // The newest bar sent on, and whether the stream broke since.
+    let mut last: Option<i64> = None;
+    let mut broken = false;
+    // Bars still to fetch, `[from, until)`, and the range the request in flight covers.
+    let mut pending: Option<(i64, i64)> = None;
+    let mut fetching: Option<((i64, i64), Fetch)> = None;
+    let mut retry_at: Option<tokio::time::Instant> = None;
     let mut wait = Duration::from_secs(1);
+    let union = |a: Option<(i64, i64)>, b: (i64, i64)| Some(a.map_or(b, |a| (a.0.min(b.0), a.1.max(b.1))));
     loop {
-        match history_since(&client, &key, tf, from).await {
-            Ok(bars) => {
-                for b in bars.into_iter().filter(|b| b.ts >= from && b.ts < until) {
+        if fetching.is_none()
+            && retry_at.is_none()
+            && let Some(range) = pending.take()
+        {
+            let (client, key) = (client.clone(), key.clone());
+            fetching = Some((range, Box::pin(async move { history_since(&client, &key, tf, range.0).await })));
+        }
+        tokio::select! {
+            u = sub.next() => {
+                let Some(u) = u else { return };
+                let bars = match u.event {
+                    Event::Resync(_) | Event::Reconnecting => {
+                        broken = true;
+                        continue;
+                    }
+                    Event::Snapshot(TopicData::Bars(b)) => b,
+                    // A `Closed` bar carries the bar's final values; merging it into the forming
+                    // bar the worker holds gives the same bar (the server's forming bars are
+                    // full states, never partial ones).
+                    Event::Delta(TopicDelta::Bar(BarDelta::Forming(b) | BarDelta::Closed(b))) => vec![b],
+                    _ => continue,
+                };
+                let Some(resume) = bars.iter().map(|b| b.ts).min() else { continue };
+                // `from` itself is included: the worker holds only its partial state.
+                if std::mem::take(&mut broken)
+                    && let Some(from) = last.filter(|&f| f < resume)
+                {
+                    pending = union(pending, (from, resume));
+                }
+                for b in bars {
+                    last = Some(last.map_or(b.ts, |l| l.max(b.ts)));
                     if tx.send(b).await.is_err() {
                         return;
                     }
                 }
-                return;
             }
-            Err(e) => tracing::debug!("terminal server, backfilling {key}: {e}; retrying in {wait:?}"),
+            r = async { fetching.as_mut().expect("guarded").1.as_mut().await }, if fetching.is_some() => {
+                let (range, _) = fetching.take().expect("guarded");
+                match r {
+                    Ok(bars) => {
+                        wait = Duration::from_secs(1);
+                        for b in bars.into_iter().filter(|b| b.ts >= range.0 && b.ts < range.1) {
+                            if tx.send(b).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("terminal server, backfilling {key}: {e}; retrying in {wait:?}");
+                        pending = union(pending, range);
+                        retry_at = Some(tokio::time::Instant::now() + wait);
+                        wait = (wait * 2).min(Duration::from_secs(30));
+                    }
+                }
+            }
+            _ = async { tokio::time::sleep_until(retry_at.expect("guarded")).await }, if retry_at.is_some() => {
+                retry_at = None;
+            }
+            _ = tx.closed() => return,
         }
-        if tx.is_closed() {
-            return;
-        }
-        rt::sleep(wait).await;
-        wait = (wait * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -644,41 +701,8 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
         let client = self.client().clone();
         let key = MarketKey::new(symbol);
         // The worker already holds the history; the live stream only needs what's new.
-        let mut sub = client.subscribe(TopicReq::Bars { key: key.clone(), tf, history: 0 });
-        rt::spawn(async move {
-            // The newest bar sent on, and whether the stream broke since.
-            let mut last: Option<i64> = None;
-            let mut broken = false;
-            while let Some(u) = sub.next().await {
-                let bars = match u.event {
-                    Event::Resync(_) | Event::Reconnecting => {
-                        broken = true;
-                        continue;
-                    }
-                    Event::Snapshot(TopicData::Bars(b)) => b,
-                    // A `Closed` bar carries the bar's final values; merging it into the forming
-                    // bar the worker holds gives the same bar (the server's forming bars are
-                    // full states, never partial ones).
-                    Event::Delta(TopicDelta::Bar(BarDelta::Forming(b) | BarDelta::Closed(b))) => vec![b],
-                    _ => continue,
-                };
-                let Some(resume) = bars.iter().map(|b| b.ts).min() else { continue };
-                // After an outage the stream picks up at the current bar. The bars from the last
-                // one sent up to it come from history, in the background, and the worker slots
-                // them into the gap; the live bars don't wait.
-                if std::mem::take(&mut broken)
-                    && let Some(from) = last.filter(|&f| f < resume)
-                {
-                    rt::spawn(backfill(client.clone(), key.clone(), tf, from, resume, tx.clone()));
-                }
-                for b in bars {
-                    last = Some(last.map_or(b.ts, |l| l.max(b.ts)));
-                    if tx.send(b).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        });
+        let sub = client.subscribe(TopicReq::Bars { key: key.clone(), tf, history: 0 });
+        rt::spawn(live_bridge(client, key, tf, sub, tx));
         Some(rx)
     }
 

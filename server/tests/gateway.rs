@@ -36,8 +36,30 @@ struct Mock {
     conns: Mutex<Vec<MockConn>>,
     /// Connections open right now.
     open: AtomicUsize,
-    /// Answer this many `candleSnapshot` requests with HTTP 500.
+    /// Answer this many `candleSnapshot` requests with HTTP 500...
     fail_candles: Mutex<usize>,
+    /// ...after holding each this long.
+    fail_hold: Mutex<Duration>,
+    /// `candleSnapshot` requests being answered now, and the most there ever were at once.
+    candles_inflight: AtomicUsize,
+    candles_peak: AtomicUsize,
+}
+
+/// Counts a `candleSnapshot` request as in flight until it's answered.
+struct InFlight(Arc<Mock>);
+
+impl InFlight {
+    fn new(m: &Arc<Mock>) -> Self {
+        let n = m.candles_inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        m.candles_peak.fetch_max(n, Ordering::SeqCst);
+        Self(m.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.candles_inflight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Counts a mock connection as open until its task ends.
@@ -148,6 +170,7 @@ fn interval_s(i: &str) -> i64 {
 
 async fn mock_info(State(m): State<Arc<Mock>>, axum::Json(req): axum::Json<Value>) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let _inflight = (req["type"] == "candleSnapshot").then(|| InFlight::new(&m));
     let fail = req["type"] == "candleSnapshot" && {
         let mut n = m.fail_candles.lock().unwrap();
         let fail = *n > 0;
@@ -155,6 +178,8 @@ async fn mock_info(State(m): State<Arc<Mock>>, axum::Json(req): axum::Json<Value
         fail
     };
     if fail {
+        let hold = *m.fail_hold.lock().unwrap();
+        tokio::time::sleep(hold).await;
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     axum::Json(match req["type"].as_str().unwrap() {
@@ -236,6 +261,10 @@ impl Setup {
 
 fn set(v: &[&str]) -> HashSet<String> {
     v.iter().map(|s| s.to_string()).collect()
+}
+
+async fn recv_bar(feed: &mut tr_data::LiveFeed) -> tr_core::Bar {
+    tokio::time::timeout(WAIT, feed.recv()).await.expect("a bar in time").expect("feed open")
 }
 
 async fn next(sub: &mut Subscription) -> Event {
@@ -573,4 +602,38 @@ async fn desktop_charts_backfill_bars_missed_in_an_outage() {
     assert_eq!(ts.first(), Some(&now), "the live bar didn't wait for history: {ts:?}");
     assert_eq!(*s.mock.fail_candles.lock().unwrap(), 0, "the first attempt failed");
     assert_eq!(chart.iter().map(|b| b.ts).collect::<Vec<_>>(), [before, before + 60, before + 120, now], "no hole");
+}
+
+#[tokio::test]
+async fn desktop_backfill_keeps_one_request_in_flight_across_outages() {
+    let s = Setup::new(|_| {}).await;
+    let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());
+    let now = m.history("BTCUSD Curncy", Timeframe::M1, None, 10).await.unwrap().last().unwrap().ts;
+    let mut feed = m.live("BTCUSD Curncy", Timeframe::M1).expect("a live feed");
+    s.mock.until("candle:BTC:1m upstream", |mk| mk.subs().contains("candle:BTC:1m")).await;
+    let candle = |t: i64| json!({"t": t * 1000, "T": t * 1000 + 59_999, "s": "BTC", "i": "1m", "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1});
+    s.mock.push("candle:BTC:1m", "candle", candle(now - 300));
+    let mut chart = vec![recv_bar(&mut feed).await];
+    // History is down, and each failed request hangs for a while: two outages in a row must
+    // not stack up two retry loops.
+    *s.mock.fail_candles.lock().unwrap() = 1000;
+    *s.mock.fail_hold.lock().unwrap() = Duration::from_secs(4);
+    s.mock.candles_peak.store(0, Ordering::SeqCst);
+    for (k, t) in [(2, now - 180), (3, now - 60)] {
+        s.mock.drop_all();
+        s.mock.until("candle resubscribed", |mk| mk.count("subscribe candle:BTC:1m") == k).await;
+        s.mock.push("candle:BTC:1m", "candle", candle(t));
+        let b = recv_bar(&mut feed).await;
+        assert_eq!(b.ts, t, "the live bar doesn't wait for history");
+        tr_core::Series::apply_live(&mut chart, b);
+    }
+    assert!(s.mock.candles_inflight.load(Ordering::SeqCst) >= 1, "a backfill request is in flight");
+    assert_eq!(s.mock.candles_peak.load(Ordering::SeqCst), 1, "one history request at a time per feed");
+    // History comes back: one request fills both gaps.
+    *s.mock.fail_candles.lock().unwrap() = 0;
+    let want: Vec<i64> = (0..5).map(|i| now - 300 + i * 60).collect();
+    while chart.iter().map(|b| b.ts).collect::<Vec<_>>() != want {
+        tr_core::Series::apply_live(&mut chart, recv_bar(&mut feed).await);
+    }
+    assert_eq!(s.mock.candles_peak.load(Ordering::SeqCst), 1);
 }

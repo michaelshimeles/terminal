@@ -834,18 +834,38 @@ fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<B
 
 /// Merge the provider's live feed (if any) into the pane's series, publishing at most
 /// four updates a second. Stops when the pane reloads, closes or the feed ends.
+/// What one live bar did to a series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Applied {
+    changed: bool,
+    /// It went in before the latest bar (a feed filling a gap after an outage), so every
+    /// series aligned to the bars by index (compare lines) has to be rebuilt.
+    inserted: bool,
+}
+
+fn apply_live_bar(bars: &mut Vec<Bar>, bar: Bar) -> Applied {
+    let (len, last) = (bars.len(), bars.last().map(|b| b.ts));
+    let changed = Series::apply_live(bars, bar);
+    Applied { changed, inserted: bars.len() > len && bars.last().map(|b| b.ts) == last }
+}
+
 fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
     let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
     rt::spawn(async move {
         let mut tick = rt::interval(Duration::from_millis(250));
         let mut dirty = false;
+        let mut inserted = false;
         loop {
             tokio::select! {
                 bar = feed.recv() => {
                     let Some(bar) = bar else { break };
                     let mut map = s.series.lock().expect("series lock");
                     match map.get_mut(&pane) {
-                        Some((g, bars)) if *g == generation => dirty |= Series::apply_live(Arc::make_mut(bars), bar),
+                        Some((g, bars)) if *g == generation => {
+                            let a = apply_live_bar(Arc::make_mut(bars), bar);
+                            dirty |= a.changed;
+                            inserted |= a.inserted;
+                        }
                         _ => break,
                     }
                 }
@@ -869,7 +889,9 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                         prepended: 0,
                         from_cache: false,
                         exhausted: false,
-                        live: true,
+                        // A bar slotted into a gap shifts everything after it: send it as a
+                        // refresh so the chart rebuilds its compare line and indicators.
+                        live: !std::mem::take(&mut inserted),
                     });
                 }
             }
@@ -949,6 +971,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bars_filling_a_gap_are_reported_as_inserted() {
+        let b = |ts: i64| Bar::new(ts, 1.0, 1.0, 1.0, 1.0, 1.0);
+        let mut bars = vec![b(0), b(60), b(240)];
+        assert_eq!(apply_live_bar(&mut bars, b(300)), Applied { changed: true, inserted: false });
+        assert_eq!(apply_live_bar(&mut bars, b(300)), Applied { changed: false, inserted: false });
+        assert_eq!(apply_live_bar(&mut bars, b(120)), Applied { changed: true, inserted: true });
+        assert_eq!(
+            apply_live_bar(&mut bars, Bar::new(60, 1.0, 2.0, 1.0, 2.0, 1.0)),
+            Applied { changed: true, inserted: false }
+        );
+        assert_eq!(bars.iter().map(|x| x.ts).collect::<Vec<_>>(), [0, 60, 120, 240, 300]);
+    }
 
     #[test]
     fn compare_alignment_carries_last_close() {
