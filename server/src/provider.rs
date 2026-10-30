@@ -194,6 +194,8 @@ pub trait Provider: Send + Sync + 'static {
     fn stats(&self) -> UpstreamStats {
         UpstreamStats::default()
     }
+    /// Close every upstream connection for good (gateway shutdown).
+    fn close(&self) {}
     /// Instruments listed right now. Called periodically; delistings show up here.
     async fn instruments(&self) -> Result<Vec<InstrumentDef>>;
     /// Up to `limit` bars before `end` (Unix seconds; `None` = now), oldest first: the same

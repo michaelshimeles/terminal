@@ -92,6 +92,7 @@ struct Conn {
 struct State {
     conns: Vec<Conn>,
     subs: BTreeMap<SubKey, usize>,
+    closed: bool,
 }
 
 struct Inner {
@@ -116,9 +117,11 @@ pub struct SubGuard {
 impl Drop for SubGuard {
     fn drop(&mut self) {
         let mut st = self.pool.state.lock().expect("pool lock");
-        if let Some(i) = st.subs.remove(&self.key) {
-            st.conns[i].subs -= 1;
-            let _ = st.conns[i].tx.send(Cmd::Unsubscribe(self.key.clone()));
+        if let Some(i) = st.subs.remove(&self.key)
+            && let Some(c) = st.conns.get_mut(i)
+        {
+            c.subs -= 1;
+            let _ = c.tx.send(Cmd::Unsubscribe(self.key.clone()));
         }
     }
 }
@@ -132,7 +135,10 @@ impl Pool {
             cfg,
             metrics,
         });
-        Self(Arc::new(Inner { shared, state: Mutex::new(State { conns: Vec::new(), subs: BTreeMap::new() }) }))
+        Self(Arc::new(Inner {
+            shared,
+            state: Mutex::new(State { conns: Vec::new(), subs: BTreeMap::new(), closed: false }),
+        }))
     }
 
     /// Subscribe upstream, within budget. Must run inside a tokio runtime (it may open a
@@ -140,6 +146,9 @@ impl Pool {
     pub fn subscribe(&self, key: SubKey, sink: UpstreamSink, permanent: bool) -> Result<SubGuard, SubscribeError> {
         let cfg = &self.0.shared.cfg;
         let mut st = self.0.state.lock().expect("pool lock");
+        if st.closed {
+            return Err(SubscribeError::Unsupported("the upstream pool is closed".into()));
+        }
         if st.subs.contains_key(&key) {
             return Err(SubscribeError::Unsupported(format!("{key} is already subscribed")));
         }
@@ -179,6 +188,15 @@ impl Pool {
         st.subs.insert(key.clone(), i);
         let _ = st.conns[i].tx.send(Cmd::Subscribe(key.clone(), sink));
         Ok(SubGuard { pool: self.0.clone(), key })
+    }
+
+    /// Close every connection for good. Dropping a connection's sender ends its task, which
+    /// closes the socket and never reconnects.
+    pub fn close(&self) {
+        let mut st = self.0.state.lock().expect("pool lock");
+        st.closed = true;
+        st.subs.clear();
+        st.conns.clear();
     }
 
     pub fn stats(&self) -> UpstreamStats {

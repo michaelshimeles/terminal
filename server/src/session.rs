@@ -24,7 +24,9 @@ use tr_proto::{
 };
 
 use crate::metrics::{Metrics, TopicKind as Kind};
-use crate::store::{BarsTopic, BookTopic, Event, EventKind, Hub, Topic, TopicKey, TradesTopic, merge_bars};
+use crate::store::{
+    BarsTopic, BookTopic, Event, EventKind, Hub, Mid, Topic, TopicKey, TradesTopic, VenueState, merge_bars,
+};
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -33,6 +35,10 @@ pub struct SessionConfig {
     pub max_book_depth: u8,
     pub max_history: u32,
     pub max_quote_hz: u8,
+    /// One-shot requests a connection may have running at once.
+    pub max_requests_in_flight: usize,
+    /// A request still running after this gets an error reply.
+    pub request_timeout: Duration,
     /// Client messages per 10 s. Subscribes past this would churn the shared upstream.
     pub max_messages_per_10s: u32,
     /// Outbound frames a client may have queued.
@@ -55,6 +61,8 @@ impl Default for SessionConfig {
             max_book_depth: 20,
             max_history: 5000,
             max_quote_hz: 10,
+            max_requests_in_flight: 8,
+            request_timeout: Duration::from_secs(30),
             max_messages_per_10s: 200,
             queue: 256,
             hello_timeout: Duration::from_secs(10),
@@ -168,11 +176,17 @@ struct SubCtl {
 }
 
 /// Serve one client until it leaves, misbehaves or can't keep up.
-pub async fn run(socket: WebSocket, hub: Arc<Hub>, cfg: Arc<SessionConfig>, session: u64) {
+pub async fn run(
+    socket: WebSocket,
+    hub: Arc<Hub>,
+    cfg: Arc<SessionConfig>,
+    session: u64,
+    closing: watch::Receiver<bool>,
+) {
     let metrics = hub.metrics.clone();
     metrics.clients.fetch_add(1, Ordering::Relaxed);
     Metrics::add(&metrics.clients_total, 1);
-    serve(socket, hub, cfg, session).await;
+    serve(socket, hub, cfg, session, closing).await;
     metrics.clients.fetch_sub(1, Ordering::Relaxed);
 }
 
@@ -192,7 +206,16 @@ async fn reject(mut socket: WebSocket, enc: Encoding, code: ErrorCode, message: 
     let _ = socket.send(Message::Close(Some(CloseFrame { code: 1008, reason: reason.into() }))).await;
 }
 
-async fn serve(mut socket: WebSocket, hub: Arc<Hub>, cfg: Arc<SessionConfig>, session: u64) {
+async fn serve(
+    mut socket: WebSocket,
+    hub: Arc<Hub>,
+    cfg: Arc<SessionConfig>,
+    session: u64,
+    mut closing: watch::Receiver<bool>,
+) {
+    if *closing.borrow_and_update() {
+        return;
+    }
     // Hello first, in either encoding.
     let first = tokio::time::timeout(cfg.hello_timeout, async {
         while let Some(Ok(m)) = socket.recv().await {
@@ -239,6 +262,7 @@ async fn serve(mut socket: WebSocket, hub: Arc<Hub>, cfg: Arc<SessionConfig>, se
     let mut idle = tokio::time::interval(cfg.idle_timeout / 3);
     let mut last_heard = Instant::now();
     let mut writer_done = false;
+    let mut rpcs = tokio::task::JoinSet::new();
     let rate = crate::limit::WindowLimiter::new(cfg.max_messages_per_10s, Duration::from_secs(10));
 
     loop {
@@ -258,7 +282,7 @@ async fn serve(mut socket: WebSocket, hub: Arc<Hub>, cfg: Arc<SessionConfig>, se
                     continue;
                 }
                 match decoded {
-                    Ok(m) => handle(m, &hub, &cfg, &link, &mut subs).await,
+                    Ok(m) => handle(m, &hub, &cfg, &link, &mut subs, &mut rpcs).await,
                     Err(e) => {
                         let m = ServerMsg::Error { code: ErrorCode::BadMessage, message: e.to_string() };
                         link.send(&m, None).await;
@@ -280,11 +304,14 @@ async fn serve(mut socket: WebSocket, hub: Arc<Hub>, cfg: Arc<SessionConfig>, se
                 writer_done = true;
                 break;
             }
+            // Only ever set to true, or dropped with the gateway.
+            _ = closing.changed() => break,
         }
     }
     for (_, s) in subs.drain() {
         s.task.abort();
     }
+    rpcs.abort_all();
     drop(link);
     // Let the writer flush what's queued (a final error, the close frame), briefly.
     if !writer_done && tokio::time::timeout(Duration::from_secs(1), &mut writer).await.is_err() {
@@ -332,6 +359,7 @@ async fn handle(
     cfg: &Arc<SessionConfig>,
     link: &Link,
     subs: &mut HashMap<SubId, SubCtl>,
+    rpcs: &mut tokio::task::JoinSet<()>,
 ) {
     let error = |code, message: String| ServerMsg::Error { code, message };
     match msg {
@@ -378,9 +406,20 @@ async fn handle(
             }
         },
         ClientMsg::Request { id, req } => {
+            while rpcs.try_join_next().is_some() {}
+            if rpcs.len() >= cfg.max_requests_in_flight {
+                let message = format!("at most {} requests in flight", cfg.max_requests_in_flight);
+                let result = Err(ApiError { code: ErrorCode::RateLimited, message });
+                link.send(&ServerMsg::Reply { id, result }, None).await;
+                return;
+            }
             let (hub, cfg, link) = (hub.clone(), cfg.clone(), link.clone());
-            tokio::spawn(async move {
-                let result = rpc(&hub, &cfg, req).await;
+            // The set aborts whatever is still running when the session ends.
+            rpcs.spawn(async move {
+                let result = match tokio::time::timeout(cfg.request_timeout, rpc(&hub, &cfg, req)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(ApiError { code: ErrorCode::Upstream, message: "timed out".into() }),
+                };
                 link.send(&ServerMsg::Reply { id, result }, None).await;
             });
         }
@@ -407,12 +446,16 @@ async fn rpc(hub: &Arc<Hub>, cfg: &SessionConfig, req: Rpc) -> Result<RpcResult,
             let inst =
                 hub.resolve(&key).ok_or_else(|| err(ErrorCode::UnknownMarket, format!("unknown market {key}")))?;
             let limit = (limit.clamp(1, cfg.max_history)) as usize;
+            // With a live stream for this market, cached history must be newer than the stream's
+            // last (re)start, or bars that closed while it was down could be missing or partial.
+            let live = hub.bars_topic(&inst, tf).filter(|_| end.is_none());
+            let fresh_after = live.as_ref().map(|t| t.overlay().live_since.unwrap_or_else(Instant::now));
             let bars = hub
-                .history(&inst, tf, end, limit, None)
+                .history(&inst, tf, end, limit, fresh_after)
                 .await
                 .map_err(|e| err(ErrorCode::Upstream, format!("{e:#}")))?;
             // Recent history also gets whatever the live stream has seen since.
-            let bars = match hub.bars_topic(&inst, tf).filter(|_| end.is_none()) {
+            let bars = match live {
                 Some(t) => merge_bars(bars.to_vec(), &t.overlay().bars, limit),
                 None => bars.to_vec(),
             };
@@ -467,16 +510,30 @@ async fn forward(f: Fwd, hub: Arc<Hub>, cfg: Arc<SessionConfig>, topic: TopicReq
     drop(held);
 }
 
-fn quote_for(hub: &Hub, key: &MarketKey, coin: &str) -> Option<Quote> {
-    let m = hub.mids.get(coin)?;
-    Some(Quote {
+fn quote_for(hub: &Hub, key: &MarketKey, coin: &str, m: &Mid) -> Quote {
+    Quote {
         key: key.clone(),
         source: MarketKey::new(coin),
         px: m.px,
         basis: PriceBasis::Mid,
         prev_day: hub.prev_day(coin),
         ts_ms: m.ts_ms,
-    })
+    }
+}
+
+/// The worst state among a subscription's venues: unavailable, else stale (since the earliest
+/// outage), else live.
+fn combined(states: &[VenueState]) -> TopicStatus {
+    let mut out = TopicStatus::Live;
+    for st in states {
+        match (&st.status, &out) {
+            (TopicStatus::Unavailable { .. }, _) => return st.status.clone(),
+            (TopicStatus::Stale { since_ms }, TopicStatus::Stale { since_ms: s }) if since_ms >= s => {}
+            (TopicStatus::Stale { .. }, _) => out = st.status.clone(),
+            _ => {}
+        }
+    }
+    out
 }
 
 async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
@@ -486,20 +543,47 @@ async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
         f.unavailable(UnavailableReason::UnknownMarket, "none of these markets are known".into()).await;
         return;
     }
+    // The feeds these quotes come from, to report their outages.
+    let mut venues: Vec<String> =
+        resolved.iter().filter_map(|(_, c)| hub.mids.get(c).map(|m| m.venue.to_string())).collect();
+    venues.sort();
+    venues.dedup();
+    let venue_states = || venues.iter().map(|v| hub.mids.venue(v)).collect::<Vec<_>>();
+    let mut epochs: Vec<u64> = venue_states().iter().map(|v| v.epoch).collect();
+    let mut status = TopicStatus::Live;
     let mut version = hub.mids.subscribe();
-    let mut stamps: HashMap<String, u64> = HashMap::new();
+    // What each requested key last carried: two keys can share a coin (`BTC`, `BTCUSD Curncy`).
+    let mut stamps: Vec<u64> = vec![0; resolved.len()];
     let mut send_snapshot = true;
     let period = Duration::from_secs(1) / u32::from(hz);
     loop {
         version.borrow_and_update();
+        let states = venue_states();
+        let now = combined(&states);
+        if now != status {
+            status = now;
+            if !f.status(status.clone()).await {
+                return;
+            }
+        }
+        // A feed that reconnected may have skipped prices: once it's live again, start over.
+        let now_epochs: Vec<u64> = states.iter().map(|v| v.epoch).collect();
+        if status == TopicStatus::Live && now_epochs != epochs {
+            epochs = now_epochs;
+            if !send_snapshot && !f.resync(ResyncReason::Upstream).await {
+                return;
+            }
+            send_snapshot = true;
+        }
         if send_snapshot {
             send_snapshot = false;
             let snap: Vec<Quote> = resolved
                 .iter()
-                .filter_map(|(k, c)| {
-                    let q = quote_for(&hub, k, c)?;
-                    stamps.insert(c.clone(), hub.mids.get(c).map_or(0, |m| m.stamp));
-                    Some(q)
+                .zip(stamps.iter_mut())
+                .filter_map(|((k, c), stamp)| {
+                    let m = hub.mids.get(c)?;
+                    *stamp = m.stamp;
+                    Some(quote_for(&hub, k, c, &m))
                 })
                 .collect();
             if !f.snapshot(TopicData::Quotes(snap)).await {
@@ -509,14 +593,12 @@ async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
             let mut newest: Option<Instant> = None;
             let changed: Vec<Quote> = resolved
                 .iter()
-                .filter_map(|(k, c)| {
-                    let m = hub.mids.get(c)?;
-                    if stamps.get(c).is_some_and(|s| *s >= m.stamp) {
-                        return None;
-                    }
-                    stamps.insert(c.clone(), m.stamp);
+                .zip(stamps.iter_mut())
+                .filter_map(|((k, c), stamp)| {
+                    let m = hub.mids.get(c).filter(|m| m.stamp > *stamp)?;
+                    *stamp = m.stamp;
                     newest = newest.max(Some(m.recv));
-                    quote_for(&hub, k, c)
+                    Some(quote_for(&hub, k, c, &m))
                 })
                 .collect();
             if let Some(recv) = newest

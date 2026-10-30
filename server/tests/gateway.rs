@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +14,8 @@ use axum::routing::{get, post};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tr_data::remote::{Client, Event, Subscription};
+use tr_data::MarketData;
+use tr_data::remote::{Client, Event, RemoteMarkets, Subscription};
 use tr_gateway::Config;
 use tr_proto::{
     BarDelta, Encoding, InstrumentKind, MarketKey, ResyncReason, Rpc, RpcResult, Timeframe, TopicData, TopicDelta,
@@ -32,6 +34,17 @@ struct Mock {
     /// Every subscribe and unsubscribe received, as `subscribe l2Book:BTC`.
     log: Mutex<Vec<String>>,
     conns: Mutex<Vec<MockConn>>,
+    /// Connections open right now.
+    open: AtomicUsize,
+}
+
+/// Counts a mock connection as open until its task ends.
+struct Open(Arc<Mock>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn label(sub: &Value) -> String {
@@ -84,6 +97,8 @@ async fn mock_ws(State(m): State<Arc<Mock>>, up: WebSocketUpgrade) -> axum::resp
 }
 
 async fn mock_conn(ws: WebSocket, m: Arc<Mock>) {
+    m.open.fetch_add(1, Ordering::SeqCst);
+    let _open = Open(m.clone());
     let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
     let subs = Arc::new(Mutex::new(HashSet::new()));
     m.conns.lock().unwrap().push((tx.clone(), subs.clone()));
@@ -141,6 +156,9 @@ async fn mock_info(axum::Json(req): axum::Json<Value>) -> axum::Json<Value> {
         ]),
         "candleSnapshot" => {
             let r = &req["req"];
+            if r["coin"] == "SLOW" {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
             let iv = interval_s(r["interval"].as_str().unwrap()) * 1000;
             let (start, end) = (r["startTime"].as_i64().unwrap(), r["endTime"].as_i64().unwrap());
             let first = (start + iv - 1) / iv;
@@ -299,7 +317,8 @@ async fn unknown_markets_never_reach_upstream_and_keys_resolve() {
         next(&mut nope).await,
         Event::Status(TopicStatus::Unavailable { reason: UnavailableReason::UnknownMarket, .. })
     ));
-    let keys = ["BTCUSD Curncy", "ETH-PERP", "xyz:TSLA", "@107", "#5", "AAPL US Equity"].map(MarketKey::new).to_vec();
+    let keys =
+        ["BTCUSD Curncy", "BTC", "ETH-PERP", "xyz:TSLA", "@107", "#5", "AAPL US Equity"].map(MarketKey::new).to_vec();
     let mut q = client.subscribe(TopicReq::Quotes { keys, max_hz: 4 });
     let Event::Snapshot(TopicData::Quotes(quotes)) = next(&mut q).await else { panic!("quotes") };
     let got: HashMap<&str, (&str, f64, Option<f64>)> =
@@ -310,10 +329,16 @@ async fn unknown_markets_never_reach_upstream_and_keys_resolve() {
     assert_eq!(got["@107"], ("@107", 30.0, None));
     assert!(!got.contains_key("#5"), "outcome markets are out of scope");
     assert!(!got.contains_key("AAPL US Equity"), "equities don't map to HIP-3 perps yet");
-    // A changed mid arrives as a delta with just that quote.
+    // A changed mid arrives as a delta with just that market, under every key that asked for it.
     s.mock.push("allMids", "allMids", json!({"mids": {"BTC": "100.75", "ETH": "10.25", "@107": "30.0"}}));
     let Event::Delta(TopicDelta::Quotes(d)) = next(&mut q).await else { panic!("quote delta") };
-    assert_eq!(d.iter().map(|q| (q.key.as_str(), q.px)).collect::<Vec<_>>(), [("BTCUSD Curncy", 100.75)]);
+    assert_eq!(
+        d.iter().map(|q| (q.key.as_str(), q.px)).collect::<Vec<_>>(),
+        [("BTCUSD Curncy", 100.75), ("BTC", 100.75)]
+    );
+    s.mock.push("allMids", "allMids", json!({"mids": {"BTC": "100.5", "ETH": "10.25", "@107": "30.0"}}));
+    let Event::Delta(TopicDelta::Quotes(d)) = next(&mut q).await else { panic!("second quote delta") };
+    assert_eq!(d.len(), 2, "neither key freezes: {d:?}");
     assert!(s.mock.log.lock().unwrap().iter().all(|e| !e.contains("NOTACOIN")));
     // The market list: perps by venue, spot, no outcomes.
     let Ok(RpcResult::Markets(m)) = client.request(Rpc::Markets).await else { panic!("markets") };
@@ -433,4 +458,100 @@ async fn clients_that_send_too_fast_are_throttled() {
         }
     }
     assert!((2..=3).contains(&answered), "{answered} of 5 subscriptions were served");
+}
+
+#[tokio::test]
+async fn quote_subscribers_see_feed_outages_then_resync() {
+    let s = Setup::new(|_| {}).await;
+    let client = s.client(Encoding::Postcard);
+    let keys = ["BTC", "xyz:TSLA"].map(MarketKey::new).to_vec();
+    let mut q = client.subscribe(TopicReq::Quotes { keys, max_hz: 10 });
+    assert!(matches!(next(&mut q).await, Event::Snapshot(TopicData::Quotes(_))));
+    s.mock.drop_all();
+    assert!(matches!(next(&mut q).await, Event::Status(TopicStatus::Stale { .. })), "the outage is visible");
+    s.mock
+        .until("mids resubscribed", |m| m.count("subscribe allMids") == 2 && m.count("subscribe allMids:xyz") == 2)
+        .await;
+    s.mock.push("allMids", "allMids", json!({"mids": {"BTC": "101.0", "ETH": "10.25", "@107": "30.0"}}));
+    s.mock.push("allMids:xyz", "allMids", json!({"dex": "xyz", "mids": {"xyz:TSLA": "401.5"}}));
+    let mut seen = Vec::new();
+    let quotes = loop {
+        match next(&mut q).await {
+            Event::Snapshot(TopicData::Quotes(q)) => break q,
+            Event::Status(TopicStatus::Live) => seen.push("live"),
+            Event::Status(TopicStatus::Stale { .. }) => seen.push("stale"),
+            Event::Resync(ResyncReason::Upstream) => seen.push("resync"),
+            e => panic!("unexpected {e:?}"),
+        }
+    };
+    assert_eq!(seen.last_chunk::<2>(), Some(&["live", "resync"]), "{seen:?}");
+    let btc = quotes.iter().find(|q| q.key.as_str() == "BTC").unwrap();
+    assert_eq!(btc.px, 101.0, "the fresh snapshot carries prices from after the outage");
+}
+
+#[tokio::test]
+async fn requests_are_bounded_and_time_out() {
+    let s = Setup::new(|c| {
+        c.session.max_requests_in_flight = 2;
+        c.session.request_timeout = Duration::from_secs(1);
+    })
+    .await;
+    // A market whose history the mock serves slowly.
+    s.mock.push("allMids", "allMids", json!({"mids": {"BTC": "100.5", "ETH": "10.25", "@107": "30.0", "SLOW": "1.0"}}));
+    let t0 = tokio::time::Instant::now();
+    while !s.gw.hub().mids.contains("SLOW") {
+        assert!(t0.elapsed() < WAIT);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let client = s.client(Encoding::Postcard);
+    let req = || client.request(Rpc::History { key: MarketKey::new("SLOW"), tf: Timeframe::M1, end: None, limit: 5 });
+    let t0 = tokio::time::Instant::now();
+    let results = futures::future::join_all([req(), req(), req()]).await;
+    let mut codes: Vec<String> = results.iter().map(|r| format!("{:?}", r.as_ref().unwrap_err().code)).collect();
+    codes.sort();
+    assert_eq!(codes, ["RateLimited", "Upstream", "Upstream"], "two time out, the third is refused: {results:?}");
+    assert!(t0.elapsed() < Duration::from_secs(3), "nobody waited for the slow upstream");
+}
+
+#[tokio::test]
+async fn shutdown_closes_upstream_for_good() {
+    let s = Setup::new(|_| {}).await;
+    let client = s.client(Encoding::Postcard);
+    let mut book = client.subscribe(TopicReq::Book { key: MarketKey::new("BTC"), depth: 5, group: None });
+    s.mock.until("l2Book:BTC upstream", |m| m.subs().contains("l2Book:BTC")).await;
+    assert_eq!(s.mock.open.load(Ordering::SeqCst), 2);
+    let Setup { mock, gw } = s;
+    tokio::time::timeout(WAIT, gw.shutdown()).await.expect("shutdown finishes");
+    mock.until("every upstream connection closed", |m| m.open.load(Ordering::SeqCst) == 0).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(mock.open.load(Ordering::SeqCst), 0, "nothing reconnects after shutdown");
+    // The client's session was closed too.
+    while !matches!(next(&mut book).await, Event::Reconnecting) {}
+}
+
+#[tokio::test]
+async fn desktop_charts_backfill_bars_missed_in_an_outage() {
+    let s = Setup::new(|_| {}).await;
+    let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());
+    let hist = m.history("BTCUSD Curncy", Timeframe::M1, None, 10).await.unwrap();
+    assert_eq!(hist.len(), 10, "history from the server");
+    let now = hist.last().unwrap().ts;
+    let mut feed = m.live("BTCUSD Curncy", Timeframe::M1).expect("a live feed");
+    s.mock.until("candle:BTC:1m upstream", |mk| mk.subs().contains("candle:BTC:1m")).await;
+    let candle = |t: i64| json!({"t": t * 1000, "T": t * 1000 + 59_999, "s": "BTC", "i": "1m", "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1});
+    // The stream is on a bar three minutes back when the upstream drops...
+    let before = now - 180;
+    s.mock.push("candle:BTC:1m", "candle", candle(before));
+    let got = tokio::time::timeout(WAIT, feed.recv()).await.unwrap().unwrap();
+    assert_eq!(got.ts, before);
+    s.mock.drop_all();
+    s.mock.until("candle resubscribed", |mk| mk.count("subscribe candle:BTC:1m") == 2).await;
+    // ...and back on the current bar after: the two bars in between come from history.
+    s.mock.push("candle:BTC:1m", "candle", candle(now));
+    let mut ts = Vec::new();
+    while ts.last() != Some(&now) || ts.len() < 3 {
+        ts.push(tokio::time::timeout(WAIT, feed.recv()).await.unwrap().unwrap().ts);
+    }
+    assert!(ts.contains(&(before + 60)) && ts.contains(&(before + 120)), "missed bars backfilled: {ts:?}");
+    assert!(ts.windows(2).all(|w| w[0] <= w[1]), "in order: {ts:?}");
 }

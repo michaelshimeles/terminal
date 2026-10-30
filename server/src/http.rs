@@ -13,6 +13,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
+use tokio::sync::watch;
 
 use crate::metrics::{Metrics, Quantiles, TopicKind};
 use crate::provider::UpstreamStats;
@@ -24,16 +25,19 @@ pub struct AppState {
     pub hub: Arc<Hub>,
     pub sessions: Arc<SessionConfig>,
     pub max_clients: usize,
+    /// Becomes true when the gateway shuts down; every session closes.
+    closing: watch::Receiver<bool>,
     next_session: Arc<AtomicU64>,
     started: Instant,
 }
 
 impl AppState {
-    pub fn new(hub: Arc<Hub>, sessions: SessionConfig, max_clients: usize) -> Self {
+    pub fn new(hub: Arc<Hub>, sessions: SessionConfig, max_clients: usize, closing: watch::Receiver<bool>) -> Self {
         Self {
             hub,
             sessions: Arc::new(sessions),
             max_clients,
+            closing,
             next_session: Arc::new(AtomicU64::new(1)),
             started: Instant::now(),
         }
@@ -55,7 +59,9 @@ async fn ws(State(st): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many clients\n").into_response();
     }
     let id = st.next_session.fetch_add(1, Ordering::Relaxed);
-    upgrade.max_message_size(64 * 1024).on_upgrade(move |socket| session::run(socket, st.hub, st.sessions, id))
+    upgrade
+        .max_message_size(64 * 1024)
+        .on_upgrade(move |socket| session::run(socket, st.hub, st.sessions, id, st.closing))
 }
 
 async fn readyz(State(st): State<AppState>) -> Response {

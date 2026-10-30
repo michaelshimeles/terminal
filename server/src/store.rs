@@ -9,7 +9,7 @@
 //!   Trades and bars are event topics: a bounded `broadcast` ring with a per-topic sequence
 //!   number, so a reader that falls behind the ring knows it did and resyncs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -53,54 +53,114 @@ impl Default for HubConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Mid {
     pub px: f64,
     pub ts_ms: i64,
     pub recv: Instant,
     /// The table version that last changed it.
     pub stamp: u64,
+    /// The venue whose feed carries it (`""` is the core dex, which also carries spot).
+    pub venue: Arc<str>,
 }
 
-/// Every mid on every venue, with a version readers watch for changes.
+/// One venue's mids feed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VenueState {
+    pub status: TopicStatus,
+    /// Bumped each time the feed reconnects, so readers know to resync.
+    pub epoch: u64,
+}
+
+impl Default for VenueState {
+    fn default() -> Self {
+        Self { status: TopicStatus::Live, epoch: 0 }
+    }
+}
+
+/// Every mid on every venue, each venue's feed state, and a version readers watch for changes
+/// to either.
 pub struct MidsTable {
     map: RwLock<HashMap<String, Mid>>,
+    venues: RwLock<HashMap<String, VenueState>>,
     version: watch::Sender<u64>,
 }
 
 impl Default for MidsTable {
     fn default() -> Self {
-        Self { map: RwLock::default(), version: watch::channel(0).0 }
+        Self { map: RwLock::default(), venues: RwLock::default(), version: watch::channel(0).0 }
     }
 }
 
 impl MidsTable {
-    fn apply(&self, recv: Instant, ts_ms: i64, mids: Vec<(String, f64)>) {
+    fn bump(&self) {
+        self.version.send_modify(|v| *v += 1);
+    }
+
+    /// One message from a venue's feed. Hyperliquid sends every mid the venue has each time, so
+    /// a coin missing from it is gone (delisted) and leaves the table.
+    fn apply(&self, venue: &str, recv: Instant, ts_ms: i64, mids: Vec<(String, f64)>) {
         let v = *self.version.borrow() + 1;
         let mut changed = false;
         {
             let mut map = self.map.write().expect("mids lock");
+            let present: HashSet<&str> = mids.iter().map(|(c, _)| c.as_str()).collect();
+            let before = map.len();
+            map.retain(|c, m| &*m.venue != venue || present.contains(c.as_str()));
+            changed |= map.len() != before;
+            let name: Arc<str> = Arc::from(venue);
             for (coin, px) in mids {
                 match map.get_mut(&coin) {
                     Some(m) if m.px == px => {}
                     Some(m) => {
-                        *m = Mid { px, ts_ms, recv, stamp: v };
+                        *m = Mid { px, ts_ms, recv, stamp: v, venue: name.clone() };
                         changed = true;
                     }
                     None => {
-                        map.insert(coin, Mid { px, ts_ms, recv, stamp: v });
+                        map.insert(coin, Mid { px, ts_ms, recv, stamp: v, venue: name.clone() });
                         changed = true;
                     }
                 }
             }
         }
+        changed |= self.set_venue(venue, |st| st.status = TopicStatus::Live);
         if changed {
             self.version.send_replace(v);
         }
     }
 
+    /// Change a venue's state; true if it changed. Doesn't bump the version.
+    fn set_venue(&self, venue: &str, f: impl FnOnce(&mut VenueState)) -> bool {
+        let mut venues = self.venues.write().expect("venues lock");
+        let st = venues.entry(venue.to_string()).or_default();
+        let before = st.clone();
+        f(st);
+        *st != before
+    }
+
+    /// Connection news for a venue's feed.
+    fn venue_event(&self, venue: &str, recv_ms: i64, ev: &UpstreamEvent) {
+        let changed = match ev {
+            UpstreamEvent::Disconnected => {
+                self.set_venue(venue, |st| st.status = TopicStatus::Stale { since_ms: recv_ms })
+            }
+            UpstreamEvent::Reconnected => self.set_venue(venue, |st| st.epoch += 1),
+            UpstreamEvent::Rejected(why) => self.set_venue(venue, |st| {
+                st.status = TopicStatus::Unavailable { reason: UnavailableReason::Upstream, detail: why.clone() }
+            }),
+            _ => false,
+        };
+        if changed {
+            self.bump();
+        }
+    }
+
+    pub fn venue(&self, venue: &str) -> VenueState {
+        self.venues.read().expect("venues lock").get(venue).cloned().unwrap_or_default()
+    }
+
     pub fn get(&self, coin: &str) -> Option<Mid> {
-        self.map.read().expect("mids lock").get(coin).copied()
+        self.map.read().expect("mids lock").get(coin).cloned()
     }
 
     pub fn contains(&self, coin: &str) -> bool {
@@ -452,6 +512,9 @@ pub struct Hub {
     venues: Mutex<HashMap<String, UpstreamHandle>>,
     topics: Mutex<HashMap<TopicKey, Entry>>,
     next_entry: std::sync::atomic::AtomicU64,
+    /// The registry loop, until [`Hub::stop`].
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stopped: std::sync::atomic::AtomicBool,
     history: Mutex<HashMap<(InstrumentId, Timeframe), Cached>>,
 }
 
@@ -492,6 +555,8 @@ impl Hub {
             venues: Mutex::default(),
             topics: Mutex::default(),
             next_entry: Default::default(),
+            task: Mutex::default(),
+            stopped: Default::default(),
             history: Mutex::default(),
         })
     }
@@ -503,7 +568,7 @@ impl Hub {
     /// Load the instrument list, subscribe every venue's mids, and keep both fresh.
     pub fn start(self: &Arc<Self>) {
         let hub = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let wait = match hub.refresh_registry().await {
                     Ok(n) => {
@@ -521,6 +586,21 @@ impl Hub {
                 tokio::time::sleep(wait).await;
             }
         });
+        *self.task.lock().expect("task lock") = Some(task);
+    }
+
+    /// Stop for good: end the registry loop, drop every upstream subscription and close the
+    /// provider's connections. Clients still connected get no more data.
+    pub fn stop(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.task.lock().expect("task lock").take() {
+            t.abort();
+        }
+        let venues = std::mem::take(&mut *self.venues.lock().expect("venues lock"));
+        let topics = std::mem::take(&mut *self.topics.lock().expect("topics lock"));
+        // Dropping the handles unsubscribes upstream; do it outside the hub's locks.
+        drop((venues, topics));
+        self.provider.close();
     }
 
     async fn refresh_registry(self: &Arc<Self>) -> Result<usize> {
@@ -536,9 +616,12 @@ impl Hub {
                 continue;
             }
             let hub = Arc::downgrade(self);
+            let name = venue.clone();
             let sink = UpstreamSink::new(move |up| {
-                if let (Some(hub), UpstreamEvent::Mids(m)) = (hub.upgrade(), up.event) {
-                    hub.mids.apply(up.recv, up.recv_ms, m);
+                let Some(hub) = hub.upgrade() else { return };
+                match up.event {
+                    UpstreamEvent::Mids(m) => hub.mids.apply(&name, up.recv, up.recv_ms, m),
+                    ev => hub.mids.venue_event(&name, up.recv_ms, &ev),
                 }
             });
             match self.provider.subscribe(Channel::Mids, &InstrumentId(venue.clone()), sink).await {
@@ -612,6 +695,9 @@ impl Hub {
 
     /// Hold a topic, creating it and its upstream subscription if nobody holds it yet.
     pub async fn acquire(self: &Arc<Self>, key: TopicKey) -> Result<TopicRef, Unavailable> {
+        if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err((UnavailableReason::Upstream, "the server is shutting down".into()));
+        }
         let (entry, topic, created) = {
             let mut topics = self.topics.lock().expect("topics lock");
             match topics.get_mut(&key) {
@@ -828,12 +914,44 @@ mod tests {
     fn mids_only_bump_what_changed() {
         let m = MidsTable::default();
         let rx = m.subscribe();
-        m.apply(Instant::now(), 1, vec![("BTC".into(), 1.0), ("ETH".into(), 2.0)]);
-        m.apply(Instant::now(), 2, vec![("BTC".into(), 1.0), ("ETH".into(), 2.5)]);
+        let both = || vec![("BTC".into(), 1.0), ("ETH".into(), 2.5)];
+        m.apply("", Instant::now(), 1, vec![("BTC".into(), 1.0), ("ETH".into(), 2.0)]);
+        m.apply("", Instant::now(), 2, both());
         assert_eq!(*rx.borrow(), 2);
         assert_eq!(m.get("BTC").unwrap().stamp, 1);
         assert_eq!(m.get("ETH").unwrap().stamp, 2);
-        m.apply(Instant::now(), 3, vec![("BTC".into(), 1.0)]);
+        m.apply("", Instant::now(), 3, both());
         assert_eq!(*rx.borrow(), 2, "no change, no new version");
+    }
+
+    #[test]
+    fn coins_missing_from_their_venue_feed_are_dropped() {
+        let m = MidsTable::default();
+        m.apply("", Instant::now(), 1, vec![("BTC".into(), 1.0), ("OLD".into(), 2.0)]);
+        m.apply("xyz", Instant::now(), 1, vec![("xyz:TSLA".into(), 400.0)]);
+        // Each message carries the venue's full set: OLD was delisted.
+        m.apply("", Instant::now(), 2, vec![("BTC".into(), 1.0)]);
+        let mut coins = m.coins();
+        coins.sort();
+        assert_eq!(coins, ["BTC", "xyz:TSLA"], "other venues are untouched");
+        assert_eq!(&*m.get("xyz:TSLA").unwrap().venue, "xyz");
+    }
+
+    #[test]
+    fn venue_outages_are_visible() {
+        let m = MidsTable::default();
+        let rx = m.subscribe();
+        m.apply("xyz", Instant::now(), 1, vec![("xyz:TSLA".into(), 400.0)]);
+        let v0 = *rx.borrow();
+        m.venue_event("xyz", 7, &UpstreamEvent::Disconnected);
+        assert_eq!(m.venue("xyz"), VenueState { status: TopicStatus::Stale { since_ms: 7 }, epoch: 0 });
+        m.venue_event("xyz", 8, &UpstreamEvent::Reconnected);
+        assert_eq!(m.venue("xyz").epoch, 1);
+        assert!(matches!(m.venue("xyz").status, TopicStatus::Stale { .. }), "stale until data arrives");
+        // The first message after reconnecting makes it live, even with no price changes.
+        m.apply("xyz", Instant::now(), 9, vec![("xyz:TSLA".into(), 400.0)]);
+        assert_eq!(m.venue("xyz"), VenueState { status: TopicStatus::Live, epoch: 1 });
+        assert_eq!(*rx.borrow(), v0 + 3);
+        assert_eq!(m.venue("flx"), VenueState::default());
     }
 }

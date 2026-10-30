@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tr_core::Bar;
 
@@ -42,6 +42,7 @@ pub struct Gateway {
     pub addr: SocketAddr,
     pub state: http::AppState,
     stop: Option<oneshot::Sender<()>>,
+    closing: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
 
@@ -50,11 +51,14 @@ impl Gateway {
         &self.state.hub
     }
 
-    /// Stop accepting, close sessions and wait for the server to finish.
+    /// Stop accepting, close every client session and upstream connection, and wait for the
+    /// server to finish. Nothing keeps running afterwards.
     pub async fn shutdown(mut self) {
+        self.closing.send_replace(true);
         if let Some(s) = self.stop.take() {
             let _ = s.send(());
         }
+        self.state.hub.stop();
         let _ = (&mut self.task).await;
     }
 
@@ -70,7 +74,8 @@ pub async fn start(cfg: Config) -> Result<Gateway> {
     let provider = Arc::new(HlPublicProvider::new(cfg.hl.clone(), metrics.clone())?);
     let hub = Hub::new(provider, cfg.hub.clone(), metrics);
     hub.start();
-    let state = http::AppState::new(hub, cfg.session.clone(), cfg.max_clients);
+    let (closing, closing_rx) = watch::channel(false);
+    let state = http::AppState::new(hub, cfg.session.clone(), cfg.max_clients, closing_rx);
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.context("binding the listen address")?;
     let addr = listener.local_addr()?;
     let (stop, stopped) = oneshot::channel::<()>();
@@ -83,5 +88,5 @@ pub async fn start(cfg: Config) -> Result<Gateway> {
             tracing::error!("server: {e}");
         }
     });
-    Ok(Gateway { addr, state, stop: Some(stop), task })
+    Ok(Gateway { addr, state, stop: Some(stop), closing, task })
 }

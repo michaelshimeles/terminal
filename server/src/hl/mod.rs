@@ -80,6 +80,10 @@ impl Provider for HlPublicProvider {
         DisplayPolicy { public_display: true, entitlement: None, delay: None, attribution: "Data: Hyperliquid" }
     }
 
+    fn close(&self) {
+        self.pool.close();
+    }
+
     fn stats(&self) -> UpstreamStats {
         let (used, budget) = self.info.weight();
         UpstreamStats { rest_weight_last_min: used, rest_weight_per_min: budget, ..self.pool.stats() }

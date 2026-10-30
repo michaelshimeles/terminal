@@ -548,6 +548,16 @@ async fn book_feed(
     books.lock().expect("books lock").remove(&symbol);
 }
 
+/// The bars from `from` (Unix seconds, the bar open) up to now.
+async fn backfill(client: &Client, key: &MarketKey, tf: Timeframe, from: i64) -> Result<Vec<Bar>, ApiError> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(from);
+    let limit = ((now - from).max(0) / tf.seconds() + 2).min(5000) as u32;
+    match client.request(Rpc::History { key: key.clone(), tf, end: None, limit }).await? {
+        RpcResult::History(bars) => Ok(bars),
+        _ => Err(ApiError { code: ErrorCode::Internal, message: "unexpected reply".into() }),
+    }
+}
+
 #[async_trait]
 impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     fn name(&self) -> &str {
@@ -607,11 +617,20 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
             return self.inner.live(symbol, tf);
         }
         let (tx, rx) = mpsc::channel(256);
+        let client = self.client().clone();
+        let key = MarketKey::new(symbol);
         // The worker already holds the history; the live stream only needs what's new.
-        let mut sub = self.client().subscribe(TopicReq::Bars { key: MarketKey::new(symbol), tf, history: 0 });
+        let mut sub = client.subscribe(TopicReq::Bars { key: key.clone(), tf, history: 0 });
         rt::spawn(async move {
+            // The newest bar sent on, and whether the stream broke since.
+            let mut last: Option<i64> = None;
+            let mut broken = false;
             while let Some(u) = sub.next().await {
-                let bars = match u.event {
+                let mut bars = match u.event {
+                    Event::Resync(_) | Event::Reconnecting => {
+                        broken = true;
+                        continue;
+                    }
                     Event::Snapshot(TopicData::Bars(b)) => b,
                     // A `Closed` bar carries the bar's final values; merging it into the forming
                     // bar the worker holds gives the same bar (the server's forming bars are
@@ -619,7 +638,22 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
                     Event::Delta(TopicDelta::Bar(BarDelta::Forming(b) | BarDelta::Closed(b))) => vec![b],
                     _ => continue,
                 };
+                // After an outage the stream picks up at the current bar. Fetch the bars that
+                // closed in between first, so the chart has no hole.
+                if std::mem::take(&mut broken)
+                    && let Some(from) = last
+                {
+                    match backfill(&client, &key, tf, from).await {
+                        Ok(mut missed) => {
+                            missed.retain(|b| b.ts >= from);
+                            missed.extend(bars);
+                            bars = missed;
+                        }
+                        Err(e) => tracing::debug!("terminal server, backfilling {key}: {e}"),
+                    }
+                }
                 for b in bars {
+                    last = Some(last.map_or(b.ts, |l| l.max(b.ts)));
                     if tx.send(b).await.is_err() {
                         return;
                     }
