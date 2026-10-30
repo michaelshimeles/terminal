@@ -417,3 +417,20 @@ async fn json_is_a_debug_encoding() {
     let stats = tr_gateway::http::stats(&s.gw.state);
     assert_eq!((stats.clients, stats.upstream.subscriptions), (1, 2));
 }
+
+#[tokio::test]
+async fn clients_that_send_too_fast_are_throttled() {
+    let s = Setup::new(|c| c.session.max_messages_per_10s = 3).await;
+    let client = s.client(Encoding::Postcard);
+    assert!(client.wait_up(WAIT).await);
+    // The client's first ping and these five subscribes share a budget of three messages.
+    let mut subs: Vec<_> =
+        (0..5).map(|_| client.subscribe(TopicReq::Quotes { keys: vec![MarketKey::new("BTC")], max_hz: 1 })).collect();
+    let mut answered = 0;
+    for sub in &mut subs {
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
+            answered += 1;
+        }
+    }
+    assert!((2..=3).contains(&answered), "{answered} of 5 subscriptions were served");
+}

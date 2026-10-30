@@ -33,6 +33,8 @@ pub struct SessionConfig {
     pub max_book_depth: u8,
     pub max_history: u32,
     pub max_quote_hz: u8,
+    /// Client messages per 10 s. Subscribes past this would churn the shared upstream.
+    pub max_messages_per_10s: u32,
     /// Outbound frames a client may have queued.
     pub queue: usize,
     pub hello_timeout: Duration,
@@ -53,6 +55,7 @@ impl Default for SessionConfig {
             max_book_depth: 20,
             max_history: 5000,
             max_quote_hz: 10,
+            max_messages_per_10s: 200,
             queue: 256,
             hello_timeout: Duration::from_secs(10),
             slow_consumer: Duration::from_secs(10),
@@ -236,6 +239,7 @@ async fn serve(mut socket: WebSocket, hub: Arc<Hub>, cfg: Arc<SessionConfig>, se
     let mut idle = tokio::time::interval(cfg.idle_timeout / 3);
     let mut last_heard = Instant::now();
     let mut writer_done = false;
+    let rate = crate::limit::WindowLimiter::new(cfg.max_messages_per_10s, Duration::from_secs(10));
 
     loop {
         tokio::select! {
@@ -248,6 +252,11 @@ async fn serve(mut socket: WebSocket, hub: Arc<Hub>, cfg: Arc<SessionConfig>, se
                     }
                     continue;
                 };
+                if rate.try_acquire(1).is_err() {
+                    let m = format!("more than {} messages in 10 s; this one was ignored", cfg.max_messages_per_10s);
+                    link.send(&ServerMsg::Error { code: ErrorCode::RateLimited, message: m }, None).await;
+                    continue;
+                }
                 match decoded {
                     Ok(m) => handle(m, &hub, &cfg, &link, &mut subs).await,
                     Err(e) => {

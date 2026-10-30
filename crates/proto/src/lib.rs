@@ -350,6 +350,8 @@ pub enum ErrorCode {
     UnknownMarket,
     Upstream,
     Internal,
+    /// The client sent messages faster than `Limits` allows; the server ignored this one.
+    RateLimited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

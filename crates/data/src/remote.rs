@@ -555,27 +555,25 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        // Older pages come from wherever the bars already shown came from, so a chart never
+        // splices one venue's bars onto another's.
+        if end.is_some() {
+            if self.served(symbol) {
+                return self.server_history(symbol, tf, end, limit).await.map_err(|e| anyhow!("{e}"));
+            }
+            return self.inner.history(symbol, tf, end, limit).await;
+        }
         if self.routed(symbol) {
             match self.server_history(symbol, tf, end, limit).await {
-                Ok(bars) if !bars.is_empty() || end.is_some() => {
-                    if end.is_none() {
-                        self.served.lock().expect("served lock").insert(symbol.to_string());
-                    }
+                Ok(bars) if !bars.is_empty() => {
+                    self.served.lock().expect("served lock").insert(symbol.to_string());
                     return Ok(bars);
                 }
                 Ok(_) => {}
-                Err(e) => {
-                    // Older pages must come from the same source as the bars already shown.
-                    if end.is_some() && self.served(symbol) {
-                        bail!("{e}");
-                    }
-                    self.note(symbol, &e);
-                }
+                Err(e) => self.note(symbol, &e),
             }
         }
-        if end.is_none() {
-            self.served.lock().expect("served lock").remove(symbol);
-        }
+        self.served.lock().expect("served lock").remove(symbol);
         self.inner.history(symbol, tf, end, limit).await
     }
 
