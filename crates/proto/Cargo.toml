@@ -1,0 +1,13 @@
+[package]
+name = "tr-proto"
+description = "Client protocol between Terminal clients and the Terminal data server"
+version.workspace = true
+edition.workspace = true
+
+# Shared by the server, the desktop app and the browser build, so it must build for
+# wasm32-unknown-unknown: serde, tr-core and the two codecs only, nothing async or networked.
+[dependencies]
+tr-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }

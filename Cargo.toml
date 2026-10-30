@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/broker", "crates/congress", "crates/data", "crates/chart", "crates/macos", "app"]
+members = ["crates/core", "crates/broker", "crates/congress", "crates/data", "crates/chart", "crates/macos", "crates/proto", "app", "server"]
 default-members = ["app"]
 
 [workspace.package]
@@ -15,6 +15,7 @@ tr-congress = { path = "crates/congress" }
 tr-data = { path = "crates/data" }
 tr-chart = { path = "crates/chart" }
 tr-macos = { path = "crates/macos" }
+tr-proto = { path = "crates/proto" }
 anyhow = "1"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }

@@ -84,12 +84,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-x11-0 libxcb-xkb1 mesa-vulkan-drivers xvfb
       - run: cargo fmt --all -- --check
       - run: cargo build --release --workspace --all-targets
       - run: cargo test --release --workspace
       - run: cargo clippy --release --workspace --all-targets -- -D warnings
+      - name: The protocol crate builds for the browser
+        run: cargo build -p tr-proto --target wasm32-unknown-unknown
       - name: Run the app (smoke test)
         env:
           TR_PROVIDER: sample
