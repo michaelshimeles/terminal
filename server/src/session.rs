@@ -447,8 +447,10 @@ async fn rpc(hub: &Arc<Hub>, cfg: &SessionConfig, req: Rpc) -> Result<RpcResult,
     }
     match req {
         Rpc::History { key, tf, end, limit } => {
-            let inst =
-                hub.resolve(&key).ok_or_else(|| err(ErrorCode::UnknownMarket, format!("unknown market {key}")))?;
+            let inst = hub.resolve(&key).ok_or_else(|| match hub.unknown(&key) {
+                (UnavailableReason::Upstream, m) => err(ErrorCode::Upstream, m),
+                (_, m) => err(ErrorCode::UnknownMarket, m),
+            })?;
             let limit = (limit.clamp(1, cfg.max_history)) as usize;
             // With a live stream for this market, cached history must be newer than the stream's
             // last (re)start, or bars that closed while it was down could be missing or partial.
@@ -481,7 +483,7 @@ async fn forward(f: Fwd, hub: Arc<Hub>, cfg: Arc<SessionConfig>, topic: TopicReq
             return;
         }
     }
-    let unknown = |k: &MarketKey| (UnavailableReason::UnknownMarket, format!("unknown market {k}"));
+    let unknown = |k: &MarketKey| hub.unknown(k);
     let (tkey, extra) = match &topic {
         TopicReq::Quotes { keys, max_hz } => {
             if keys.len() > cfg.max_quote_keys {
@@ -547,20 +549,38 @@ fn combined(states: &[VenueState]) -> TopicStatus {
     out
 }
 
-async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
-    let resolved: Vec<(MarketKey, String)> =
-        keys.into_iter().filter_map(|k| hub.resolve(&k).map(|i| (k, i.0))).collect();
-    if resolved.is_empty() {
-        f.unavailable(UnavailableReason::UnknownMarket, "none of these markets are known".into()).await;
-        return;
-    }
-    // The feeds these quotes come from, to report their outages.
+/// The feeds these quotes come from, to report their outages.
+fn venues_of(hub: &Hub, resolved: &[(MarketKey, String)]) -> Vec<String> {
     let mut venues: Vec<String> =
         resolved.iter().filter_map(|(_, c)| hub.mids.get(c).map(|m| m.venue.to_string())).collect();
     venues.sort();
     venues.dedup();
-    let venue_states = || venues.iter().map(|v| hub.mids.venue(v)).collect::<Vec<_>>();
-    let mut epochs: Vec<u64> = venue_states().iter().map(|v| v.epoch).collect();
+    venues
+}
+
+async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
+    let (mut resolved, mut late) = (Vec::new(), Vec::new());
+    for k in keys {
+        match hub.resolve(&k) {
+            Some(i) => resolved.push((k, i.0)),
+            None => late.push(k),
+        }
+    }
+    if resolved.is_empty() {
+        let (reason, detail) = if hub.loading() {
+            (UnavailableReason::Upstream, "none of these markets are known yet; some venues are still loading")
+        } else {
+            (UnavailableReason::UnknownMarket, "none of these markets are known")
+        };
+        f.unavailable(reason, detail.into()).await;
+        return;
+    }
+    // Keys on a venue that is still loading join with their first delta once it's in. After
+    // that, whatever still doesn't resolve is unknown.
+    let mut look_again = hub.loading();
+    let mut venues = venues_of(&hub, &resolved);
+    let venue_states = |venues: &[String]| venues.iter().map(|v| hub.mids.venue(v)).collect::<Vec<_>>();
+    let mut epochs: Vec<u64> = venue_states(&venues).iter().map(|v| v.epoch).collect();
     let mut status = TopicStatus::Live;
     let mut version = hub.mids.subscribe();
     // What each requested key last carried: two keys can share a coin (`BTC`, `BTCUSD Curncy`).
@@ -569,7 +589,23 @@ async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
     let period = Duration::from_secs(1) / u32::from(hz);
     loop {
         version.borrow_and_update();
-        let states = venue_states();
+        if look_again && !late.is_empty() {
+            look_again = hub.loading();
+            let before = resolved.len();
+            late.retain(|k| match hub.resolve(k) {
+                Some(i) => {
+                    resolved.push((k.clone(), i.0));
+                    false
+                }
+                None => true,
+            });
+            if resolved.len() > before {
+                stamps.resize(resolved.len(), 0);
+                venues = venues_of(&hub, &resolved);
+                epochs = venue_states(&venues).iter().map(|v| v.epoch).collect();
+            }
+        }
+        let states = venue_states(&venues);
         let now = combined(&states);
         if now != status {
             status = now;

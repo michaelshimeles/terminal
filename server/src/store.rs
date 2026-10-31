@@ -664,26 +664,39 @@ impl Hub {
     /// from the first instrument list has done so. A venue that stays silent holds it back for
     /// `venue_grace` at most. Mids stream all the time, so the first message after that settles it.
     fn heard(&self, venue: &str) {
-        if self.is_ready() {
-            return;
-        }
-        let missing: Vec<String> = match &mut *self.listing.lock().expect("listing lock") {
-            Some((at, waiting)) => {
-                waiting.remove(venue);
-                if !waiting.is_empty() && at.elapsed() < self.cfg.venue_grace {
-                    return;
-                }
-                waiting.iter().cloned().collect()
+        let mut listing = self.listing.lock().expect("listing lock");
+        let Some((at, waiting)) = listing.as_mut() else { return };
+        let first = waiting.remove(venue);
+        let settled = waiting.is_empty() || at.elapsed() >= self.cfg.venue_grace;
+        let now_ready = settled && !self.is_ready() && !self.mids.is_empty();
+        if now_ready {
+            self.ready.send_replace(true);
+            if waiting.is_empty() {
+                tracing::info!("ready: {} mids", self.mids.len());
+            } else {
+                tracing::warn!("ready with {} mids, but none yet from venues {waiting:?}", self.mids.len());
             }
-            None => return,
-        };
-        if self.mids.is_empty() || self.ready.send_replace(true) {
-            return;
         }
-        if missing.is_empty() {
-            tracing::info!("ready: {} mids", self.mids.len());
+        drop(listing);
+        // Subscriptions waiting for a market on this venue look again.
+        if first || now_ready {
+            self.mids.bump();
+        }
+    }
+
+    /// Until every venue from the first instrument list has sent mids (or been refused), a key
+    /// that doesn't resolve may still be a market whose venue is late, even after the grace.
+    pub fn loading(&self) -> bool {
+        self.listing.lock().expect("listing lock").as_ref().is_none_or(|(_, waiting)| !waiting.is_empty())
+    }
+
+    /// Why `key` doesn't resolve. While venues are still loading that is an upstream problem,
+    /// which clients retry, rather than an unknown market, which they don't.
+    pub fn unknown(&self, key: &MarketKey) -> Unavailable {
+        if self.loading() {
+            (UnavailableReason::Upstream, format!("{key} isn't known yet; some venues are still loading"))
         } else {
-            tracing::warn!("ready with {} mids, but none yet from venues {missing:?}", self.mids.len());
+            (UnavailableReason::UnknownMarket, format!("unknown market {key}"))
         }
     }
 

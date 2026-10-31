@@ -66,8 +66,9 @@ systemctl restart tr-gateway
 # Wait until the process is up (/healthz), then until it has the instrument list and
 # every venue's mids (/readyz).
 wait_for() {
-  for _ in $(seq 1 "$2"); do
-    if curl -fsS "http://127.0.0.1:8080/$1" >/dev/null 2>&1; then return 0; fi
+  local deadline=$((SECONDS + $2))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:8080/$1" >/dev/null 2>&1; then return 0; fi
     sleep 1
   done
   echo "/$1 did not answer 200 within $2 s" >&2

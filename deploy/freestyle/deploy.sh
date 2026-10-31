@@ -37,8 +37,12 @@ fs vm scp "$HERE/vm-setup.sh" "$SLUG:/root/vm-setup.sh" >/dev/null
 fs vm exec "$SLUG" --linux-user root --timeout-ms 1800000 -- bash /root/vm-setup.sh "$REF"
 
 # The VM said it's ready; check the public path through Freestyle's edge too.
-for _ in $(seq 1 30); do
-  if curl -fsS "https://$DOMAIN/readyz" >/dev/null 2>&1; then echo "ready: wss://$DOMAIN/ws"; exit 0; fi
+deadline=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if curl -fsS --connect-timeout 5 --max-time 10 "https://$DOMAIN/readyz" >/dev/null 2>&1; then
+    echo "ready: wss://$DOMAIN/ws"
+    exit 0
+  fi
   sleep 2
 done
 echo "deployed, but https://$DOMAIN/readyz is not answering 200 yet" >&2
