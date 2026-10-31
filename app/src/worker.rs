@@ -308,8 +308,8 @@ struct Shared {
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
-    /// How many times each chart pane reloaded because its data source changed, so a page of
-    /// older bars from the old source doesn't join the new one's.
+    /// Counts each chart pane's reloads for a changed data source, up once as one starts and again
+    /// when it's done (odd while it runs), so a page of older bars that spans one is dropped.
     sources: std::sync::Mutex<HashMap<PaneId, u64>>,
     #[cfg(not(target_arch = "wasm32"))]
     cache: std::sync::Mutex<Option<BarCache>>,
@@ -618,12 +618,13 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             // Page from the worker's copy (it may hold newer live bars than the UI's).
             let base = current_series(s, pane, generation).filter(|b| !b.is_empty()).unwrap_or(existing);
             let Some(first) = base.first().copied() else { return };
+            // A page that overlaps a reload for another source is dropped. The reload answers the
+            // pane, and the chart pages again from the new source.
             let source = source_switches(s, pane);
-            let page = s.provider.history(&symbol, tf, Some(first.ts), limit).await;
-            if source_switches(s, pane) != source {
-                return; // the chart reloaded from another source, and that reload answers the pane
+            if source % 2 == 1 {
+                return;
             }
-            match page {
+            match s.provider.history(&symbol, tf, Some(first.ts), limit).await {
                 Ok(older) => {
                     let older: Vec<Bar> = older.into_iter().filter(|b| b.ts < first.ts).collect();
                     let prepended = older.len();
@@ -631,6 +632,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         let mut map = s.series.lock().expect("series lock");
                         let Some((g, cur)) = map.get_mut(&pane).filter(|(g, _)| *g == generation) else { return };
                         let _ = g;
+                        if source_switches(s, pane) != source {
+                            return;
+                        }
                         let mut merged = older;
                         merged.extend_from_slice(cur);
                         *cur = Arc::new(merged);
@@ -650,7 +654,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         live: false,
                     });
                 }
-                Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
+                Err(e) if source_switches(s, pane) == source => {
+                    s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") })
+                }
+                Err(_) => {}
             }
         }
         Request::Indicators { pane, generation, bars, tf, specs, palette } => {
@@ -929,8 +936,10 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
         if ended {
             rt::sleep(RELOAD_AFTER_FEED_ENDS.saturating_sub(started.elapsed())).await;
             if current_series(&s, pane, generation).is_some() {
-                *s.sources.lock().expect("sources lock").entry(pane).or_default() += 1;
+                let switch = || *s.sources.lock().expect("sources lock").entry(pane).or_default() += 1;
+                switch();
                 handle(&s, Request::History { pane, generation, symbol, tf, limit }).await;
+                switch();
             }
         }
     });
@@ -1073,12 +1082,14 @@ mod tests {
         assert!(current_series(&s, 1, 1).is_none());
     }
 
-    /// Bars whose close counts the loads, and older pages that wait for `page`. The first chart's
-    /// live feed ends at once, the way `RemoteMarkets` ends one when the chart's source changes.
+    /// Bars whose close counts the loads. Reloads wait for `reload`, and older pages for `page`.
+    /// The first chart's live feed ends at once, the way `RemoteMarkets` ends one when the chart's
+    /// source changes.
     #[derive(Default)]
     struct SourceChanges {
         loads: std::sync::atomic::AtomicUsize,
         open: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<Bar>>>,
+        reload: tokio::sync::Notify,
         page: tokio::sync::Notify,
     }
 
@@ -1094,6 +1105,9 @@ mod tests {
                 return Ok(vec![Bar::new(-60, 1.0, 1.0, 1.0, 1.0, 1.0)]);
             }
             let n = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n > 1 {
+                self.reload.notified().await;
+            }
             Ok(vec![Bar::new(0, 1.0, 1.0, 1.0, n as f64, 1.0)])
         }
 
@@ -1143,15 +1157,16 @@ mod tests {
     async fn charts_reload_when_the_provider_ends_their_live_feed() {
         let t0 = std::time::Instant::now();
         let (_s, rx, provider) = switching_chart().await;
+        provider.reload.notify_one();
         assert_eq!(closes(&rx, 2).await, [1.0, 2.0], "the reload replaced the chart");
         assert!(t0.elapsed() >= RELOAD_AFTER_FEED_ENDS, "not before the pause");
         assert_eq!(provider.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn pages_from_the_old_source_are_dropped_when_the_chart_switches() {
+    async fn pages_that_overlap_a_source_switch_are_dropped() {
         let (s, rx, provider) = switching_chart().await;
-        let req = Request::MoreHistory {
+        let more = || Request::MoreHistory {
             pane: 1,
             generation: 1,
             symbol: "BTCUSD Curncy".into(),
@@ -1159,14 +1174,23 @@ mod tests {
             existing: Arc::new(Vec::new()),
             limit: 10,
         };
-        let paging = tokio::spawn({
-            let s = s.clone();
+        // One page starts before the switch, and its bars arrive after it.
+        let before = tokio::spawn({
+            let (s, req) = (s.clone(), more());
             async move { handle(&s, req).await }
         });
+        let t0 = std::time::Instant::now();
+        while source_switches(&s, 1) != 1 {
+            assert!(t0.elapsed() < Duration::from_secs(15), "no reload");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Another starts while the chart reloads, and gives up at once.
+        let during = tokio::time::timeout(Duration::from_secs(1), handle(&s, more())).await;
+        assert!(during.is_ok(), "a page started during the reload went ahead");
+        provider.reload.notify_one();
         assert_eq!(closes(&rx, 2).await, [1.0, 2.0]);
-        // The page from before the switch arrives after it.
         provider.page.notify_one();
-        paging.await.unwrap();
+        before.await.unwrap();
         let ts: Vec<i64> = current_series(&s, 1, 1).unwrap().iter().map(|b| b.ts).collect();
         assert_eq!(ts, [0], "the old source's page joined the new source's bars");
         assert!(rx.try_iter().all(|r| !matches!(r, Response::History { prepended: 1.., .. })));
