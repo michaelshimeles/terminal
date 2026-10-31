@@ -757,9 +757,9 @@ async fn a_silent_venue_delays_readiness_only_for_the_grace() {
     assert!(!s.gw.hub().mids.contains("xyz:TSLA"));
 }
 
-/// A venue later than `venue_grace` doesn't make its markets unknown. Until it reports, they
-/// fail as `Upstream`, which the client retries, and a quotes subscription takes them in when
-/// their mids arrive.
+/// A venue later than `venue_grace` doesn't make its markets unknown. Until it reports, a
+/// request for one fails as `Upstream`, which clients retry, a subscription waits for it like
+/// one made during startup, and a quotes subscription takes it in when its mids arrive.
 #[tokio::test]
 async fn markets_on_a_venue_later_than_the_grace_come_back() {
     let s = Setup::starting(|c| c.hub.venue_grace = Duration::from_millis(300)).await;
@@ -772,23 +772,19 @@ async fn markets_on_a_venue_later_than_the_grace_come_back() {
     let r = client.request(Rpc::History { key: tsla(), tf: Timeframe::H1, end: None, limit: 5 }).await;
     assert_eq!(r.as_ref().map_err(|e| e.code), Err(ErrorCode::Upstream), "{r:?}");
     let mut book = client.subscribe(TopicReq::Book { key: tsla(), depth: 5, group: None });
-    let e = next(&mut book).await;
-    assert!(matches!(e, Event::Status(TopicStatus::Unavailable { reason: UnavailableReason::Upstream, .. })), "{e:?}");
     let mut quotes = client.subscribe(TopicReq::Quotes { keys: vec![MarketKey::new("BTC"), tsla()], max_hz: 10 });
     let Event::Snapshot(TopicData::Quotes(q)) = next(&mut quotes).await else { panic!("quotes") };
     assert_eq!(q.iter().map(|q| q.key.as_str()).collect::<Vec<_>>(), ["BTC"]);
+    let e = next(&mut book).await;
+    assert!(matches!(e, Event::Status(TopicStatus::Stale { .. })), "the book waits for its venue: {e:?}");
     s.xyz_mids();
     // The quotes subscription takes the late market in...
     let Event::Delta(TopicDelta::Quotes(d)) = next(&mut quotes).await else { panic!("a quotes delta") };
     assert_eq!(d.iter().map(|q| (q.key.as_str(), q.px)).collect::<Vec<_>>(), [("xyz:TSLA", 401.5)]);
-    // ...and the client's retry brings the book back.
+    // ...and the book subscription goes live, with no retry from the client.
     s.mock.until("l2Book:xyz:TSLA upstream", |m| m.subs().contains("l2Book:xyz:TSLA")).await;
     s.mock.push("l2Book:xyz:TSLA", "l2Book", book_msg("xyz:TSLA", "400.0"));
-    loop {
-        match next(&mut book).await {
-            Event::Snapshot(TopicData::Book(b)) => break assert_eq!(b.bids[0].px, 400.0),
-            Event::Resubscribing | Event::Status(TopicStatus::Live) => {}
-            e => panic!("{e:?}"),
-        }
-    }
+    let (seen, data) = until_snapshot(&mut book).await;
+    assert_eq!(seen, ["live"]);
+    assert!(matches!(data, TopicData::Book(b) if b.bids[0].px == 400.0));
 }

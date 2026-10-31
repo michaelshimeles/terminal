@@ -471,26 +471,52 @@ async fn rpc(hub: &Arc<Hub>, cfg: &SessionConfig, req: Rpc) -> Result<RpcResult,
     }
 }
 
+/// Whether the hub knows the market (for quotes, any of them).
+fn known(hub: &Hub, topic: &TopicReq) -> bool {
+    match topic {
+        TopicReq::Quotes { keys, .. } => keys.iter().any(|k| hub.resolve(k).is_some()),
+        TopicReq::Book { key, .. } | TopicReq::Trades { key } | TopicReq::Bars { key, .. } => {
+            hub.resolve(key).is_some()
+        }
+    }
+}
+
+/// Right after a restart the gateway doesn't know yet which markets exist, and one venue can
+/// be later than the rest. A subscription waits for its market, marked stale, rather than end.
+/// False once the session is gone.
+async fn wait_until_known(f: &Fwd, hub: &Hub, topic: &TopicReq) -> bool {
+    let mut version = hub.mids.subscribe();
+    let mut waited = false;
+    loop {
+        version.borrow_and_update();
+        if hub.is_ready() && (!hub.loading() || known(hub, topic)) {
+            return !waited || f.status(TopicStatus::Live).await;
+        }
+        if !waited && !f.status(TopicStatus::Stale { since_ms: now_ms() }).await {
+            return false;
+        }
+        waited = true;
+        // Mids, a venue's first report and readiness all bump the version.
+        if version.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
 async fn forward(f: Fwd, hub: Arc<Hub>, cfg: Arc<SessionConfig>, topic: TopicReq) {
-    // Right after a restart the gateway doesn't know yet which markets exist. A client that
-    // reconnects then keeps its subscriptions, stale until the upstream is in and live after.
-    if !hub.is_ready() {
-        if !f.status(TopicStatus::Stale { since_ms: now_ms() }).await {
-            return;
-        }
-        hub.wait_ready().await;
-        if !f.status(TopicStatus::Live).await {
-            return;
-        }
+    if let TopicReq::Quotes { keys, .. } = &topic
+        && keys.len() > cfg.max_quote_keys
+    {
+        let m = format!("at most {} keys per quotes subscription", cfg.max_quote_keys);
+        f.unavailable(UnavailableReason::Unsupported, m).await;
+        return;
+    }
+    if !wait_until_known(&f, &hub, &topic).await {
+        return;
     }
     let unknown = |k: &MarketKey| hub.unknown(k);
     let (tkey, extra) = match &topic {
         TopicReq::Quotes { keys, max_hz } => {
-            if keys.len() > cfg.max_quote_keys {
-                let m = format!("at most {} keys per quotes subscription", cfg.max_quote_keys);
-                f.unavailable(UnavailableReason::Unsupported, m).await;
-                return;
-            }
             let hz = (*max_hz).clamp(1, cfg.max_quote_hz);
             return quotes(f, hub, keys.clone(), hz).await;
         }
@@ -567,12 +593,7 @@ async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
         }
     }
     if resolved.is_empty() {
-        let (reason, detail) = if hub.loading() {
-            (UnavailableReason::Upstream, "none of these markets are known yet; some venues are still loading")
-        } else {
-            (UnavailableReason::UnknownMarket, "none of these markets are known")
-        };
-        f.unavailable(reason, detail.into()).await;
+        f.unavailable(UnavailableReason::UnknownMarket, "none of these markets are known".into()).await;
         return;
     }
     // Keys on a venue that is still loading join with their first delta once it's in. After

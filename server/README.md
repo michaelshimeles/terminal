@@ -20,7 +20,7 @@ The gateway serves plain HTTP and websockets. For `wss://` on 443, put a TLS-ter
 
 ## Restarts
 
-A restarted gateway listens before it knows which markets exist. It learns that from the instrument list and the first mids from every venue, which usually takes a few seconds. Clients that reconnect in that window keep their subscriptions. Each one gets `Stale`, then `Live` and its snapshot once the gateway is ready. Requests wait up to 10 s and then fail with `Upstream` rather than `UnknownMarket`, so clients can retry them. The client in `crates/data/src/remote.rs` subscribes again, with backoff from 1 s to 30 s, to anything a server ended with `Unavailable { reason: Upstream }`, so it also recovers from older gateways that gave up on such subscriptions.
+A restarted gateway listens before it knows which markets exist. It learns that from the instrument list and the first mids from every venue, which usually takes a few seconds. Clients that reconnect in that window keep their subscriptions. Each one gets `Stale`, then `Live` and its snapshot once the gateway is ready. Requests wait up to 10 s and then fail with `Upstream` rather than `UnknownMarket`, so clients can retry them. If one venue is slower than the rest, the gateway gets ready without it after 10 s. Subscriptions to that venue's markets keep waiting for it, and requests for them fail with `Upstream` until it reports. The client in `crates/data/src/remote.rs` subscribes again, with backoff from 1 s to 30 s, to anything a server ended with `Unavailable { reason: Upstream }`, so it also recovers from older gateways that gave up on such subscriptions.
 
 ## Try it
 
