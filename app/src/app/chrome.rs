@@ -108,7 +108,7 @@ impl TerminalApp {
         p.rect_filled(chip, 9.0, theme::control());
         p.circle_filled(pos2(chip.left() + 8.0, cy), 3.0, if live { theme::up() } else { amber() });
         p.galley(pos2(chip.left() + 14.0, cy - chip_text.size().y / 2.0), chip_text, muted());
-        ui.interact(chip, Id::new("source-chip"), Sense::hover()).on_hover_text(self.provider_label());
+        ui.interact(chip, Id::new("source-chip"), Sense::hover()).on_hover_text(provider_label(&self.provider));
         x = chip.right() + 8.0;
 
         // Which account trades: DEMO (paper) or LIVE (real money, in red). Click to switch.
@@ -291,21 +291,6 @@ impl TerminalApp {
             ("Crypto live", true)
         } else {
             ("Live", true)
-        }
-    }
-
-    fn provider_label(&self) -> String {
-        let n = self.provider.to_lowercase();
-        if n == "sample" {
-            "Offline · sample data".into()
-        } else if n.contains("sample") {
-            // The browser build (tr_data::web::WebMarkets).
-            "Live crypto from Binance and Coinbase; every other market is sample data in the browser".into()
-        } else if let Some(rest) = self.provider.strip_prefix("server+") {
-            // TR_SERVER_URL is set (tr_data::remote::RemoteMarkets).
-            format!("Live · crypto from Hyperliquid perps through the Terminal server; other markets from {rest}")
-        } else {
-            format!("Live · {}", self.provider)
         }
     }
 
@@ -990,4 +975,42 @@ fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selecte
         }
     }
     resp
+}
+
+/// What the data-source chip says on hover, from the provider's name.
+fn provider_label(provider: &str) -> String {
+    let n = provider.to_lowercase();
+    if n == "sample" {
+        "Offline · sample data".into()
+    } else if let Some(rest) = provider.strip_prefix("server+") {
+        // A Terminal server (tr_data::remote::RemoteMarkets), in front of the browser's sources
+        // (tr_data::web::WebMarkets) or the desktop's.
+        if rest.contains("sample") {
+            "Live crypto from Hyperliquid perps through the Terminal server, or from Binance and Coinbase while \
+             it is unreachable; every other market is sample data in the browser"
+                .into()
+        } else {
+            format!("Live · crypto from Hyperliquid perps through the Terminal server; other markets from {rest}")
+        }
+    } else if n.contains("sample") {
+        // The browser build (tr_data::web::WebMarkets).
+        "Live crypto from Binance and Coinbase; every other market is sample data in the browser".into()
+    } else {
+        format!("Live · {provider}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_label;
+
+    #[test]
+    fn the_source_tooltip_names_the_terminal_server() {
+        assert_eq!(provider_label("sample"), "Offline · sample data");
+        assert!(provider_label("binance+sample").starts_with("Live crypto from Binance"));
+        let web = provider_label("server+binance+sample");
+        assert!(web.contains("Terminal server") && web.contains("sample data in the browser"), "{web}");
+        let desktop = provider_label("server+markets");
+        assert!(desktop.contains("Terminal server") && desktop.ends_with("other markets from markets"), "{desktop}");
+    }
 }

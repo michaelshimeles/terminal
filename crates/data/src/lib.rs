@@ -18,7 +18,8 @@
 //!
 //! The browser build (`wasm32`) can only reach sources that allow cross-origin requests:
 //! [`for_browser`] serves live crypto through [`web::WebMarkets`] and sample data for the
-//! rest. It has no SQLite bar cache.
+//! rest. It has no SQLite bar cache. When the page was built with a Terminal server URL
+//! ([`web::server_url`]), crypto comes through the server first, as on the desktop.
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod alpaca;
@@ -27,7 +28,6 @@ pub mod cache;
 pub mod crypto;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod markets;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod remote;
 pub mod rss;
 pub mod rt;
@@ -435,11 +435,18 @@ pub fn from_env() -> Provider {
 }
 
 /// The browser build's provider: sample data only when `offline`, otherwise live crypto
-/// with sample data for everything else.
-pub fn for_browser(offline: bool) -> Provider {
+/// with sample data for everything else. With a Terminal `server` URL, crypto comes through
+/// that server, and from Binance and Coinbase whenever the server can't serve it.
+pub fn for_browser(offline: bool, server: Option<&str>) -> Provider {
     if !offline {
         match web::WebMarkets::new() {
-            Ok(m) => return Arc::new(Fallback::new(m)),
+            Ok(m) => {
+                let m = Fallback::new(m);
+                return match server {
+                    Some(url) => Arc::new(remote::RemoteMarkets::new(url, m)),
+                    None => Arc::new(m),
+                };
+            }
             Err(e) => tracing::warn!("crypto sources unavailable, using sample data: {e:#}"),
         }
     }

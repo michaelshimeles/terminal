@@ -572,6 +572,32 @@ async fn shutdown_closes_upstream_for_good() {
 }
 
 #[tokio::test]
+async fn order_books_fall_back_while_the_server_is_away() {
+    let s = Setup::new(|_| {}).await;
+    let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());
+    let push = async {
+        s.mock.until("l2Book:BTC upstream", |mk| mk.subs().contains("l2Book:BTC")).await;
+        s.mock.push("l2Book:BTC", "l2Book", book_msg("BTC", "100.0"));
+    };
+    let (book, ()) = tokio::join!(m.order_book("BTCUSD Curncy", 10), push);
+    let book = book.unwrap();
+    assert_eq!((book.source.as_str(), book.bids[0].0), (tr_data::remote::BOOK_SOURCE, 100.0));
+    // The server goes away: the pane gets the fallback's book, not the last one the server sent.
+    let Setup { mock: _mock, gw } = s;
+    tokio::time::timeout(WAIT, gw.shutdown()).await.expect("shutdown finishes");
+    let t0 = tokio::time::Instant::now();
+    loop {
+        let book = m.order_book("BTCUSD Curncy", 10).await.unwrap();
+        if book.source != tr_data::remote::BOOK_SOURCE {
+            assert!(book.simulated, "the sample provider's book");
+            break;
+        }
+        assert!(t0.elapsed() < WAIT, "still the server's last book {:?} after it went away", book.bids[0]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
 async fn desktop_charts_backfill_bars_missed_in_an_outage() {
     let s = Setup::new(|_| {}).await;
     let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());

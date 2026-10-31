@@ -3,6 +3,10 @@
 //!
 //! Query flags: `?sample` serves offline sample data only (like `TR_PROVIDER=sample`), and
 //! `?fps` shows the frame-time readout and repaints continuously (like `TR_FPS`).
+//!
+//! Crypto markets come from the Terminal server that `TR_SERVER_URL` named when the page was built
+//! (scripts/build-web.sh). `?server=off` turns it off, and `?server=ws://localhost:8787/ws` uses a
+//! server on this machine instead (see `tr_data::web::server_url`).
 
 use std::cell::Cell;
 
@@ -19,6 +23,13 @@ pub fn start() {
     let query = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
     let offline = has_flag(&query, "sample");
     let perf = has_flag(&query, "fps");
+    let requested = web_sys::UrlSearchParams::new_with_str(&query).ok().and_then(|p| p.get("server"));
+    let server = tr_data::web::server_url(option_env!("TR_SERVER_URL"), requested.as_deref());
+    if let Some(url) = server.as_deref().filter(|_| !offline) {
+        tracing::info!(
+            "crypto markets come from the Terminal server at {url}, or Binance and Coinbase while it's down"
+        );
+    }
     wasm_bindgen_futures::spawn_local(async move {
         let Some(canvas) = canvas() else { return fail("the page has no #terminal canvas") };
         let started = eframe::WebRunner::new()
@@ -29,7 +40,7 @@ pub fn start() {
                     // The first frame needs fonts; set them before it (set_fonts applies from the next pass).
                     cc.egui_ctx.set_fonts(crate::theme::base_fonts());
                     wasm_bindgen_futures::spawn_local(load_emoji_fonts(cc.egui_ctx.clone()));
-                    let mut app = crate::create_app(cc, tr_data::for_browser(offline), 1, t0)?;
+                    let mut app = crate::create_app(cc, tr_data::for_browser(offline, server.as_deref()), 1, t0)?;
                     if perf {
                         app.show_perf();
                     }

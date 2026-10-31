@@ -39,14 +39,40 @@ pub async fn sleep(d: Duration) {
 
 /// Resolves after `d`, through `setTimeout`.
 #[cfg(target_arch = "wasm32")]
-pub async fn sleep(d: Duration) {
+pub fn sleep(d: Duration) -> impl Future<Output = ()> + Send {
     let ms = d.as_millis().min(i32::MAX as u128) as i32;
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         if let Some(w) = web_sys::window() {
             let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
         }
     });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    // A promise isn't `Send`. The web build has one thread, so wrapping it is sound, and the provider
+    // traits' `Send` futures can then wait on it.
+    let done = send_wrapper::SendWrapper::new(wasm_bindgen_futures::JsFuture::from(promise));
+    async move {
+        let _ = done.await;
+    }
+}
+
+/// `fut` ran past its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elapsed;
+
+impl std::fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("deadline has elapsed")
+    }
+}
+
+impl std::error::Error for Elapsed {}
+
+/// Run `fut` for at most `d`.
+pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapsed> {
+    let (fut, deadline) = (std::pin::pin!(fut), std::pin::pin!(sleep(d)));
+    match futures::future::select(fut, deadline).await {
+        futures::future::Either::Left((out, _)) => Ok(out),
+        futures::future::Either::Right(_) => Err(Elapsed),
+    }
 }
 
 /// A periodic timer: the first tick completes at once, later ones every `period`. A late
@@ -85,5 +111,13 @@ mod tests {
         iv.tick().await;
         assert!(t0.elapsed() >= Duration::from_millis(40));
         assert_eq!(blocking(|| 6 * 7).await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn timeout_stops_at_the_deadline() {
+        assert_eq!(timeout(Duration::from_secs(5), async { 7 }).await, Ok(7));
+        let t0 = Instant::now();
+        assert_eq!(timeout(Duration::from_millis(20), std::future::pending::<()>()).await, Err(Elapsed));
+        assert!(t0.elapsed() >= Duration::from_millis(20));
     }
 }

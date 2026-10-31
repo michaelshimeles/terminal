@@ -5,6 +5,10 @@
 //! Treasury.gov, Alpaca and CoinDesk do not, so every other asset class comes from the
 //! sample generator and there are no headlines or network search.
 //!
+//! When the page has a Terminal server ([`server_url`]), [`crate::for_browser`] puts
+//! [`crate::remote::RemoteMarkets`] in front of these, so crypto comes from the server and
+//! from Binance and Coinbase only while the server can't serve it.
+//!
 //! TODO(web proxy): route equities, FX, indices, futures, Treasuries and news through a
 //! same-origin proxy to those sources, then use [`crate::markets::Markets`] here instead.
 
@@ -25,6 +29,38 @@ impl WebMarkets {
     pub fn new() -> Result<Self> {
         Ok(Self { crypto: CryptoProvider::new()?, sample: SampleProvider::default() })
     }
+}
+
+/// The Terminal server a page uses for crypto markets: `built`, the URL set when the page was
+/// built, unless the page's `?server=` parameter (`requested`) turns it off (`off`) or names a
+/// server on the same machine, such as `ws://localhost:8787/ws`. Other servers are refused, so a
+/// link can't point someone's page at a server that isn't ours.
+pub fn server_url(built: Option<&str>, requested: Option<&str>) -> Option<String> {
+    let built = built.map(str::trim).filter(|u| !u.is_empty()).map(str::to_string);
+    let Some(requested) = requested.map(str::trim) else { return built };
+    if requested.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    if is_local(requested) {
+        return Some(requested.to_string());
+    }
+    tracing::warn!("?server= takes a server on this machine (ws://localhost:8787/ws) or off; ignoring it");
+    built
+}
+
+/// A `ws://` or `wss://` URL whose host is this machine. Anything unusual (user info, other
+/// spellings of the address) counts as not local.
+fn is_local(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("ws://").or_else(|| url.strip_prefix("wss://")) else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 fn is_crypto(symbol: &str) -> bool {
@@ -92,5 +128,36 @@ mod tests {
         assert!(m.order_book("AAPL US Equity", 10).await.is_err());
         assert_eq!(m.yield_curves().await.unwrap().current.points.len(), 11);
         assert!(is_crypto("BTCUSD Curncy") && !is_crypto("US10Y Govt"));
+    }
+
+    #[test]
+    fn server_url_from_the_build_or_a_local_override() {
+        let prod = Some("wss://terminal-gateway.style.dev/ws");
+        assert_eq!(server_url(prod, None).as_deref(), prod);
+        assert_eq!(server_url(Some(" "), None), None, "an empty build setting means no server");
+        assert_eq!(server_url(None, None), None);
+        assert_eq!(server_url(prod, Some("off")), None);
+        for local in ["ws://localhost:8787/ws", "ws://127.0.0.1:9", "wss://[::1]:8787/ws", "ws://LOCALHOST/ws"] {
+            assert_eq!(server_url(prod, Some(local)).as_deref(), Some(local));
+            assert_eq!(server_url(None, Some(local)).as_deref(), Some(local));
+        }
+        for refused in [
+            "wss://evil.example/ws",
+            "ws://localhost.evil.example/ws",
+            "ws://localhost@evil.example/ws",
+            "ws://evil.example:80@localhost/ws",
+            "http://localhost:8787/ws",
+            "",
+        ] {
+            assert_eq!(server_url(prod, Some(refused)).as_deref(), prod, "{refused}");
+            assert_eq!(server_url(None, Some(refused)), None, "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_server_goes_in_front_of_the_browser_sources() {
+        assert_eq!(crate::for_browser(false, None).name(), "binance+sample");
+        assert_eq!(crate::for_browser(false, Some("ws://127.0.0.1:9/ws")).name(), "server+binance+sample");
+        assert_eq!(crate::for_browser(true, Some("ws://127.0.0.1:9/ws")).name(), "sample");
     }
 }
