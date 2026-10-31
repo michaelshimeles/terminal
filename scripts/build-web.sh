@@ -12,6 +12,11 @@
 # cache everything under immutable/ for good (site/vercel.json), and a page can't pair one
 # build's JS with another build's wasm.
 #
+# The app gets crypto markets from the Terminal data server at TR_SERVER_URL, which is built
+# in. It defaults to the production server; set it to another ws:// or wss:// URL, or to
+# nothing (TR_SERVER_URL=) for no server. A page can also ask for a server on the same machine
+# with ?server=ws://localhost:8787/ws, or for none with ?server=off.
+#
 # Needs the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown),
 # wasm-bindgen-cli at the version pinned in Cargo.lock, and wasm-opt from binaryen.
 set -euo pipefail
@@ -19,7 +24,17 @@ cd "$(dirname "$0")/.."
 
 out="${1:-site/static/app}"
 target=wasm32-unknown-unknown
-wasm="target/$target/web/terminal.wasm"
+wasm="${CARGO_TARGET_DIR:-target}/$target/web/terminal.wasm"
+
+export TR_SERVER_URL="${TR_SERVER_URL-wss://terminal-gateway.style.dev/ws}"
+case "$TR_SERVER_URL" in
+"") echo "no Terminal server: crypto markets come from Binance and Coinbase" ;;
+ws://* | wss://*) echo "Terminal server: $TR_SERVER_URL" ;;
+*)
+	echo "TR_SERVER_URL must be a ws:// or wss:// URL, or empty for no server" >&2
+	exit 1
+	;;
+esac
 
 want=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
 have=$(wasm-bindgen --version 2>/dev/null | awk '{ print $2 }' || true)

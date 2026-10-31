@@ -60,6 +60,10 @@ web-sys = { version = "0.3", features = [
     "Response",
     "Storage",
     "Url",
+    "UrlSearchParams",
     "Window",
     "console",
 ] }
+
+[dev-dependencies]
+async-trait = "0.1"
