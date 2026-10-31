@@ -19,6 +19,7 @@ On 2026-10-29 Micky approved starting on Hyperliquid's public API, because a nod
 - It makes read-only public calls only. No `exchange` endpoint, no user subscriptions, no orders.
 - The desktop opts in with `TR_SERVER_URL` (§4.6). Crypto keys such as `BTCUSD Curncy` then come from Hyperliquid core perps, and the order book pane names the source. Everything else is unchanged.
 - The web build uses the server for the same crypto markets. `scripts/build-web.sh` builds in `wss://terminal-gateway.style.dev/ws` unless `TR_SERVER_URL` says otherwise. While the server is unreachable, the page falls back to Binance and Coinbase as before.
+- It runs on one Freestyle VM (2 vCPU, 4 GiB) at `wss://terminal-gateway.style.dev/ws`, behind Freestyle's TLS edge. `deploy/freestyle/README.md` covers deploys, health checks and cost, which is about $80 a month above the free allowance.
 
 How facts are marked:
 
