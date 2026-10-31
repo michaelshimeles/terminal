@@ -563,15 +563,20 @@ async fn history_since(client: &Client, key: &MarketKey, tf: Timeframe, from: i6
 
 type Fetch = std::pin::Pin<Box<dyn Future<Output = Result<Vec<Bar>, ApiError>> + Send>>;
 
+/// How long a chart's live feed from the server waits for a dropped connection to come back
+/// before it ends, so the worker reloads the chart from the fallback.
+const OUTAGE_GRACE: Duration = Duration::from_secs(10);
+
 /// The server's bar stream, onto the worker's live feed. Live bars go straight through. After an
 /// outage the stream picks up at the current bar, so the bars from the last one sent up to it
 /// come from history: one request at a time per feed, retried with backoff, every outstanding
-/// gap merged into one range. The worker slots those bars into the gap. Everything stops when
-/// the worker drops the feed.
+/// gap merged into one range. The worker slots those bars into the gap. A connection that stays
+/// down past `OUTAGE_GRACE` ends the feed instead. Everything stops when the worker drops the feed.
 async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Subscription, tx: mpsc::Sender<Bar>) {
-    // The newest bar sent on, and whether the stream broke since.
+    // The newest bar sent on, whether the stream broke since, and when the connection dropped.
     let mut last: Option<i64> = None;
     let mut broken = false;
+    let mut away: Option<Instant> = None;
     // Bars still to fetch, `[from, until)`, and the range the request in flight covers.
     let mut pending: Option<(i64, i64)> = None;
     let mut fetching: Option<((i64, i64), Fetch)> = None;
@@ -587,15 +592,24 @@ async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Sub
             fetching = Some((range, Box::pin(async move { history_since(&client, &key, tf, range.0).await })));
         }
         let retry_in = retry_at.map(|t| t.saturating_duration_since(Instant::now()));
+        let give_up_in = away.map(|t| OUTAGE_GRACE.saturating_sub(t.elapsed()));
         tokio::select! {
             u = sub.next() => {
                 let Some(u) = u else { return };
                 let bars = match u.event {
-                    Event::Resync(_) | Event::Reconnecting => {
+                    Event::Resync(_) => {
                         broken = true;
                         continue;
                     }
-                    Event::Snapshot(TopicData::Bars(b)) => b,
+                    Event::Reconnecting => {
+                        broken = true;
+                        away.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                    Event::Snapshot(TopicData::Bars(b)) => {
+                        away = None;
+                        b
+                    }
                     // A `Closed` bar carries the bar's final values; merging it into the forming
                     // bar the worker holds gives the same bar (the server's forming bars are
                     // full states, never partial ones).
@@ -637,6 +651,40 @@ async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Sub
             }
             _ = async { rt::sleep(retry_in.expect("guarded")).await }, if retry_in.is_some() => {
                 retry_at = None;
+            }
+            _ = async { rt::sleep(give_up_in.expect("guarded")).await }, if give_up_in.is_some() => {
+                tracing::debug!("terminal server still unreachable; ending the {key} {tf} feed");
+                return;
+            }
+            _ = tx.closed() => return,
+        }
+    }
+}
+
+/// A fallback's live bars for a market the server serves, passed on until the server comes back
+/// up. Then the feed ends, so the worker reloads the chart from the server.
+async fn until_server_up(mut state: watch::Receiver<ConnState>, mut feed: LiveFeed, tx: mpsc::Sender<Bar>) {
+    let up = |s: &ConnState| matches!(s, ConnState::Up { .. });
+    let mut was_up = up(&state.borrow_and_update());
+    let mut watching = true;
+    loop {
+        tokio::select! {
+            b = feed.recv() => {
+                let Some(b) = b else { return };
+                if tx.send(b).await.is_err() {
+                    return;
+                }
+            }
+            changed = state.changed(), if watching => {
+                if changed.is_err() {
+                    watching = false;
+                    continue;
+                }
+                let now_up = up(&state.borrow_and_update());
+                if now_up && !was_up {
+                    return;
+                }
+                was_up = now_up;
             }
             _ = tx.closed() => return,
         }
@@ -699,7 +747,13 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
 
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         if !self.served(symbol) {
-            return self.inner.live(symbol, tf);
+            let feed = self.inner.live(symbol, tf)?;
+            if !self.routed(symbol) {
+                return Some(feed);
+            }
+            let (tx, rx) = mpsc::channel(256);
+            rt::spawn(until_server_up(self.client().state.clone(), feed, tx));
+            return Some(rx);
         }
         let (tx, rx) = mpsc::channel(256);
         let client = self.client().clone();

@@ -37,21 +37,30 @@ pub async fn sleep(d: Duration) {
     tokio::time::sleep(d).await;
 }
 
-/// Resolves after `d`, through `setTimeout`.
+/// Resolves after `d`, through a `setTimeout` set on the first poll and cleared if the sleep is
+/// dropped before it fires.
 #[cfg(target_arch = "wasm32")]
 pub fn sleep(d: Duration) -> impl Future<Output = ()> + Send {
-    let ms = d.as_millis().min(i32::MAX as u128) as i32;
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        if let Some(w) = web_sys::window() {
-            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+    struct Timer(Option<i32>);
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            if let (Some(id), Some(w)) = (self.0, web_sys::window()) {
+                w.clear_timeout_with_handle(id);
+            }
         }
-    });
+    }
+    let ms = d.as_millis().min(i32::MAX as u128) as i32;
     // A promise isn't `Send`. The web build has one thread, so wrapping it is sound, and the provider
     // traits' `Send` futures can then wait on it.
-    let done = send_wrapper::SendWrapper::new(wasm_bindgen_futures::JsFuture::from(promise));
-    async move {
-        let _ = done.await;
-    }
+    send_wrapper::SendWrapper::new(async move {
+        let mut timer = Timer(None);
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            timer.0 = web_sys::window()
+                .and_then(|w| w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms).ok());
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        timer.0 = None; // it fired
+    })
 }
 
 /// `fut` ran past its deadline.

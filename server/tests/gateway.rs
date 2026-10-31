@@ -598,6 +598,34 @@ async fn order_books_fall_back_while_the_server_is_away() {
 }
 
 #[tokio::test]
+async fn charts_hand_off_to_the_fallback_and_back_when_the_server_goes_and_returns() {
+    let s = Setup::new(|_| {}).await;
+    let addr = s.gw.addr;
+    let m = RemoteMarkets::new(&format!("ws://{addr}"), tr_data::sample::SampleProvider::default().with_live_ticks());
+    assert_eq!(m.history("BTCUSD Curncy", Timeframe::M1, None, 10).await.unwrap().len(), 10, "from the server");
+    let mut feed = m.live("BTCUSD Curncy", Timeframe::M1).expect("the server's feed");
+    s.mock.until("candle:BTC:1m upstream", |mk| mk.subs().contains("candle:BTC:1m")).await;
+    // The server goes away and stays away: the feed ends, so the worker reloads the chart...
+    let Setup { mock: _mock, gw } = s;
+    tokio::time::timeout(WAIT, gw.shutdown()).await.expect("shutdown finishes");
+    let gone = tokio::time::Instant::now();
+    while tokio::time::timeout(Duration::from_secs(20), feed.recv()).await.expect("the feed ends").is_some() {}
+    assert!(gone.elapsed() >= Duration::from_secs(9), "it gave the server a while to come back first");
+    // ...from the fallback.
+    let bars = m.history("BTCUSD Curncy", Timeframe::M1, None, 10).await.unwrap();
+    assert_eq!(bars.len(), 10, "sample bars");
+    let mut feed = m.live("BTCUSD Curncy", Timeframe::M1).expect("the fallback's feed");
+    assert!(recv_bar(&mut feed).await.close > 0.0, "the fallback's live bars come through");
+    // The server comes back on the same address: the fallback's feed ends, so the worker reloads
+    // the chart from the server.
+    let back = Setup::new(|c| c.bind = addr).await;
+    while tokio::time::timeout(Duration::from_secs(30), feed.recv()).await.expect("the fallback feed ends").is_some() {}
+    assert_eq!(m.history("BTCUSD Curncy", Timeframe::M1, None, 10).await.unwrap().len(), 10);
+    let _feed = m.live("BTCUSD Curncy", Timeframe::M1).expect("the server's feed again");
+    back.mock.until("candle:BTC:1m upstream again", |mk| mk.subs().contains("candle:BTC:1m")).await;
+}
+
+#[tokio::test]
 async fn desktop_charts_backfill_bars_missed_in_an_outage() {
     let s = Setup::new(|_| {}).await;
     let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());

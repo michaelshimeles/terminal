@@ -34,6 +34,9 @@ pub type PaneId = u64;
 /// Minutes between Congress disclosure checks (`TR_CONGRESS_REFRESH_MIN`; 0 disables).
 pub const CONGRESS_REFRESH_MIN: u64 = 30;
 
+/// The least time between a chart's reloads after its provider ended the live feed.
+const RELOAD_AFTER_FEED_ENDS: Duration = Duration::from_secs(5);
+
 pub enum Request {
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
     Portfolio(Option<tr_broker::Credentials>),
@@ -595,7 +598,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         exhausted,
                         live: false,
                     });
-                    start_live(s.clone(), pane, generation, symbol, tf);
+                    start_live(s.clone(), pane, generation, symbol, tf, limit);
                 }
                 Ok(_) => s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") }),
                 Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
@@ -849,16 +852,21 @@ fn apply_live_bar(bars: &mut Vec<Bar>, bar: Bar) -> Applied {
     Applied { changed, inserted: bars.len() > len && bars.last().map(|b| b.ts) == last }
 }
 
-fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe) {
+fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe, limit: usize) {
     let Some(mut feed) = s.provider.live(&symbol, tf) else { return };
     rt::spawn(async move {
+        let started = web_time::Instant::now();
         let mut tick = rt::interval(Duration::from_millis(250));
         let mut dirty = false;
         let mut inserted = false;
+        let mut ended = false;
         loop {
             tokio::select! {
                 bar = feed.recv() => {
-                    let Some(bar) = bar else { break };
+                    let Some(bar) = bar else {
+                        ended = true;
+                        break;
+                    };
                     let mut map = s.series.lock().expect("series lock");
                     match map.get_mut(&pane) {
                         Some((g, bars)) if *g == generation => {
@@ -897,6 +905,14 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
             }
         }
         tracing::debug!("live feed for pane {pane} ({symbol}) stopped");
+        // A provider ends a feed the pane still shows when the chart's source changes (the Terminal
+        // server went away or came back): reload the chart from wherever its data comes from now.
+        if ended {
+            rt::sleep(RELOAD_AFTER_FEED_ENDS.saturating_sub(started.elapsed())).await;
+            if current_series(&s, pane, generation).is_some() {
+                handle(&s, Request::History { pane, generation, symbol, tf, limit }).await;
+            }
+        }
     });
 }
 
@@ -1034,6 +1050,63 @@ mod tests {
         assert!(store_series(&s, 1, 2, Arc::new(vec![Bar::new(0, 1.0, 1.0, 1.0, 1.0, 1.0)])));
         assert_eq!(current_series(&s, 1, 2).unwrap().len(), 1);
         assert!(current_series(&s, 1, 1).is_none());
+    }
+
+    /// Bars whose close counts the loads. The first chart's live feed ends at once, the way
+    /// `RemoteMarkets` ends one when the chart's source changes.
+    #[derive(Default)]
+    struct SourceChanges {
+        loads: std::sync::atomic::AtomicUsize,
+        open: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<Bar>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for SourceChanges {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            let n = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(vec![Bar::new(0, 1.0, 1.0, 1.0, n as f64, 1.0)])
+        }
+
+        fn live(&self, _: &str, _: Timeframe) -> Option<tr_data::LiveFeed> {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            if self.loads.load(std::sync::atomic::Ordering::SeqCst) > 1 {
+                self.open.lock().unwrap().push(tx);
+            }
+            Some(rx)
+        }
+    }
+
+    #[tokio::test]
+    async fn charts_reload_when_the_provider_ends_their_live_feed() {
+        let (out, rx) = mpsc::channel();
+        let provider = Arc::new(SourceChanges::default());
+        let s = Arc::new(Shared {
+            provider: provider.clone(),
+            series: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        });
+        let t0 = std::time::Instant::now();
+        let symbol = "BTCUSD Curncy".to_string();
+        handle(&s, Request::History { pane: 1, generation: 1, symbol, tf: Timeframe::D1, limit: 10 }).await;
+        let mut closes = Vec::new();
+        while closes.len() < 2 {
+            assert!(t0.elapsed() < Duration::from_secs(15), "no reload: {closes:?}");
+            match rx.try_recv() {
+                Ok(Response::History { generation: 1, bars, .. }) => closes.push(bars.last().unwrap().close),
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert_eq!(closes, [1.0, 2.0], "the reload replaced the chart");
+        assert!(t0.elapsed() >= RELOAD_AFTER_FEED_ENDS, "not before the pause");
+        assert_eq!(provider.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
