@@ -18,6 +18,7 @@ On 2026-10-29 Micky approved starting on Hyperliquid's public API, because a nod
 - History comes from `candleSnapshot`, so it stops at the most recent 5000 bars per interval [doc: INFO]. For 1m bars that is about 3.5 days. Node-built candles (§5.3) lift the cap.
 - It makes read-only public calls only. No `exchange` endpoint, no user subscriptions, no orders.
 - The desktop opts in with `TR_SERVER_URL` (§4.6). Crypto keys such as `BTCUSD Curncy` then come from Hyperliquid core perps, and the order book pane names the source. Everything else is unchanged. The web build doesn't use the server yet.
+- It runs on one Freestyle VM (2 vCPU, 4 GiB) at `wss://terminal-gateway.style.dev/ws`, behind Freestyle's TLS edge. `deploy/freestyle/README.md` covers deploys, health checks and cost, which is about $80 a month above the free allowance.
 
 How facts are marked:
 

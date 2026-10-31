@@ -18,8 +18,8 @@ use tr_data::MarketData;
 use tr_data::remote::{Client, Event, RemoteMarkets, Subscription};
 use tr_gateway::Config;
 use tr_proto::{
-    BarDelta, Encoding, InstrumentKind, MarketKey, ResyncReason, Rpc, RpcResult, Timeframe, TopicData, TopicDelta,
-    TopicReq, TopicStatus, UnavailableReason,
+    BarDelta, Encoding, ErrorCode, InstrumentKind, MarketKey, ResyncReason, Rpc, RpcResult, Timeframe, TopicData,
+    TopicDelta, TopicReq, TopicStatus, UnavailableReason,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -230,6 +230,21 @@ struct Setup {
 
 impl Setup {
     async fn new(tweak: impl FnOnce(&mut Config)) -> Setup {
+        let s = Setup::starting(tweak).await;
+        s.core_mids();
+        s.xyz_mids();
+        let t0 = tokio::time::Instant::now();
+        while s.gw.hub().mids.len() < 4 {
+            assert!(t0.elapsed() < WAIT, "mids never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(s.gw.hub().ready(WAIT).await, "the hub never got ready");
+        s
+    }
+
+    /// A gateway that has subscribed every venue's mids upstream but heard none yet, as right
+    /// after a restart.
+    async fn starting(tweak: impl FnOnce(&mut Config)) -> Setup {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (mock, addr) = start_mock().await;
         let mut cfg = Config { bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), ..Default::default() };
@@ -239,15 +254,16 @@ impl Setup {
         tweak(&mut cfg);
         let gw = tr_gateway::start(cfg).await.unwrap();
         mock.until("both venues' mids", |m| m.subs().is_superset(&set(&["allMids", "allMids:xyz"]))).await;
-        mock.push("allMids", "allMids", json!({"mids": {"BTC": "100.5", "ETH": "10.25", "@107": "30.0", "#5": "0.5"}}));
-        mock.push("allMids:xyz", "allMids", json!({"dex": "xyz", "mids": {"xyz:TSLA": "401.5"}}));
-        let s = Setup { mock, gw };
-        let t0 = tokio::time::Instant::now();
-        while s.gw.hub().mids.len() < 4 {
-            assert!(t0.elapsed() < WAIT, "mids never arrived");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        s
+        Setup { mock, gw }
+    }
+
+    fn core_mids(&self) {
+        let mids = json!({"mids": {"BTC": "100.5", "ETH": "10.25", "@107": "30.0", "#5": "0.5"}});
+        self.mock.push("allMids", "allMids", mids);
+    }
+
+    fn xyz_mids(&self) {
+        self.mock.push("allMids:xyz", "allMids", json!({"dex": "xyz", "mids": {"xyz:TSLA": "401.5"}}));
     }
 
     fn client(&self, enc: Encoding) -> Client {
@@ -275,8 +291,23 @@ async fn next(sub: &mut Subscription) -> Event {
 async fn next_data(sub: &mut Subscription) -> Event {
     loop {
         match next(sub).await {
-            Event::Status(_) | Event::Reconnecting => {}
+            Event::Status(_) | Event::Reconnecting | Event::Resubscribing => {}
             e => return e,
+        }
+    }
+}
+
+/// What a subscription sees up to its first snapshot, and the snapshot. Fails if the server
+/// gives up on it on the way.
+async fn until_snapshot(sub: &mut Subscription) -> (Vec<String>, TopicData) {
+    let mut seen = Vec::new();
+    loop {
+        match next(sub).await {
+            Event::Snapshot(data) => return (seen, data),
+            Event::Status(s @ TopicStatus::Unavailable { .. }) => panic!("the server gave up: {s:?} after {seen:?}"),
+            Event::Status(TopicStatus::Live) => seen.push("live".into()),
+            Event::Status(TopicStatus::Stale { .. }) => seen.push("stale".into()),
+            e => seen.push(format!("{e:?}")),
         }
     }
 }
@@ -636,4 +667,124 @@ async fn desktop_backfill_keeps_one_request_in_flight_across_outages() {
         tr_core::Series::apply_live(&mut chart, recv_bar(&mut feed).await);
     }
     assert_eq!(s.mock.candles_peak.load(Ordering::SeqCst), 1);
+}
+
+/// A client that reconnects while the gateway is still starting (no instrument list or mids yet)
+/// keeps its subscriptions: each is marked stale, then goes live with a snapshot once the
+/// upstream is in. The gateway used to wait a few seconds, then end them with `Unavailable`.
+#[tokio::test]
+async fn subscriptions_made_while_the_gateway_starts_wait_for_the_upstream() {
+    let s = Setup::starting(|c| c.session.ready_timeout = Duration::from_millis(200)).await;
+    let client = s.client(Encoding::Postcard);
+    let keys = ["BTC", "xyz:TSLA"].map(MarketKey::new).to_vec();
+    let mut quotes = client.subscribe(TopicReq::Quotes { keys, max_hz: 10 });
+    let mut book = client.subscribe(TopicReq::Book { key: MarketKey::new("BTC"), depth: 5, group: None });
+    let mut trades = client.subscribe(TopicReq::Trades { key: MarketKey::new("xyz:TSLA") });
+    // Well past the wait after which the gateway used to give up.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    s.core_mids();
+    s.xyz_mids();
+    let (seen, data) = until_snapshot(&mut quotes).await;
+    assert_eq!(seen, ["stale", "live"], "told it's waiting, then that it's live");
+    let TopicData::Quotes(q) = data else { panic!("quotes") };
+    let mut got: Vec<(&str, f64)> = q.iter().map(|q| (q.key.as_str(), q.px)).collect();
+    got.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(got, [("BTC", 100.5), ("xyz:TSLA", 401.5)]);
+    s.mock.until("l2Book:BTC upstream", |m| m.subs().contains("l2Book:BTC")).await;
+    s.mock.push("l2Book:BTC", "l2Book", book_msg("BTC", "100.0"));
+    let (seen, data) = until_snapshot(&mut book).await;
+    assert_eq!(seen, ["stale", "live"]);
+    assert!(matches!(data, TopicData::Book(b) if b.bids[0].px == 100.0));
+    let (_, data) = until_snapshot(&mut trades).await;
+    assert_eq!(data, TopicData::Trades(vec![]));
+    assert!(s.mock.subs().contains("trades:xyz:TSLA"));
+}
+
+/// The gateway is ready once every venue's mids are in, not just the first venue's: a HIP-3
+/// market asked for while only the core dex has reported waits for its own dex, where it used
+/// to come back as an unknown market.
+#[tokio::test]
+async fn markets_on_a_dex_still_loading_are_not_unknown() {
+    let s = Setup::starting(|_| {}).await;
+    s.core_mids();
+    let t0 = tokio::time::Instant::now();
+    while !s.gw.hub().mids.contains("BTC") {
+        assert!(t0.elapsed() < WAIT, "core mids never arrived");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let client = s.client(Encoding::Postcard);
+    let mut q = client.subscribe(TopicReq::Quotes { keys: vec![MarketKey::new("xyz:TSLA")], max_hz: 10 });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.xyz_mids();
+    let (_, data) = until_snapshot(&mut q).await;
+    let TopicData::Quotes(q) = data else { panic!("quotes") };
+    assert_eq!(q.iter().map(|q| (q.key.as_str(), q.px)).collect::<Vec<_>>(), [("xyz:TSLA", 401.5)]);
+}
+
+/// A request made while the gateway starts fails as an upstream error, which clients retry, not
+/// as an unknown market: the desktop stops asking the server about a market it called unknown.
+#[tokio::test]
+async fn requests_made_while_the_gateway_starts_fail_as_retryable() {
+    let s = Setup::starting(|c| c.session.ready_timeout = Duration::from_millis(200)).await;
+    let client = s.client(Encoding::Postcard);
+    let history = || {
+        client.request(Rpc::History { key: MarketKey::new("BTCUSD Curncy"), tf: Timeframe::H1, end: None, limit: 10 })
+    };
+    let r = history().await;
+    assert_eq!(r.as_ref().map_err(|e| e.code), Err(ErrorCode::Upstream), "{r:?}");
+    s.core_mids();
+    s.xyz_mids();
+    assert!(s.gw.hub().ready(WAIT).await);
+    let Ok(RpcResult::History(h)) = history().await else { panic!("history once ready") };
+    assert_eq!(h.len(), 10);
+}
+
+/// A venue whose mids never come holds readiness back only for `venue_grace`: after that, the
+/// next mids from any venue make the gateway ready without it.
+#[tokio::test]
+async fn a_silent_venue_delays_readiness_only_for_the_grace() {
+    let s = Setup::starting(|c| c.hub.venue_grace = Duration::from_secs(1)).await;
+    let readyz = || async {
+        reqwest::get(format!("http://{}/readyz", s.gw.addr)).await.expect("readyz answers").status().as_u16()
+    };
+    s.core_mids();
+    assert!(!s.gw.hub().ready(Duration::from_millis(300)).await, "still waiting for the xyz dex");
+    assert_eq!(readyz().await, 503);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    s.mock.push("allMids", "allMids", json!({"mids": {"BTC": "100.75", "ETH": "10.25", "@107": "30.0"}}));
+    assert!(s.gw.hub().ready(WAIT).await);
+    assert_eq!(readyz().await, 200);
+    assert!(!s.gw.hub().mids.contains("xyz:TSLA"));
+}
+
+/// A venue later than `venue_grace` doesn't make its markets unknown. Until it reports, a
+/// request for one fails as `Upstream`, which clients retry, a subscription waits for it like
+/// one made during startup, and a quotes subscription takes it in when its mids arrive.
+#[tokio::test]
+async fn markets_on_a_venue_later_than_the_grace_come_back() {
+    let s = Setup::starting(|c| c.hub.venue_grace = Duration::from_millis(300)).await;
+    s.core_mids();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.mock.push("allMids", "allMids", json!({"mids": {"BTC": "100.75", "ETH": "10.25", "@107": "30.0"}}));
+    assert!(s.gw.hub().ready(WAIT).await, "ready without the xyz dex");
+    let client = s.client(Encoding::Postcard);
+    let tsla = || MarketKey::new("xyz:TSLA");
+    let r = client.request(Rpc::History { key: tsla(), tf: Timeframe::H1, end: None, limit: 5 }).await;
+    assert_eq!(r.as_ref().map_err(|e| e.code), Err(ErrorCode::Upstream), "{r:?}");
+    let mut book = client.subscribe(TopicReq::Book { key: tsla(), depth: 5, group: None });
+    let mut quotes = client.subscribe(TopicReq::Quotes { keys: vec![MarketKey::new("BTC"), tsla()], max_hz: 10 });
+    let Event::Snapshot(TopicData::Quotes(q)) = next(&mut quotes).await else { panic!("quotes") };
+    assert_eq!(q.iter().map(|q| q.key.as_str()).collect::<Vec<_>>(), ["BTC"]);
+    let e = next(&mut book).await;
+    assert!(matches!(e, Event::Status(TopicStatus::Stale { .. })), "the book waits for its venue: {e:?}");
+    s.xyz_mids();
+    // The quotes subscription takes the late market in...
+    let Event::Delta(TopicDelta::Quotes(d)) = next(&mut quotes).await else { panic!("a quotes delta") };
+    assert_eq!(d.iter().map(|q| (q.key.as_str(), q.px)).collect::<Vec<_>>(), [("xyz:TSLA", 401.5)]);
+    // ...and the book subscription goes live, with no retry from the client.
+    s.mock.until("l2Book:xyz:TSLA upstream", |m| m.subs().contains("l2Book:xyz:TSLA")).await;
+    s.mock.push("l2Book:xyz:TSLA", "l2Book", book_msg("xyz:TSLA", "400.0"));
+    let (seen, data) = until_snapshot(&mut book).await;
+    assert_eq!(seen, ["live"]);
+    assert!(matches!(data, TopicData::Book(b) if b.bids[0].px == 400.0));
 }

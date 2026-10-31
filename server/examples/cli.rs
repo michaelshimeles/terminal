@@ -217,6 +217,7 @@ async fn drain(mut sub: Subscription, name: String, tally: Arc<Mutex<Tally>>, un
                     line = Some(format!("status {s:?}"));
                 }
                 Event::Reconnecting => line = Some("reconnecting".into()),
+                Event::Resubscribing => line = Some("resubscribing".into()),
             }
         }
         let kind = match &u.event {

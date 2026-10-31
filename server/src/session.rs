@@ -49,7 +49,8 @@ pub struct SessionConfig {
     pub ping_every: Duration,
     /// Close a client we've heard nothing from (not even a pong) for this long.
     pub idle_timeout: Duration,
-    /// How long a subscribe waits for the first mids after a restart.
+    /// How long a request waits for the upstream after a restart before it fails. Subscriptions
+    /// wait as long as it takes.
     pub ready_timeout: Duration,
 }
 
@@ -440,11 +441,16 @@ impl Drop for Decrement {
 
 async fn rpc(hub: &Arc<Hub>, cfg: &SessionConfig, req: Rpc) -> Result<RpcResult, ApiError> {
     let err = |code, message: String| ApiError { code, message };
-    hub.ready(cfg.ready_timeout).await;
+    // Not `UnknownMarket`, since clients stop asking about a market the server called unknown.
+    if !hub.ready(cfg.ready_timeout).await {
+        return Err(err(ErrorCode::Upstream, "the server is starting; no upstream data yet".into()));
+    }
     match req {
         Rpc::History { key, tf, end, limit } => {
-            let inst =
-                hub.resolve(&key).ok_or_else(|| err(ErrorCode::UnknownMarket, format!("unknown market {key}")))?;
+            let inst = hub.resolve(&key).ok_or_else(|| match hub.unknown(&key) {
+                (UnavailableReason::Upstream, m) => err(ErrorCode::Upstream, m),
+                (_, m) => err(ErrorCode::UnknownMarket, m),
+            })?;
             let limit = (limit.clamp(1, cfg.max_history)) as usize;
             // With a live stream for this market, cached history must be newer than the stream's
             // last (re)start, or bars that closed while it was down could be missing or partial.
@@ -465,19 +471,52 @@ async fn rpc(hub: &Arc<Hub>, cfg: &SessionConfig, req: Rpc) -> Result<RpcResult,
     }
 }
 
+/// Whether the hub knows the market (for quotes, any of them).
+fn known(hub: &Hub, topic: &TopicReq) -> bool {
+    match topic {
+        TopicReq::Quotes { keys, .. } => keys.iter().any(|k| hub.resolve(k).is_some()),
+        TopicReq::Book { key, .. } | TopicReq::Trades { key } | TopicReq::Bars { key, .. } => {
+            hub.resolve(key).is_some()
+        }
+    }
+}
+
+/// Right after a restart the gateway doesn't know yet which markets exist, and one venue can
+/// be later than the rest. A subscription waits for its market, marked stale, rather than end.
+/// False once the session is gone.
+async fn wait_until_known(f: &Fwd, hub: &Hub, topic: &TopicReq) -> bool {
+    let mut version = hub.mids.subscribe();
+    let mut waited = false;
+    loop {
+        version.borrow_and_update();
+        if hub.is_ready() && (!hub.loading() || known(hub, topic)) {
+            return !waited || f.status(TopicStatus::Live).await;
+        }
+        if !waited && !f.status(TopicStatus::Stale { since_ms: now_ms() }).await {
+            return false;
+        }
+        waited = true;
+        // Mids, a venue's first report and readiness all bump the version.
+        if version.changed().await.is_err() {
+            return false;
+        }
+    }
+}
+
 async fn forward(f: Fwd, hub: Arc<Hub>, cfg: Arc<SessionConfig>, topic: TopicReq) {
-    if !hub.ready(cfg.ready_timeout).await {
-        f.unavailable(UnavailableReason::Upstream, "no upstream data yet".into()).await;
+    if let TopicReq::Quotes { keys, .. } = &topic
+        && keys.len() > cfg.max_quote_keys
+    {
+        let m = format!("at most {} keys per quotes subscription", cfg.max_quote_keys);
+        f.unavailable(UnavailableReason::Unsupported, m).await;
         return;
     }
-    let unknown = |k: &MarketKey| (UnavailableReason::UnknownMarket, format!("unknown market {k}"));
+    if !wait_until_known(&f, &hub, &topic).await {
+        return;
+    }
+    let unknown = |k: &MarketKey| hub.unknown(k);
     let (tkey, extra) = match &topic {
         TopicReq::Quotes { keys, max_hz } => {
-            if keys.len() > cfg.max_quote_keys {
-                let m = format!("at most {} keys per quotes subscription", cfg.max_quote_keys);
-                f.unavailable(UnavailableReason::Unsupported, m).await;
-                return;
-            }
             let hz = (*max_hz).clamp(1, cfg.max_quote_hz);
             return quotes(f, hub, keys.clone(), hz).await;
         }
@@ -536,20 +575,33 @@ fn combined(states: &[VenueState]) -> TopicStatus {
     out
 }
 
-async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
-    let resolved: Vec<(MarketKey, String)> =
-        keys.into_iter().filter_map(|k| hub.resolve(&k).map(|i| (k, i.0))).collect();
-    if resolved.is_empty() {
-        f.unavailable(UnavailableReason::UnknownMarket, "none of these markets are known".into()).await;
-        return;
-    }
-    // The feeds these quotes come from, to report their outages.
+/// The feeds these quotes come from, to report their outages.
+fn venues_of(hub: &Hub, resolved: &[(MarketKey, String)]) -> Vec<String> {
     let mut venues: Vec<String> =
         resolved.iter().filter_map(|(_, c)| hub.mids.get(c).map(|m| m.venue.to_string())).collect();
     venues.sort();
     venues.dedup();
-    let venue_states = || venues.iter().map(|v| hub.mids.venue(v)).collect::<Vec<_>>();
-    let mut epochs: Vec<u64> = venue_states().iter().map(|v| v.epoch).collect();
+    venues
+}
+
+async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
+    let (mut resolved, mut late) = (Vec::new(), Vec::new());
+    for k in keys {
+        match hub.resolve(&k) {
+            Some(i) => resolved.push((k, i.0)),
+            None => late.push(k),
+        }
+    }
+    if resolved.is_empty() {
+        f.unavailable(UnavailableReason::UnknownMarket, "none of these markets are known".into()).await;
+        return;
+    }
+    // Keys on a venue that is still loading join with their first delta once it's in. After
+    // that, whatever still doesn't resolve is unknown.
+    let mut look_again = hub.loading();
+    let mut venues = venues_of(&hub, &resolved);
+    let venue_states = |venues: &[String]| venues.iter().map(|v| hub.mids.venue(v)).collect::<Vec<_>>();
+    let mut epochs: Vec<u64> = venue_states(&venues).iter().map(|v| v.epoch).collect();
     let mut status = TopicStatus::Live;
     let mut version = hub.mids.subscribe();
     // What each requested key last carried: two keys can share a coin (`BTC`, `BTCUSD Curncy`).
@@ -558,7 +610,23 @@ async fn quotes(mut f: Fwd, hub: Arc<Hub>, keys: Vec<MarketKey>, hz: u8) {
     let period = Duration::from_secs(1) / u32::from(hz);
     loop {
         version.borrow_and_update();
-        let states = venue_states();
+        if look_again && !late.is_empty() {
+            look_again = hub.loading();
+            let before = resolved.len();
+            late.retain(|k| match hub.resolve(k) {
+                Some(i) => {
+                    resolved.push((k.clone(), i.0));
+                    false
+                }
+                None => true,
+            });
+            if resolved.len() > before {
+                stamps.resize(resolved.len(), 0);
+                venues = venues_of(&hub, &resolved);
+                epochs = venue_states(&venues).iter().map(|v| v.epoch).collect();
+            }
+        }
+        let states = venue_states(&venues);
         let now = combined(&states);
         if now != status {
             status = now;

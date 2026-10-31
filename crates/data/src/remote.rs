@@ -3,7 +3,8 @@
 //!
 //! [`Client`] keeps one connection per server, shared by every subscription and request. It
 //! reconnects with backoff, resubscribes everything (each subscription then gets a fresh
-//! `Snapshot`), checks each subscription's `seq` and asks for a `Resync` on a gap.
+//! `Snapshot`), checks each subscription's `seq` and asks for a `Resync` on a gap. A
+//! subscription the server gave up on because of its upstream is subscribed again, with backoff.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tr_core::{AssetClass, Bar, Timeframe};
 use tr_proto::{
     ApiError, BarDelta, ClientInfo, ClientMsg, Encoding, ErrorCode, Frame, MarketKey, PROTOCOL_VERSION, ReqId,
-    ResyncReason, Rpc, RpcResult, ServerMsg, SubId, TopicData, TopicDelta, TopicReq, TopicStatus,
+    ResyncReason, Rpc, RpcResult, ServerMsg, SubId, TopicData, TopicDelta, TopicReq, TopicStatus, UnavailableReason,
 };
 
 use crate::{LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, rt, security};
@@ -33,6 +34,9 @@ pub enum Event {
     Resync(ResyncReason),
     /// The connection dropped. The client resubscribes when it's back, and a `Snapshot` follows.
     Reconnecting,
+    /// The server ended this subscription with `Unavailable` because of its upstream. The client
+    /// has subscribed again, and a `Snapshot` follows once the server has data.
+    Resubscribing,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +166,10 @@ impl Client {
     }
 }
 
+/// The first wait before subscribing again after an `Unavailable { Upstream }`, and the most.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
 struct SubState {
     topic: TopicReq,
     tx: mpsc::Sender<Update>,
@@ -169,6 +177,16 @@ struct SubState {
     seq: Option<u64>,
     /// When we last asked for a resync, so a stuck reader can't make us ask nonstop.
     asked: Option<Instant>,
+    /// When to subscribe again, after the server gave up on this subscription.
+    retry_at: Option<Instant>,
+    /// The wait before the next retry; doubles up to `RETRY_MAX` until a `Snapshot` arrives.
+    backoff: Duration,
+}
+
+impl SubState {
+    fn new(topic: TopicReq, tx: mpsc::Sender<Update>) -> Self {
+        Self { topic, tx, seq: None, asked: None, retry_at: None, backoff: RETRY_FIRST }
+    }
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -225,6 +243,8 @@ async fn run(
                 state.send_replace(ConnState::Down("connection lost".into()));
                 for s in subs.values_mut() {
                     s.seq = None;
+                    // Reconnecting subscribes everything again anyway.
+                    s.retry_at = None;
                     let _ = s.tx.try_send(Update { received: SystemTime::now(), event: Event::Reconnecting });
                 }
             }
@@ -243,7 +263,7 @@ async fn run(
                 cmd = cmds.recv() => match cmd {
                     None => return,
                     Some(Cmd::Subscribe { id, topic, tx }) => {
-                        subs.insert(id, SubState { topic, tx, seq: None, asked: None });
+                        subs.insert(id, SubState::new(topic, tx));
                     }
                     Some(Cmd::Unsubscribe(id)) => {
                         subs.remove(&id);
@@ -277,6 +297,7 @@ async fn connected(
                 return true;
             }
         }
+        let retry = subs.values().filter_map(|s| s.retry_at).min();
         tokio::select! {
             m = rx.next() => {
                 let received = SystemTime::now();
@@ -294,7 +315,7 @@ async fn connected(
                 }
                 Some(Cmd::Subscribe { id, topic, tx: sub }) => {
                     queue.push(ClientMsg::Subscribe { id, topic: topic.clone() });
-                    subs.insert(id, SubState { topic, tx: sub, seq: None, asked: None });
+                    subs.insert(id, SubState::new(topic, sub));
                 }
                 Some(Cmd::Unsubscribe(id)) => {
                     if subs.remove(&id).is_some() {
@@ -307,7 +328,23 @@ async fn connected(
                 }
             },
             _ = ping.tick() => queue.push(ClientMsg::Ping { t: now_ms() }),
+            _ = async { tokio::time::sleep_until(retry.expect("guarded").into()).await }, if retry.is_some() => {
+                resubscribe_due(subs, &mut queue);
+            }
         }
+    }
+}
+
+/// Subscribe again to whatever is due for a retry. The `Unsubscribe` frees the id on a server
+/// that still holds it.
+fn resubscribe_due(subs: &mut HashMap<SubId, SubState>, queue: &mut Vec<ClientMsg>) {
+    let now = Instant::now();
+    for (id, s) in subs.iter_mut().filter(|(_, s)| s.retry_at.is_some_and(|t| t <= now)) {
+        s.retry_at = None;
+        s.seq = None;
+        queue.push(ClientMsg::Unsubscribe { id: *id });
+        queue.push(ClientMsg::Subscribe { id: *id, topic: s.topic.clone() });
+        let _ = s.tx.try_send(Update { received: SystemTime::now(), event: Event::Resubscribing });
     }
 }
 
@@ -321,7 +358,11 @@ fn route(
     let mut deliver = |id: SubId, seq: Option<u64>, event: Event| {
         let Some(s) = subs.get_mut(&id) else { return };
         match (&event, seq) {
-            (Event::Snapshot(_), Some(n)) => s.seq = Some(n),
+            (Event::Snapshot(_), Some(n)) => {
+                s.seq = Some(n);
+                s.retry_at = None;
+                s.backoff = RETRY_FIRST;
+            }
             (Event::Delta(_), Some(n)) if s.seq.is_some_and(|last| last + 1 == n) => s.seq = Some(n),
             (Event::Delta(_), Some(_)) => {
                 // A gap, or a delta before any snapshot: drop it and ask for a fresh snapshot.
@@ -332,6 +373,16 @@ fn route(
                 return;
             }
             (Event::Resync(_), _) => s.seq = None,
+            // An older server sends this when its upstream isn't ready yet, and then nothing
+            // more, so ask again later. Newer ones mark the subscription stale and keep it.
+            (Event::Status(TopicStatus::Unavailable { reason: UnavailableReason::Upstream, .. }), _) => {
+                if s.retry_at.is_none() {
+                    s.retry_at = Some(Instant::now() + s.backoff);
+                    s.backoff = (s.backoff * 2).min(RETRY_MAX);
+                }
+            }
+            // The server is still serving it.
+            (Event::Status(TopicStatus::Live | TopicStatus::Stale { .. }), _) => s.retry_at = None,
             _ => {}
         }
         if s.tx.try_send(Update { received, event }).is_err() && s.seq.take().is_some() {
@@ -587,7 +638,7 @@ async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Sub
             u = sub.next() => {
                 let Some(u) = u else { return };
                 let bars = match u.event {
-                    Event::Resync(_) | Event::Reconnecting => {
+                    Event::Resync(_) | Event::Reconnecting | Event::Resubscribing => {
                         broken = true;
                         continue;
                     }
@@ -748,10 +799,7 @@ mod tests {
     #[test]
     fn gaps_ask_for_a_resync() {
         let (tx, mut rx) = mpsc::channel(8);
-        let mut subs = HashMap::from([(
-            7,
-            SubState { topic: TopicReq::Trades { key: MarketKey::new("BTC") }, tx, seq: None, asked: None },
-        )]);
+        let mut subs = HashMap::from([(7, SubState::new(TopicReq::Trades { key: MarketKey::new("BTC") }, tx))]);
         let mut pending = HashMap::new();
         let mut queue = Vec::new();
         let t = SystemTime::now();
@@ -773,5 +821,110 @@ mod tests {
         assert_eq!(queue, [ClientMsg::Resync { id: 7 }], "11 follows 10; 13 skips 12");
         let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).map(|u| u.event).collect();
         assert!(matches!(got[..], [Event::Snapshot(_), Event::Delta(_)]));
+    }
+
+    #[test]
+    fn upstream_refusals_are_retried_with_backoff() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut subs = HashMap::from([(3, SubState::new(TopicReq::Trades { key: MarketKey::new("BTC") }, tx))]);
+        let (mut pending, mut queue) = (HashMap::new(), Vec::new());
+        let t = SystemTime::now();
+        let status = |reason| ServerMsg::Status {
+            id: 3,
+            status: TopicStatus::Unavailable { reason, detail: "no upstream data yet".into() },
+        };
+        route(status(UnavailableReason::UnknownMarket), t, &mut subs, &mut pending, &mut queue);
+        assert_eq!(subs[&3].retry_at, None, "an unknown market isn't worth asking about again");
+        route(status(UnavailableReason::Upstream), t, &mut subs, &mut pending, &mut queue);
+        let first = subs[&3].retry_at.expect("a retry");
+        route(status(UnavailableReason::Upstream), t, &mut subs, &mut pending, &mut queue);
+        assert_eq!(subs[&3].retry_at, Some(first), "one retry at a time");
+        assert_eq!(subs[&3].backoff, RETRY_FIRST * 2);
+        // A newer server keeps the subscription and says so.
+        let stale = ServerMsg::Status { id: 3, status: TopicStatus::Stale { since_ms: 1 } };
+        route(stale, t, &mut subs, &mut pending, &mut queue);
+        assert_eq!(subs[&3].retry_at, None);
+        route(status(UnavailableReason::Upstream), t, &mut subs, &mut pending, &mut queue);
+        subs.get_mut(&3).unwrap().retry_at = Some(Instant::now());
+        resubscribe_due(&mut subs, &mut queue);
+        assert!(matches!(queue[..], [ClientMsg::Unsubscribe { id: 3 }, ClientMsg::Subscribe { id: 3, .. }]));
+        assert_eq!((subs[&3].retry_at, subs[&3].backoff), (None, RETRY_FIRST * 4));
+        let snap = ServerMsg::Snapshot { id: 3, seq: 1, data: TopicData::Trades(vec![]) };
+        route(snap, t, &mut subs, &mut pending, &mut queue);
+        assert_eq!(subs[&3].backoff, RETRY_FIRST, "data resets the backoff");
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).map(|u| u.event).collect();
+        assert!(matches!(got.last_chunk::<2>(), Some([Event::Resubscribing, Event::Snapshot(_)])), "{got:?}");
+    }
+
+    /// What an older gateway did with a subscription made before its upstream was ready: a final
+    /// `Unavailable { Upstream }`, then nothing. Like the real one, it refuses an id that's still
+    /// subscribed, and serves a fresh subscription.
+    async fn older_gateway(listener: tokio::net::TcpListener) {
+        use tr_proto::{Limits, SessionId};
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let mut subscribed = HashSet::new();
+        let mut gave_up = false;
+        while let Some(Ok(m)) = ws.next().await {
+            let Message::Binary(b) = m else { continue };
+            let reply = match tr_proto::decode_binary::<ClientMsg>(&b).unwrap() {
+                ClientMsg::Hello { .. } => ServerMsg::Welcome {
+                    version: PROTOCOL_VERSION,
+                    session: SessionId(1),
+                    user: None,
+                    server_time_ms: 0,
+                    limits: Limits {
+                        max_subscriptions: 64,
+                        max_quote_keys: 512,
+                        max_book_depth: 20,
+                        max_history: 5000,
+                    },
+                },
+                ClientMsg::Subscribe { id, .. } if !subscribed.insert(id) => {
+                    ServerMsg::Error { code: ErrorCode::DuplicateId, message: format!("subscription {id} exists") }
+                }
+                ClientMsg::Subscribe { id, .. } if !std::mem::replace(&mut gave_up, true) => ServerMsg::Status {
+                    id,
+                    status: TopicStatus::Unavailable {
+                        reason: UnavailableReason::Upstream,
+                        detail: "no upstream data yet".into(),
+                    },
+                },
+                ClientMsg::Subscribe { id, .. } => ServerMsg::Snapshot { id, seq: 1, data: TopicData::Trades(vec![]) },
+                ClientMsg::Unsubscribe { id } => {
+                    subscribed.remove(&id);
+                    continue;
+                }
+                _ => continue,
+            };
+            ws.send(to_message(tr_proto::encode(&reply, Encoding::Postcard).unwrap())).await.unwrap();
+        }
+    }
+
+    async fn next(sub: &mut Subscription) -> Event {
+        tokio::time::timeout(Duration::from_secs(10), sub.next())
+            .await
+            .expect("an update in time")
+            .expect("client alive")
+            .event
+    }
+
+    /// The client subscribes again, with backoff, when a server gives up on a subscription
+    /// because its upstream isn't ready, so a client recovers even from an older server.
+    #[tokio::test]
+    async fn subscriptions_a_server_gave_up_on_are_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(older_gateway(listener));
+        let client = Client::connect(&url, Encoding::Postcard, "remote-test");
+        let mut sub = client.subscribe(TopicReq::Trades { key: MarketKey::new("BTC") });
+        assert!(matches!(next(&mut sub).await, Event::Status(TopicStatus::Unavailable { .. })));
+        loop {
+            match next(&mut sub).await {
+                Event::Snapshot(data) => break assert_eq!(data, TopicData::Trades(vec![])),
+                Event::Status(s) => panic!("{s:?}"),
+                _ => {}
+            }
+        }
     }
 }
