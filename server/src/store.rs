@@ -38,6 +38,9 @@ pub struct HubConfig {
     pub history_ttl: Duration,
     /// How often the instrument list (and previous-day prices) is refreshed.
     pub registry_every: Duration,
+    /// After the first instrument list, how long to wait for every venue's first mids before
+    /// the hub calls itself ready without the venues still missing.
+    pub venue_grace: Duration,
 }
 
 impl Default for HubConfig {
@@ -49,6 +52,7 @@ impl Default for HubConfig {
             ring: 1024,
             history_ttl: Duration::from_secs(15),
             registry_every: Duration::from_secs(300),
+            venue_grace: Duration::from_secs(10),
         }
     }
 }
@@ -516,6 +520,10 @@ pub struct Hub {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stopped: std::sync::atomic::AtomicBool,
     history: Mutex<HashMap<(InstrumentId, Timeframe), Cached>>,
+    /// When the first instrument list loaded, and the venues whose first mids haven't come yet.
+    listing: Mutex<Option<(Instant, HashSet<String>)>>,
+    /// Set for good once the first instrument list is in and every venue has sent its mids.
+    ready: watch::Sender<bool>,
 }
 
 /// A client's hold on a topic. Dropping it releases the topic.
@@ -558,6 +566,8 @@ impl Hub {
             task: Mutex::default(),
             stopped: Default::default(),
             history: Mutex::default(),
+            listing: Mutex::default(),
+            ready: watch::channel(false).0,
         })
     }
 
@@ -611,6 +621,10 @@ impl Hub {
         venues.sort();
         venues.dedup();
         *self.registry.write().expect("registry lock") = list.into_iter().map(|d| (d.id.0.clone(), d)).collect();
+        self.listing
+            .lock()
+            .expect("listing lock")
+            .get_or_insert_with(|| (Instant::now(), venues.iter().cloned().collect()));
         for venue in venues {
             if self.venues.lock().expect("venues lock").contains_key(&venue) {
                 continue;
@@ -620,32 +634,74 @@ impl Hub {
             let sink = UpstreamSink::new(move |up| {
                 let Some(hub) = hub.upgrade() else { return };
                 match up.event {
-                    UpstreamEvent::Mids(m) => hub.mids.apply(&name, up.recv, up.recv_ms, m),
-                    ev => hub.mids.venue_event(&name, up.recv_ms, &ev),
+                    UpstreamEvent::Mids(m) => {
+                        hub.mids.apply(&name, up.recv, up.recv_ms, m);
+                        hub.heard(&name);
+                    }
+                    ev => {
+                        hub.mids.venue_event(&name, up.recv_ms, &ev);
+                        if matches!(ev, UpstreamEvent::Rejected(_)) {
+                            hub.heard(&name);
+                        }
+                    }
                 }
             });
             match self.provider.subscribe(Channel::Mids, &InstrumentId(venue.clone()), sink).await {
                 Ok(h) => {
                     self.venues.lock().expect("venues lock").insert(venue, h);
                 }
-                Err(e) => tracing::warn!("mids for venue {venue:?}: {e}"),
+                Err(e) => {
+                    tracing::warn!("mids for venue {venue:?}: {e}");
+                    // Readiness doesn't wait for a feed that never started.
+                    self.heard(&venue);
+                }
             }
         }
         Ok(n)
     }
 
-    /// Wait (up to `timeout`) for the first mids, which tell us what exists.
-    pub async fn ready(&self, timeout: Duration) -> bool {
-        let mut rx = self.mids.subscribe();
-        let wait = async {
-            while self.mids.is_empty() {
-                if rx.changed().await.is_err() {
-                    break;
+    /// Note that a venue's mids feed sent data or was refused. The hub is ready once every venue
+    /// from the first instrument list has done so. A venue that stays silent holds it back for
+    /// `venue_grace` at most. Mids stream all the time, so the first message after that settles it.
+    fn heard(&self, venue: &str) {
+        if self.is_ready() {
+            return;
+        }
+        let missing: Vec<String> = match &mut *self.listing.lock().expect("listing lock") {
+            Some((at, waiting)) => {
+                waiting.remove(venue);
+                if !waiting.is_empty() && at.elapsed() < self.cfg.venue_grace {
+                    return;
                 }
+                waiting.iter().cloned().collect()
             }
+            None => return,
         };
-        let _ = tokio::time::timeout(timeout, wait).await;
-        !self.mids.is_empty()
+        if self.mids.is_empty() || self.ready.send_replace(true) {
+            return;
+        }
+        if missing.is_empty() {
+            tracing::info!("ready: {} mids", self.mids.len());
+        } else {
+            tracing::warn!("ready with {} mids, but none yet from venues {missing:?}", self.mids.len());
+        }
+    }
+
+    /// Whether the instrument list and every venue's mids are in, which tell us what exists.
+    /// Once true, it stays true; later upstream outages show up as stale topics instead.
+    pub fn is_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    /// Wait up to `timeout` for the hub to be ready.
+    pub async fn ready(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.wait_ready()).await.is_ok()
+    }
+
+    /// Wait for the hub to be ready, however long that takes.
+    pub async fn wait_ready(&self) {
+        // The hub holds the sender, so the channel can't close while we borrow the hub.
+        let _ = self.ready.subscribe().wait_for(|r| *r).await;
     }
 
     /// Map a client's market key to the upstream instrument. Venue-native keys (`BTC`,

@@ -49,7 +49,8 @@ pub struct SessionConfig {
     pub ping_every: Duration,
     /// Close a client we've heard nothing from (not even a pong) for this long.
     pub idle_timeout: Duration,
-    /// How long a subscribe waits for the first mids after a restart.
+    /// How long a request waits for the upstream after a restart before it fails. Subscriptions
+    /// wait as long as it takes.
     pub ready_timeout: Duration,
 }
 
@@ -440,7 +441,10 @@ impl Drop for Decrement {
 
 async fn rpc(hub: &Arc<Hub>, cfg: &SessionConfig, req: Rpc) -> Result<RpcResult, ApiError> {
     let err = |code, message: String| ApiError { code, message };
-    hub.ready(cfg.ready_timeout).await;
+    // Not `UnknownMarket`, since clients stop asking about a market the server called unknown.
+    if !hub.ready(cfg.ready_timeout).await {
+        return Err(err(ErrorCode::Upstream, "the server is starting; no upstream data yet".into()));
+    }
     match req {
         Rpc::History { key, tf, end, limit } => {
             let inst =
@@ -466,9 +470,16 @@ async fn rpc(hub: &Arc<Hub>, cfg: &SessionConfig, req: Rpc) -> Result<RpcResult,
 }
 
 async fn forward(f: Fwd, hub: Arc<Hub>, cfg: Arc<SessionConfig>, topic: TopicReq) {
-    if !hub.ready(cfg.ready_timeout).await {
-        f.unavailable(UnavailableReason::Upstream, "no upstream data yet".into()).await;
-        return;
+    // Right after a restart the gateway doesn't know yet which markets exist. A client that
+    // reconnects then keeps its subscriptions, stale until the upstream is in and live after.
+    if !hub.is_ready() {
+        if !f.status(TopicStatus::Stale { since_ms: now_ms() }).await {
+            return;
+        }
+        hub.wait_ready().await;
+        if !f.status(TopicStatus::Live).await {
+            return;
+        }
     }
     let unknown = |k: &MarketKey| (UnavailableReason::UnknownMarket, format!("unknown market {k}"));
     let (tkey, extra) = match &topic {

@@ -66,7 +66,7 @@ async fn ws(State(st): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
 
 async fn readyz(State(st): State<AppState>) -> Response {
     let up = st.hub.provider().stats().connections_up;
-    if up > 0 && !st.hub.mids.is_empty() {
+    if up > 0 && st.hub.is_ready() {
         (StatusCode::OK, "ready\n").into_response()
     } else {
         (
