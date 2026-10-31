@@ -308,6 +308,9 @@ struct Shared {
     /// Authoritative bars per chart pane (history, paging and live ticks all merge here),
     /// tagged with the pane's load generation.
     series: std::sync::Mutex<SeriesMap>,
+    /// How many times each chart pane reloaded because its data source changed, so a page of
+    /// older bars from the old source doesn't join the new one's.
+    sources: std::sync::Mutex<HashMap<PaneId, u64>>,
     #[cfg(not(target_arch = "wasm32"))]
     cache: std::sync::Mutex<Option<BarCache>>,
     db: Mutex<Db>,
@@ -370,6 +373,7 @@ impl Worker {
         let shared = Arc::new(Shared {
             provider,
             series: Default::default(),
+            sources: Default::default(),
             cache: std::sync::Mutex::new(cache),
             db: Mutex::new(db),
             out,
@@ -410,8 +414,14 @@ impl Worker {
     pub fn spawn(ctx: egui::Context, provider: Provider) -> anyhow::Result<Self> {
         let (tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<Request>();
         let (out, rx) = mpsc::channel();
-        let shared =
-            Arc::new(Shared { provider, series: Default::default(), db: Mutex::new(Db::open_in_memory()?), out, ctx });
+        let shared = Arc::new(Shared {
+            provider,
+            series: Default::default(),
+            sources: Default::default(),
+            db: Mutex::new(Db::open_in_memory()?),
+            out,
+            ctx,
+        });
         rt::spawn(async move {
             while let Some(req) = req_rx.recv().await {
                 let s = shared.clone();
@@ -608,7 +618,12 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             // Page from the worker's copy (it may hold newer live bars than the UI's).
             let base = current_series(s, pane, generation).filter(|b| !b.is_empty()).unwrap_or(existing);
             let Some(first) = base.first().copied() else { return };
-            match s.provider.history(&symbol, tf, Some(first.ts), limit).await {
+            let source = source_switches(s, pane);
+            let page = s.provider.history(&symbol, tf, Some(first.ts), limit).await;
+            if source_switches(s, pane) != source {
+                return; // the chart reloaded from another source, and that reload answers the pane
+            }
+            match page {
                 Ok(older) => {
                     let older: Vec<Bar> = older.into_iter().filter(|b| b.ts < first.ts).collect();
                     let prepended = older.len();
@@ -831,6 +846,10 @@ fn store_series(s: &Shared, pane: PaneId, generation: u64, bars: Arc<Vec<Bar>>) 
     }
 }
 
+fn source_switches(s: &Shared, pane: PaneId) -> u64 {
+    s.sources.lock().expect("sources lock").get(&pane).copied().unwrap_or(0)
+}
+
 fn current_series(s: &Shared, pane: PaneId, generation: u64) -> Option<Arc<Vec<Bar>>> {
     s.series.lock().expect("series lock").get(&pane).filter(|(g, _)| *g == generation).map(|(_, b)| b.clone())
 }
@@ -910,6 +929,7 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
         if ended {
             rt::sleep(RELOAD_AFTER_FEED_ENDS.saturating_sub(started.elapsed())).await;
             if current_series(&s, pane, generation).is_some() {
+                *s.sources.lock().expect("sources lock").entry(pane).or_default() += 1;
                 handle(&s, Request::History { pane, generation, symbol, tf, limit }).await;
             }
         }
@@ -1038,6 +1058,7 @@ mod tests {
         let s = Shared {
             provider: std::sync::Arc::new(tr_data::sample::SampleProvider::at(0, 10)),
             series: Default::default(),
+            sources: Default::default(),
             cache: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
@@ -1052,12 +1073,13 @@ mod tests {
         assert!(current_series(&s, 1, 1).is_none());
     }
 
-    /// Bars whose close counts the loads. The first chart's live feed ends at once, the way
-    /// `RemoteMarkets` ends one when the chart's source changes.
+    /// Bars whose close counts the loads, and older pages that wait for `page`. The first chart's
+    /// live feed ends at once, the way `RemoteMarkets` ends one when the chart's source changes.
     #[derive(Default)]
     struct SourceChanges {
         loads: std::sync::atomic::AtomicUsize,
         open: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<Bar>>>,
+        page: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -1066,7 +1088,11 @@ mod tests {
             "test"
         }
 
-        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+        async fn history(&self, _: &str, _: Timeframe, end: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            if end.is_some() {
+                self.page.notified().await;
+                return Ok(vec![Bar::new(-60, 1.0, 1.0, 1.0, 1.0, 1.0)]);
+            }
             let n = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             Ok(vec![Bar::new(0, 1.0, 1.0, 1.0, n as f64, 1.0)])
         }
@@ -1080,23 +1106,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn charts_reload_when_the_provider_ends_their_live_feed() {
+    /// A worker on `SourceChanges` with pane 1 loading `BTCUSD Curncy`, and its responses.
+    async fn switching_chart() -> (Arc<Shared>, mpsc::Receiver<Response>, Arc<SourceChanges>) {
         let (out, rx) = mpsc::channel();
         let provider = Arc::new(SourceChanges::default());
         let s = Arc::new(Shared {
             provider: provider.clone(),
             series: Default::default(),
+            sources: Default::default(),
             cache: std::sync::Mutex::new(None),
             db: Mutex::new(Db::open_in_memory().unwrap()),
             out,
             ctx: egui::Context::default(),
         });
-        let t0 = std::time::Instant::now();
         let symbol = "BTCUSD Curncy".to_string();
         handle(&s, Request::History { pane: 1, generation: 1, symbol, tf: Timeframe::D1, limit: 10 }).await;
+        (s, rx, provider)
+    }
+
+    /// The last close of each chart update, until there are `n`.
+    async fn closes(rx: &mpsc::Receiver<Response>, n: usize) -> Vec<f64> {
+        let t0 = std::time::Instant::now();
         let mut closes = Vec::new();
-        while closes.len() < 2 {
+        while closes.len() < n {
             assert!(t0.elapsed() < Duration::from_secs(15), "no reload: {closes:?}");
             match rx.try_recv() {
                 Ok(Response::History { generation: 1, bars, .. }) => closes.push(bars.last().unwrap().close),
@@ -1104,9 +1136,40 @@ mod tests {
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
-        assert_eq!(closes, [1.0, 2.0], "the reload replaced the chart");
+        closes
+    }
+
+    #[tokio::test]
+    async fn charts_reload_when_the_provider_ends_their_live_feed() {
+        let t0 = std::time::Instant::now();
+        let (_s, rx, provider) = switching_chart().await;
+        assert_eq!(closes(&rx, 2).await, [1.0, 2.0], "the reload replaced the chart");
         assert!(t0.elapsed() >= RELOAD_AFTER_FEED_ENDS, "not before the pause");
         assert_eq!(provider.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pages_from_the_old_source_are_dropped_when_the_chart_switches() {
+        let (s, rx, provider) = switching_chart().await;
+        let req = Request::MoreHistory {
+            pane: 1,
+            generation: 1,
+            symbol: "BTCUSD Curncy".into(),
+            tf: Timeframe::D1,
+            existing: Arc::new(Vec::new()),
+            limit: 10,
+        };
+        let paging = tokio::spawn({
+            let s = s.clone();
+            async move { handle(&s, req).await }
+        });
+        assert_eq!(closes(&rx, 2).await, [1.0, 2.0]);
+        // The page from before the switch arrives after it.
+        provider.page.notify_one();
+        paging.await.unwrap();
+        let ts: Vec<i64> = current_series(&s, 1, 1).unwrap().iter().map(|b| b.ts).collect();
+        assert_eq!(ts, [0], "the old source's page joined the new source's bars");
+        assert!(rx.try_iter().all(|r| !matches!(r, Response::History { prepended: 1.., .. })));
     }
 
     #[test]

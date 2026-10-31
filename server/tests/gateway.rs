@@ -626,6 +626,32 @@ async fn charts_hand_off_to_the_fallback_and_back_when_the_server_goes_and_retur
 }
 
 #[tokio::test]
+async fn charts_on_the_fallback_move_back_on_a_newer_connection_only() {
+    // Nothing listens there yet, so the chart loads from the fallback.
+    let addr = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+    let m = RemoteMarkets::new(&format!("ws://{addr}"), tr_data::sample::SampleProvider::default().with_live_ticks());
+    assert_eq!(m.history("BTCUSD Curncy", Timeframe::M1, None, 10).await.unwrap().len(), 10, "sample bars");
+    // The server comes up before the chart starts its live feed...
+    let s = Setup::new(|c| c.bind = addr).await;
+    let t0 = tokio::time::Instant::now();
+    while m.quotes(&["BTCUSD Curncy".into()]).await.unwrap()[0].last != 100.5 {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the client never connected");
+    }
+    // ...so the fallback's feed ends at once, and the chart reloads from the server.
+    let mut feed = m.live("BTCUSD Curncy", Timeframe::M1).expect("the fallback's feed");
+    let ended = tokio::time::timeout(Duration::from_secs(2), async { while feed.recv().await.is_some() {} }).await;
+    assert!(ended.is_ok(), "the fallback's feed kept going with the server up");
+    // A chart that falls back while the server is up (it failed the request) stays on the fallback:
+    // reloading would only fail again.
+    *s.mock.fail_candles.lock().unwrap() = 1000;
+    assert_eq!(m.history("BTCUSD Curncy", Timeframe::M1, None, 10).await.unwrap().len(), 10, "sample bars");
+    assert!(*s.mock.fail_candles.lock().unwrap() < 1000, "the server was asked and failed");
+    let mut feed = m.live("BTCUSD Curncy", Timeframe::M1).expect("the fallback's feed");
+    let ended = tokio::time::timeout(Duration::from_secs(2), async { while feed.recv().await.is_some() {} }).await;
+    assert!(ended.is_err(), "the fallback's feed ended with no new connection");
+}
+
+#[tokio::test]
 async fn desktop_charts_backfill_bars_missed_in_an_outage() {
     let s = Setup::new(|_| {}).await;
     let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());

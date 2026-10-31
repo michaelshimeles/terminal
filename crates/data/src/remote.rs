@@ -46,7 +46,12 @@ pub struct Update {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnState {
     Connecting,
-    Up { session: u64 },
+    /// Connected. The server numbers the `session`; `connection` counts this client's connections
+    /// from 1.
+    Up {
+        session: u64,
+        connection: u64,
+    },
     Down(String),
 }
 
@@ -212,11 +217,13 @@ async fn run(
 ) {
     let mut subs: HashMap<SubId, SubState> = HashMap::new();
     let mut backoff = Duration::from_millis(500);
+    let mut connection = 0;
     loop {
         state.send_replace(ConnState::Connecting);
         match hello(&url, enc, &info).await {
             Ok((ws, session)) => {
-                state.send_replace(ConnState::Up { session });
+                connection += 1;
+                state.send_replace(ConnState::Up { session, connection });
                 backoff = Duration::from_millis(500);
                 if !connected(ws, enc, &mut subs, &mut cmds).await {
                     return;
@@ -374,6 +381,9 @@ pub struct RemoteMarkets<P> {
     unknown: Mutex<HashSet<String>>,
     /// Markets whose latest history came from the server, so paging and the live feed must too.
     served: Mutex<HashSet<String>>,
+    /// Markets the server serves whose latest history came from `inner` instead, with the
+    /// connection that was up then (0 for none). A newer connection moves their charts back.
+    fallbacks: Mutex<HashMap<String, u64>>,
     books: Arc<Mutex<HashMap<String, BookFeed>>>,
     sparks: Mutex<HashMap<String, (Instant, Vec<f64>)>>,
 }
@@ -390,6 +400,7 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
             served: Mutex::default(),
             books: Arc::default(),
             sparks: Mutex::default(),
+            fallbacks: Mutex::default(),
         }
     }
 
@@ -661,11 +672,14 @@ async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Sub
     }
 }
 
-/// A fallback's live bars for a market the server serves, passed on until the server comes back
-/// up. Then the feed ends, so the worker reloads the chart from the server.
-async fn until_server_up(mut state: watch::Receiver<ConnState>, mut feed: LiveFeed, tx: mpsc::Sender<Bar>) {
-    let up = |s: &ConnState| matches!(s, ConnState::Up { .. });
-    let mut was_up = up(&state.borrow_and_update());
+/// A fallback's live bars for a market the server serves, passed on until a connection newer than
+/// `after` is up, one the chart didn't fall back on. Then the feed ends, so the worker reloads the
+/// chart from the server.
+async fn until_server_up(mut state: watch::Receiver<ConnState>, after: u64, mut feed: LiveFeed, tx: mpsc::Sender<Bar>) {
+    let newer = |s: &ConnState| matches!(s, ConnState::Up { connection, .. } if *connection > after);
+    if newer(&state.borrow_and_update()) {
+        return;
+    }
     let mut watching = true;
     loop {
         tokio::select! {
@@ -680,11 +694,9 @@ async fn until_server_up(mut state: watch::Receiver<ConnState>, mut feed: LiveFe
                     watching = false;
                     continue;
                 }
-                let now_up = up(&state.borrow_and_update());
-                if now_up && !was_up {
+                if newer(&state.borrow_and_update()) {
                     return;
                 }
-                was_up = now_up;
             }
             _ = tx.closed() => return,
         }
@@ -715,6 +727,11 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
                 Ok(_) => {}
                 Err(e) => self.note(symbol, &e),
             }
+            let connection = match self.client().state() {
+                ConnState::Up { connection, .. } => connection,
+                _ => 0,
+            };
+            self.fallbacks.lock().expect("fallbacks lock").insert(symbol.to_string(), connection);
         }
         self.served.lock().expect("served lock").remove(symbol);
         self.inner.history(symbol, tf, end, limit).await
@@ -751,8 +768,9 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
             if !self.routed(symbol) {
                 return Some(feed);
             }
+            let after = self.fallbacks.lock().expect("fallbacks lock").get(symbol).copied().unwrap_or(0);
             let (tx, rx) = mpsc::channel(256);
-            rt::spawn(until_server_up(self.client().state.clone(), feed, tx));
+            rt::spawn(until_server_up(self.client().state.clone(), after, feed, tx));
             return Some(rx);
         }
         let (tx, rx) = mpsc::channel(256);
