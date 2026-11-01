@@ -957,6 +957,7 @@ impl TerminalApp {
                     prepended,
                     from_cache,
                     exhausted,
+                    full,
                     live,
                 } => {
                     let worker = &self.worker;
@@ -964,7 +965,7 @@ impl TerminalApp {
                         && c.symbol == symbol
                         && c.tf == tf
                     {
-                        c.on_history(generation, bars, gpu, prepended, from_cache, exhausted, live, worker);
+                        c.on_history(generation, bars, gpu, prepended, from_cache, exhausted, full, live, worker);
                     }
                 }
                 Response::HistoryError { pane, generation, error } => {

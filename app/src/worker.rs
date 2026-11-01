@@ -241,6 +241,9 @@ pub enum Response {
         prepended: usize,
         from_cache: bool,
         exhausted: bool,
+        /// A full load from the provider. Its `exhausted` replaces the chart's, which may have
+        /// come from the source the chart showed before.
+        full: bool,
         /// A live-feed update of the latest bar.
         live: bool,
     },
@@ -584,6 +587,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                     prepended: 0,
                     from_cache: true,
                     exhausted: false,
+                    full: false,
                     live: false,
                 });
             }
@@ -606,6 +610,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         prepended: 0,
                         from_cache: false,
                         exhausted,
+                        full: true,
                         live: false,
                     });
                     start_live(s.clone(), pane, generation, symbol, tf, limit);
@@ -651,6 +656,7 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                         prepended,
                         from_cache: false,
                         exhausted: prepended == 0,
+                        full: false,
                         live: false,
                     });
                 }
@@ -923,6 +929,7 @@ fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf:
                         prepended: 0,
                         from_cache: false,
                         exhausted: false,
+                        full: false,
                         // A bar slotted into a gap shifts everything after it: send it as a
                         // refresh so the chart rebuilds its compare line and indicators.
                         live: !std::mem::take(&mut inserted),
