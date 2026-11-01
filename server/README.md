@@ -16,6 +16,8 @@ The desktop app uses it for crypto markets when `TR_SERVER_URL` is set:
 TR_SERVER_URL=ws://localhost:8787 cargo run --release
 ```
 
+The browser build uses it too. `scripts/build-web.sh` builds in `wss://terminal-gateway.style.dev/ws`, or `TR_SERVER_URL` when it is set (empty for none). To try a local gateway with a built page, open the page with `?server=ws://localhost:8787/ws`.
+
 The gateway serves plain HTTP and websockets. For `wss://` on 443, put a TLS-terminating edge in front of it and bind to an address the edge can reach, for example `TR_GATEWAY_BIND=0.0.0.0:8080`. Clients accept `wss://` URLs. The gateway pings each client every 20 s so idle connections survive proxies. The hosted one runs on Freestyle; see `deploy/freestyle/README.md`.
 
 ## Restarts

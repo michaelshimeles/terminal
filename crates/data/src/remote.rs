@@ -5,23 +5,24 @@
 //! reconnects with backoff, resubscribes everything (each subscription then gets a fresh
 //! `Snapshot`), checks each subscription's `seq` and asks for a `Resync` on a gap. A
 //! subscription the server gave up on because of its upstream is subscribed again, with backoff.
+//! It runs on either target: tokio on the desktop, the page's event loop in the browser build.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_tungstenite::tungstenite::Message;
 use tr_core::{AssetClass, Bar, Timeframe};
 use tr_proto::{
     ApiError, BarDelta, ClientInfo, ClientMsg, Encoding, ErrorCode, Frame, MarketKey, PROTOCOL_VERSION, ReqId,
     ResyncReason, Rpc, RpcResult, ServerMsg, SubId, TopicData, TopicDelta, TopicReq, TopicStatus, UnavailableReason,
 };
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::ws::{Message, Socket};
 use crate::{LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, rt, security};
 
 /// What a subscription receives.
@@ -49,7 +50,12 @@ pub struct Update {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnState {
     Connecting,
-    Up { session: u64 },
+    /// Connected. The server numbers the `session`; `connection` counts this client's connections
+    /// from 1.
+    Up {
+        session: u64,
+        connection: u64,
+    },
     Down(String),
 }
 
@@ -59,7 +65,8 @@ enum Cmd {
     Request { id: ReqId, req: Rpc, reply: oneshot::Sender<Result<RpcResult, ApiError>> },
 }
 
-/// A shared connection to one server. Cheap to clone. Create it inside a tokio runtime.
+/// A shared connection to one server. Cheap to clone. On the desktop, create it inside a tokio
+/// runtime.
 #[derive(Clone)]
 pub struct Client {
     cmd: mpsc::UnboundedSender<Cmd>,
@@ -103,8 +110,8 @@ pub fn normalize_url(url: &str) -> String {
 
 fn to_message(f: Frame) -> Message {
     match f {
-        Frame::Binary(b) => Message::Binary(b.into()),
-        Frame::Text(t) => Message::Text(t.into()),
+        Frame::Binary(b) => Message::Binary(b),
+        Frame::Text(t) => Message::Text(t),
     }
 }
 
@@ -118,7 +125,7 @@ impl Client {
         let (cmd, rx) = mpsc::unbounded_channel();
         let (state_tx, state) = watch::channel(ConnState::Connecting);
         let info = ClientInfo { name: name.into(), version: env!("CARGO_PKG_VERSION").into() };
-        tokio::spawn(run(normalize_url(url), encoding, info, rx, state_tx));
+        rt::spawn(run(normalize_url(url), encoding, info, rx, state_tx));
         Client { cmd, next_id: Arc::new(AtomicU32::new(1)), state }
     }
 
@@ -139,7 +146,7 @@ impl Client {
                 }
             }
         };
-        tokio::time::timeout(timeout, up).await.is_ok()
+        rt::timeout(timeout, up).await.is_ok()
     }
 
     pub fn subscribe(&self, topic: TopicReq) -> Subscription {
@@ -158,7 +165,7 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         self.cmd.send(Cmd::Request { id, req, reply }).map_err(|_| err("client stopped"))?;
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        match rt::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(err("connection lost")),
             Err(_) => Err(err("request timed out")),
@@ -189,21 +196,19 @@ impl SubState {
     }
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-async fn hello(url: &str, enc: Encoding, info: &ClientInfo) -> Result<(Ws, u64)> {
-    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(url))
+async fn hello(url: &str, enc: Encoding, info: &ClientInfo) -> Result<(Socket, u64)> {
+    let mut ws = rt::timeout(Duration::from_secs(10), Socket::connect(url))
         .await
         .context("connect timed out")?
         .context("connect")?;
     let hello =
         ClientMsg::Hello { version: PROTOCOL_VERSION, encoding: enc, client: info.clone(), token: None, resume: None };
-    ws.send(to_message(tr_proto::encode(&hello, enc)?)).await?;
-    let welcome = tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(m) = ws.next().await {
+    ws.send_message(to_message(tr_proto::encode(&hello, enc)?)).await?;
+    let welcome = rt::timeout(Duration::from_secs(10), async {
+        while let Some(m) = ws.next_message().await {
             match decode(&m?) {
-                Some(Ok(ServerMsg::Welcome { session, .. })) => return Ok(session.0),
-                Some(Ok(ServerMsg::Error { code, message })) => bail!("{code:?}: {message}"),
+                Ok(ServerMsg::Welcome { session, .. }) => return Ok(session.0),
+                Ok(ServerMsg::Error { code, message }) => bail!("{code:?}: {message}"),
                 _ => {}
             }
         }
@@ -214,11 +219,10 @@ async fn hello(url: &str, enc: Encoding, info: &ClientInfo) -> Result<(Ws, u64)>
     Ok((ws, welcome))
 }
 
-fn decode(m: &Message) -> Option<Result<ServerMsg, tr_proto::CodecError>> {
+fn decode(m: &Message) -> Result<ServerMsg, tr_proto::CodecError> {
     match m {
-        Message::Binary(b) => Some(tr_proto::decode_binary(b)),
-        Message::Text(t) => Some(tr_proto::decode_text(t.as_str())),
-        _ => None,
+        Message::Binary(b) => tr_proto::decode_binary(b),
+        Message::Text(t) => tr_proto::decode_text(t),
     }
 }
 
@@ -231,11 +235,13 @@ async fn run(
 ) {
     let mut subs: HashMap<SubId, SubState> = HashMap::new();
     let mut backoff = Duration::from_millis(500);
+    let mut connection = 0;
     loop {
         state.send_replace(ConnState::Connecting);
         match hello(&url, enc, &info).await {
             Ok((ws, session)) => {
-                state.send_replace(ConnState::Up { session });
+                connection += 1;
+                state.send_replace(ConnState::Up { session, connection });
                 backoff = Duration::from_millis(500);
                 if !connected(ws, enc, &mut subs, &mut cmds).await {
                     return;
@@ -255,7 +261,7 @@ async fn run(
         }
         // Back off, still taking commands: subscriptions wait for the next connection,
         // requests fail now.
-        let sleep = tokio::time::sleep(backoff);
+        let sleep = rt::sleep(backoff);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
@@ -280,37 +286,35 @@ async fn run(
 
 /// Serve one connection. Returns false once every handle to the client is gone.
 async fn connected(
-    ws: Ws,
+    mut ws: Socket,
     enc: Encoding,
     subs: &mut HashMap<SubId, SubState>,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> bool {
-    let (mut tx, mut rx) = ws.split();
     let mut pending: HashMap<ReqId, oneshot::Sender<Result<RpcResult, ApiError>>> = HashMap::new();
     let mut queue: Vec<ClientMsg> =
         subs.iter().map(|(id, s)| ClientMsg::Subscribe { id: *id, topic: s.topic.clone() }).collect();
-    let mut ping = tokio::time::interval(Duration::from_secs(15));
+    let mut ping = rt::interval(Duration::from_secs(15));
     loop {
         for m in queue.drain(..) {
             let Ok(f) = tr_proto::encode(&m, enc) else { continue };
-            if tx.send(to_message(f)).await.is_err() {
+            if ws.send_message(to_message(f)).await.is_err() {
                 return true;
             }
         }
         let retry = subs.values().filter_map(|s| s.retry_at).min();
         tokio::select! {
-            m = rx.next() => {
+            m = ws.next_message() => {
                 let received = SystemTime::now();
                 let Some(Ok(m)) = m else { return true };
                 match decode(&m) {
-                    Some(Ok(msg)) => route(msg, received, subs, &mut pending, &mut queue),
-                    Some(Err(e)) => tracing::debug!("terminal server sent an unreadable frame: {e}"),
-                    None => {}
+                    Ok(msg) => route(msg, received, subs, &mut pending, &mut queue),
+                    Err(e) => tracing::debug!("terminal server sent an unreadable frame: {e}"),
                 }
             }
             cmd = cmds.recv() => match cmd {
                 None => {
-                    let _ = tx.close().await;
+                    ws.close().await;
                     return false;
                 }
                 Some(Cmd::Subscribe { id, topic, tx: sub }) => {
@@ -328,7 +332,7 @@ async fn connected(
                 }
             },
             _ = ping.tick() => queue.push(ClientMsg::Ping { t: now_ms() }),
-            _ = async { tokio::time::sleep_until(retry.expect("guarded").into()).await }, if retry.is_some() => {
+            _ = async { rt::sleep(retry.expect("guarded").saturating_duration_since(Instant::now())).await }, if retry.is_some() => {
                 resubscribe_due(subs, &mut queue);
             }
         }
@@ -428,6 +432,9 @@ pub struct RemoteMarkets<P> {
     unknown: Mutex<HashSet<String>>,
     /// Markets whose latest history came from the server, so paging and the live feed must too.
     served: Mutex<HashSet<String>>,
+    /// Markets the server serves whose latest history came from `inner` instead, with the
+    /// connection that was up then (0 for none). A newer connection moves their charts back.
+    fallbacks: Mutex<HashMap<String, u64>>,
     books: Arc<Mutex<HashMap<String, BookFeed>>>,
     sparks: Mutex<HashMap<String, (Instant, Vec<f64>)>>,
 }
@@ -444,11 +451,13 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
             served: Mutex::default(),
             books: Arc::default(),
             sparks: Mutex::default(),
+            fallbacks: Mutex::default(),
         }
     }
 
     fn client(&self) -> &Client {
-        self.client.get_or_init(|| Client::connect(&self.url, Encoding::Postcard, "terminal-desktop"))
+        let name = if cfg!(target_arch = "wasm32") { "terminal-web" } else { "terminal-desktop" };
+        self.client.get_or_init(|| Client::connect(&self.url, Encoding::Postcard, name))
     }
 
     fn routed(&self, symbol: &str) -> bool {
@@ -502,7 +511,7 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
         }
         let topic = TopicReq::Quotes { keys: keys.iter().map(MarketKey::new).collect(), max_hz: 1 };
         let mut sub = client.subscribe(topic);
-        let quotes = tokio::time::timeout(Duration::from_secs(5), async {
+        let quotes = rt::timeout(Duration::from_secs(5), async {
             while let Some(u) = sub.next().await {
                 match u.event {
                     Event::Snapshot(TopicData::Quotes(q)) => return Ok(q),
@@ -548,7 +557,7 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
                 }
             }
         };
-        let got = tokio::time::timeout(Duration::from_secs(3), latest.wait_for(Option::is_some))
+        let got = rt::timeout(Duration::from_secs(3), latest.wait_for(Option::is_some))
             .await
             .context("no book from the Terminal server")?
             .map_err(|_| anyhow!("book feed stopped"))?
@@ -569,7 +578,7 @@ async fn book_feed(
     used: Arc<Mutex<Instant>>,
     books: Arc<Mutex<HashMap<String, BookFeed>>>,
 ) {
-    let mut check = tokio::time::interval(Duration::from_secs(5));
+    let mut check = rt::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             u = sub.next() => {
@@ -578,6 +587,11 @@ async fn book_feed(
                     Event::Snapshot(TopicData::Book(b)) | Event::Delta(TopicDelta::Book(b)) => b,
                     Event::Status(TopicStatus::Unavailable { detail, .. }) => {
                         tx.send_replace(Some(Err(detail)));
+                        continue;
+                    }
+                    // The last book goes stale while the connection is down; the next snapshot replaces it.
+                    Event::Reconnecting => {
+                        tx.send_replace(Some(Err("the Terminal server is not reachable".into())));
                         continue;
                     }
                     _ => continue,
@@ -611,19 +625,24 @@ async fn history_since(client: &Client, key: &MarketKey, tf: Timeframe, from: i6
 
 type Fetch = std::pin::Pin<Box<dyn Future<Output = Result<Vec<Bar>, ApiError>> + Send>>;
 
+/// How long a chart's live feed from the server waits for a dropped connection to come back
+/// before it ends, so the worker reloads the chart from the fallback.
+const OUTAGE_GRACE: Duration = Duration::from_secs(10);
+
 /// The server's bar stream, onto the worker's live feed. Live bars go straight through. After an
 /// outage the stream picks up at the current bar, so the bars from the last one sent up to it
 /// come from history: one request at a time per feed, retried with backoff, every outstanding
-/// gap merged into one range. The worker slots those bars into the gap. Everything stops when
-/// the worker drops the feed.
+/// gap merged into one range. The worker slots those bars into the gap. A connection that stays
+/// down past `OUTAGE_GRACE` ends the feed instead. Everything stops when the worker drops the feed.
 async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Subscription, tx: mpsc::Sender<Bar>) {
-    // The newest bar sent on, and whether the stream broke since.
+    // The newest bar sent on, whether the stream broke since, and when the connection dropped.
     let mut last: Option<i64> = None;
     let mut broken = false;
+    let mut away: Option<Instant> = None;
     // Bars still to fetch, `[from, until)`, and the range the request in flight covers.
     let mut pending: Option<(i64, i64)> = None;
     let mut fetching: Option<((i64, i64), Fetch)> = None;
-    let mut retry_at: Option<tokio::time::Instant> = None;
+    let mut retry_at: Option<Instant> = None;
     let mut wait = Duration::from_secs(1);
     let union = |a: Option<(i64, i64)>, b: (i64, i64)| Some(a.map_or(b, |a| (a.0.min(b.0), a.1.max(b.1))));
     loop {
@@ -634,15 +653,25 @@ async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Sub
             let (client, key) = (client.clone(), key.clone());
             fetching = Some((range, Box::pin(async move { history_since(&client, &key, tf, range.0).await })));
         }
+        let retry_in = retry_at.map(|t| t.saturating_duration_since(Instant::now()));
+        let give_up_in = away.map(|t| OUTAGE_GRACE.saturating_sub(t.elapsed()));
         tokio::select! {
             u = sub.next() => {
                 let Some(u) = u else { return };
                 let bars = match u.event {
-                    Event::Resync(_) | Event::Reconnecting | Event::Resubscribing => {
+                    Event::Resync(_) | Event::Resubscribing => {
                         broken = true;
                         continue;
                     }
-                    Event::Snapshot(TopicData::Bars(b)) => b,
+                    Event::Reconnecting => {
+                        broken = true;
+                        away.get_or_insert_with(Instant::now);
+                        continue;
+                    }
+                    Event::Snapshot(TopicData::Bars(b)) => {
+                        away = None;
+                        b
+                    }
                     // A `Closed` bar carries the bar's final values; merging it into the forming
                     // bar the worker holds gives the same bar (the server's forming bars are
                     // full states, never partial ones).
@@ -677,13 +706,48 @@ async fn live_bridge(client: Client, key: MarketKey, tf: Timeframe, mut sub: Sub
                     Err(e) => {
                         tracing::debug!("terminal server, backfilling {key}: {e}; retrying in {wait:?}");
                         pending = union(pending, range);
-                        retry_at = Some(tokio::time::Instant::now() + wait);
+                        retry_at = Some(Instant::now() + wait);
                         wait = (wait * 2).min(Duration::from_secs(30));
                     }
                 }
             }
-            _ = async { tokio::time::sleep_until(retry_at.expect("guarded")).await }, if retry_at.is_some() => {
+            _ = async { rt::sleep(retry_in.expect("guarded")).await }, if retry_in.is_some() => {
                 retry_at = None;
+            }
+            _ = async { rt::sleep(give_up_in.expect("guarded")).await }, if give_up_in.is_some() => {
+                tracing::debug!("terminal server still unreachable; ending the {key} {tf} feed");
+                return;
+            }
+            _ = tx.closed() => return,
+        }
+    }
+}
+
+/// A fallback's live bars for a market the server serves, passed on until a connection newer than
+/// `after` is up, one the chart didn't fall back on. Then the feed ends, so the worker reloads the
+/// chart from the server.
+async fn until_server_up(mut state: watch::Receiver<ConnState>, after: u64, mut feed: LiveFeed, tx: mpsc::Sender<Bar>) {
+    let newer = |s: &ConnState| matches!(s, ConnState::Up { connection, .. } if *connection > after);
+    if newer(&state.borrow_and_update()) {
+        return;
+    }
+    let mut watching = true;
+    loop {
+        tokio::select! {
+            b = feed.recv() => {
+                let Some(b) = b else { return };
+                if tx.send(b).await.is_err() {
+                    return;
+                }
+            }
+            changed = state.changed(), if watching => {
+                if changed.is_err() {
+                    watching = false;
+                    continue;
+                }
+                if newer(&state.borrow_and_update()) {
+                    return;
+                }
             }
             _ = tx.closed() => return,
         }
@@ -714,6 +778,11 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
                 Ok(_) => {}
                 Err(e) => self.note(symbol, &e),
             }
+            let connection = match self.client().state() {
+                ConnState::Up { connection, .. } => connection,
+                _ => 0,
+            };
+            self.fallbacks.lock().expect("fallbacks lock").insert(symbol.to_string(), connection);
         }
         self.served.lock().expect("served lock").remove(symbol);
         self.inner.history(symbol, tf, end, limit).await
@@ -746,7 +815,14 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
 
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
         if !self.served(symbol) {
-            return self.inner.live(symbol, tf);
+            let feed = self.inner.live(symbol, tf)?;
+            if !self.routed(symbol) {
+                return Some(feed);
+            }
+            let after = self.fallbacks.lock().expect("fallbacks lock").get(symbol).copied().unwrap_or(0);
+            let (tx, rx) = mpsc::channel(256);
+            rt::spawn(until_server_up(self.client().state.clone(), after, feed, tx));
+            return Some(rx);
         }
         let (tx, rx) = mpsc::channel(256);
         let client = self.client().clone();
@@ -860,13 +936,15 @@ mod tests {
     /// `Unavailable { Upstream }`, then nothing. Like the real one, it refuses an id that's still
     /// subscribed, and serves a fresh subscription.
     async fn older_gateway(listener: tokio::net::TcpListener) {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
         use tr_proto::{Limits, SessionId};
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let mut subscribed = HashSet::new();
         let mut gave_up = false;
         while let Some(Ok(m)) = ws.next().await {
-            let Message::Binary(b) = m else { continue };
+            let WsMessage::Binary(b) = m else { continue };
             let reply = match tr_proto::decode_binary::<ClientMsg>(&b).unwrap() {
                 ClientMsg::Hello { .. } => ServerMsg::Welcome {
                     version: PROTOCOL_VERSION,
@@ -897,7 +975,8 @@ mod tests {
                 }
                 _ => continue,
             };
-            ws.send(to_message(tr_proto::encode(&reply, Encoding::Postcard).unwrap())).await.unwrap();
+            let Frame::Binary(f) = tr_proto::encode(&reply, Encoding::Postcard).unwrap() else { unreachable!() };
+            ws.send(WsMessage::Binary(f.into())).await.unwrap();
         }
     }
 

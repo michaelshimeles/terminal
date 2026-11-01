@@ -17,7 +17,8 @@ On 2026-10-29 Micky approved starting on Hyperliquid's public API, because a nod
 - Hyperliquid closes the whole websocket when asked for a coin it doesn't list, with no error message [observed 2026-10-29]. The gateway only subscribes coins that have a live mid, and keeps the permanent mids on a connection of their own.
 - History comes from `candleSnapshot`, so it stops at the most recent 5000 bars per interval [doc: INFO]. For 1m bars that is about 3.5 days. Node-built candles (§5.3) lift the cap.
 - It makes read-only public calls only. No `exchange` endpoint, no user subscriptions, no orders.
-- The desktop opts in with `TR_SERVER_URL` (§4.6). Crypto keys such as `BTCUSD Curncy` then come from Hyperliquid core perps, and the order book pane names the source. Everything else is unchanged. The web build doesn't use the server yet.
+- The desktop opts in with `TR_SERVER_URL` (§4.6). Crypto keys such as `BTCUSD Curncy` then come from Hyperliquid core perps, and the order book pane names the source. Everything else is unchanged.
+- The web build uses the server for the same crypto markets. `scripts/build-web.sh` builds in `wss://terminal-gateway.style.dev/ws` unless `TR_SERVER_URL` says otherwise. While the server is unreachable, the page falls back to Binance and Coinbase as before.
 - It runs on one Freestyle VM (2 vCPU, 4 GiB) at `wss://terminal-gateway.style.dev/ws`, behind Freestyle's TLS edge. `deploy/freestyle/README.md` covers deploys, health checks and cost, which is about $80 a month above the free allowance.
 
 How facts are marked:
@@ -263,7 +264,7 @@ For comparison, the public `l2Book` feed is pushed "on each block that is at lea
 
 - **`tr-data::remote::RemoteMarkets`** implements `MarketData` over one shared connection. `history` maps to an RPC, `quotes` to a short-lived or shared `Quotes` subscription, and `live` to a `Bars` subscription bridged into the existing `mpsc::Receiver<Bar>`.
 - **Selection:** `TR_SERVER_URL` (or a settings toggle) picks `RemoteMarkets`. The direct providers stay as the offline and dev fallback (`TR_PROVIDER=sample` keeps working).
-- **Web build:** `for_browser()` switches to `RemoteMarkets`. This closes the `TODO(web proxy)` stubs in `crates/data/src/web.rs` and `crates/congress/src/db_web.rs`.
+- **Web build:** `for_browser()` puts `RemoteMarkets` in front of the browser's own sources when the page was built with a server URL (`TR_SERVER_URL`, read by `scripts/build-web.sh`; production uses `wss://terminal-gateway.style.dev/ws`). The client runs on the page's event loop over the browser's `WebSocket`, with postcard in binary frames like the desktop. `?server=ws://localhost:8787/ws` points a page at a server on the same machine, and `?server=off` turns the server off. Crypto is the only asset class the server serves so far, so the `TODO(web proxy)` stubs in `crates/data/src/web.rs` and `crates/congress/src/db_web.rs` stay until it serves the rest.
 
 ---
 
