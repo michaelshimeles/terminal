@@ -397,6 +397,7 @@ impl ChartState {
         prepended: usize,
         from_cache: bool,
         exhausted: bool,
+        full: bool,
         live: bool,
         w: &Worker,
     ) {
@@ -421,7 +422,7 @@ impl ChartState {
         self.bars = bars;
         self.gpu = Some(gpu);
         self.paging = false;
-        self.exhausted = exhausted || self.exhausted && prepended == 0;
+        self.exhausted = end_of_history(self.exhausted, exhausted, prepended, full);
         if !from_cache {
             self.loading = false;
         }
@@ -1435,9 +1436,25 @@ fn hover_card(ui: &Ui, at: Pos2, t: &Trade) {
     }
 }
 
+/// Whether the chart has reached the start of its history after a response. A full load decides
+/// it, since it may come from another source than the bars before it. A page decides it too. Live
+/// updates and refreshes keep what the chart knew.
+fn end_of_history(was: bool, exhausted: bool, prepended: usize, full: bool) -> bool {
+    if full { exhausted } else { exhausted || was && prepended == 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_load_from_a_new_source_can_page_again() {
+        assert!(!end_of_history(true, false, 0, true), "a reload from a source with more history");
+        assert!(end_of_history(false, true, 0, true));
+        assert!(end_of_history(true, false, 0, false), "a live update keeps the end");
+        assert!(!end_of_history(true, false, 5, false), "a page that added bars");
+        assert!(end_of_history(false, true, 0, false), "an empty page");
+    }
 
     #[test]
     fn glide_pans_linearly_and_zooms_evenly() {
