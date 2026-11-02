@@ -329,13 +329,17 @@ fn book_msg(coin: &str, bid: &str) -> Value {
     ]})
 }
 
-/// A book with `n` levels a side, best bid `top`, as Hyperliquid's default (`n` = 20) or fast
-/// (`n` = 5) feed sends it.
-fn deep_book(top: f64, n: usize, time: i64) -> Value {
+/// A book with `n` levels a side, best bid `top`, as Hyperliquid's default or fast feed sends it:
+/// only the fast feed's messages carry `"fast":true`.
+fn deep_book(top: f64, n: usize, time: i64, fast: bool) -> Value {
     let side = |sign: f64, start: f64| {
         (0..n).map(|i| json!({"px": format!("{}", start + sign * i as f64), "sz": "1", "n": 1})).collect::<Vec<_>>()
     };
-    json!({"coin": "BTC", "time": time, "levels": [side(-1.0, top), side(1.0, top + 1.0)]})
+    let mut b = json!({"coin": "BTC", "time": time, "levels": [side(-1.0, top), side(1.0, top + 1.0)]});
+    if fast {
+        b["fast"] = json!(true);
+    }
+    b
 }
 
 fn trade(tid: u64) -> Value {
@@ -388,12 +392,12 @@ async fn books_update_at_the_fast_feed_rate_with_full_depth() {
     s.mock
         .until("both l2Book feeds upstream", |m| m.subs().is_superset(&set(&["l2Book:BTC", "l2Book:BTC:fast"])))
         .await;
-    s.mock.push("l2Book:BTC", "l2Book", deep_book(100.0, 20, 1));
+    s.mock.push("l2Book:BTC", "l2Book", deep_book(100.0, 20, 1, false));
     let Event::Snapshot(TopicData::Book(book)) = next_data(&mut sub).await else { panic!("book snapshot") };
     assert_eq!((book.bids.len(), book.asks.len()), (20, 20));
     for i in 1..=5 {
         let top = 100.0 + i as f64;
-        s.mock.push("l2Book:BTC:fast", "l2Book", deep_book(top, 5, 1 + i));
+        s.mock.push("l2Book:BTC:fast", "l2Book", deep_book(top, 5, 1 + i, true));
         let Event::Delta(TopicDelta::Book(book)) = next_data(&mut sub).await else { panic!("book delta {i}") };
         assert_eq!(book.bids[0].px, top, "fast update {i} reaches the client");
         assert!(book.bids.len() > 5 && book.asks.len() > 5, "the default feed's deeper levels stay under it");
@@ -402,6 +406,27 @@ async fn books_update_at_the_fast_feed_rate_with_full_depth() {
     drop(sub);
     s.mock.until("both feeds unsubscribed", |m| m.count("unsubscribe l2Book:BTC:fast") == 1).await;
     assert_eq!(s.mock.count("unsubscribe l2Book:BTC"), 1);
+}
+
+/// A thin market's default book can be 5 levels a side, as thin as a fast one. It still replaces
+/// the default feed's deeper book, so levels that are gone from the market leave the client's.
+#[tokio::test]
+async fn a_default_book_as_thin_as_a_fast_one_replaces_the_deep_levels() {
+    let s = Setup::new(|_| {}).await;
+    let c = s.client(Encoding::Postcard);
+    let mut sub = c.subscribe(TopicReq::Book { key: MarketKey::new("BTC"), depth: 20, group: None });
+    s.mock
+        .until("both l2Book feeds upstream", |m| m.subs().is_superset(&set(&["l2Book:BTC", "l2Book:BTC:fast"])))
+        .await;
+    s.mock.push("l2Book:BTC", "l2Book", deep_book(100.0, 20, 1, false));
+    let Event::Snapshot(TopicData::Book(_)) = next_data(&mut sub).await else { panic!("book snapshot") };
+    s.mock.push("l2Book:BTC:fast", "l2Book", deep_book(100.0, 5, 2, true));
+    let Event::Delta(TopicDelta::Book(book)) = next_data(&mut sub).await else { panic!("fast delta") };
+    assert_eq!((book.bids.len(), book.asks.len()), (20, 20), "deep levels under the fast ones");
+    // The default feed now has 5 levels a side: the 15 deeper ones are gone.
+    s.mock.push("l2Book:BTC", "l2Book", deep_book(100.0, 5, 3, false));
+    let Event::Delta(TopicDelta::Book(book)) = next_data(&mut sub).await else { panic!("default delta") };
+    assert_eq!((book.bids.len(), book.asks.len()), (5, 5), "removed levels stay off the book");
 }
 
 #[tokio::test]

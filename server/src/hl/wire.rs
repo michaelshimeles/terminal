@@ -143,6 +143,9 @@ struct WsBook {
     coin: String,
     time: i64,
     levels: (Vec<WsLevel>, Vec<WsLevel>),
+    /// Set on the fast feed's messages; the default feed leaves it out.
+    #[serde(default)]
+    fast: bool,
 }
 
 #[derive(Deserialize)]
@@ -249,9 +252,9 @@ pub fn parse(text: &str) -> Result<Incoming, String> {
         }
         "l2Book" => {
             let b: WsBook = serde_json::from_str(data()?).map_err(err)?;
-            // A book message doesn't say which mode it is. Only a fast one stops at 5 levels a side;
-            // a book that thin in either mode lands on whichever is subscribed (see `Pool::handle`).
-            let fast = b.levels.0.len() <= FAST_BOOK_LEVELS && b.levels.1.len() <= FAST_BOOK_LEVELS;
+            // The fast feed marks its messages `"fast":true`. Depth can't tell the feeds apart: a
+            // thin market's default book is 5 levels a side or fewer too.
+            let fast = b.fast;
             let ev = UpstreamEvent::Book { bids: levels(b.levels.0), asks: levels(b.levels.1), time_ms: b.time };
             Incoming::Data(SubKey::L2Book { coin: b.coin, fast }, ev)
         }
@@ -350,6 +353,9 @@ mod tests {
             panic!("fast l2Book")
         };
         assert_eq!((coin.as_str(), bids.len(), asks.len()), ("BTC", FAST_BOOK_LEVELS, FAST_BOOK_LEVELS));
+        // A default book as thin as a fast one is still the default feed's: only the flag counts.
+        let thin = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[{"px":"1","sz":"1","n":1}],[{"px":"2","sz":"1","n":1}]]}}"#;
+        assert!(matches!(parse(thin).unwrap(), Incoming::Data(SubKey::L2Book { fast: false, .. }, _)));
 
         let Incoming::Data(SubKey::Trades { coin }, UpstreamEvent::Trades(t)) =
             parse(&fixture("trades_btc.json")).unwrap()
