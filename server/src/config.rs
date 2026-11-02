@@ -4,7 +4,9 @@ use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::http::HeaderName;
 
+use crate::access::Secret;
 use crate::hl::HlConfig;
 use crate::session::SessionConfig;
 use crate::store::HubConfig;
@@ -17,6 +19,12 @@ pub struct Config {
     pub hub: HubConfig,
     pub session: SessionConfig,
     pub max_clients: usize,
+    /// Client connections from one address (an IPv6 /64), or 0 for no cap.
+    pub max_clients_per_ip: usize,
+    /// The header the edge puts the client's address in. Without it, the peer's address counts.
+    pub client_ip_header: Option<HeaderName>,
+    /// When set, `/stats` and `/metrics` answer only requests that carry it as a bearer token.
+    pub metrics_token: Option<Secret>,
 }
 
 impl Default for Config {
@@ -27,6 +35,9 @@ impl Default for Config {
             hub: HubConfig::default(),
             session: SessionConfig::default(),
             max_clients: 1000,
+            max_clients_per_ip: 0,
+            client_ip_header: None,
+            metrics_token: None,
         }
     }
 }
@@ -79,6 +90,15 @@ impl Config {
         if let Some(n) = num("TR_MAX_CLIENTS")? {
             c.max_clients = n;
         }
+        if let Some(n) = num("TR_MAX_CLIENTS_PER_IP")? {
+            c.max_clients_per_ip = n;
+        }
+        if let Some(h) = var("TR_CLIENT_IP_HEADER") {
+            let name = HeaderName::try_from(h.as_str()).with_context(|| format!("TR_CLIENT_IP_HEADER={h}"))?;
+            c.client_ip_header = Some(name);
+        }
+        // Never echoed back, not even in an error.
+        c.metrics_token = var("TR_METRICS_TOKEN").map(|t| Secret::new(&t));
         Ok(c)
     }
 }
@@ -87,6 +107,7 @@ pub const HELP: &str = "\
 tr-gateway: the Terminal data server (interim: Hyperliquid's public feed)
 
 Serves websocket clients at /ws, plus /healthz, /readyz, /metrics and /stats.
+With TR_METRICS_TOKEN set, /metrics and /stats answer 404 without that bearer token.
 Plain HTTP only: put a TLS-terminating edge in front of it for wss:// on 443.
 
 Environment:
@@ -98,6 +119,10 @@ Environment:
   TR_REST_WEIGHT_PER_MIN        info endpoint weight a minute, at most 1100 (default 800)
   TR_LINGER_SECS                keep an unwatched market's streams this long (default 20)
   TR_MAX_CLIENTS                client connections (default 1000)
+  TR_MAX_CLIENTS_PER_IP         client connections from one address or IPv6 /64 (default 0: no cap)
+  TR_CLIENT_IP_HEADER           header holding the client address, e.g. x-forwarded-for (default:
+                                none, the peer address counts)
+  TR_METRICS_TOKEN              bearer token for /metrics and /stats (default: none, both public)
   TR_HL_WS_URL, TR_HL_INFO_URL  upstream endpoints (default Hyperliquid mainnet)
   RUST_LOG                      log filter (default info)
 ";
