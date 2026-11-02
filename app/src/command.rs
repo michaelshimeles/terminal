@@ -2,6 +2,8 @@
 //!
 //! Examples: `AAPL`, `AAPL US EQUITY <GO>`, `5`, `1W`, `RSI`, `SMA 50`, `ICHIMOKU`, `IND MOMENTUM`,
 //! `CMP MSFT`, `AAPL CONG`, `CONG`, `POL PELOSI`, `TRACK PELOSI`, `LAYOUT 4`, `FIB`, `HELP`.
+//! Hyperliquid HIP-3 perps go by their venue key (`xyz:AAPL`), and `AAPL PERP` opens the perp
+//! linked to a security.
 
 use tr_chart::drawings::Tool;
 use tr_chart::scene::ChartType;
@@ -275,6 +277,9 @@ pub enum Function {
     Trade(TradeArgs),
     /// Switch between the demo account and live accounts (`DEMO`, `MODE LIVE`); `true` = live.
     AccountMode(bool),
+    /// `AAPL PERP`: open the HIP-3 perp linked to a security. Alone, or on a perp, it switches
+    /// the focused pane between the two.
+    Perp,
 }
 
 fn num<T: std::str::FromStr>(t: Option<&&str>) -> Option<T> {
@@ -365,6 +370,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
             _ => return None,
         },
         "RANGE" => Function::Range(Range::parse(rest.first()?)?),
+        "PERP" if rest.is_empty() => Function::Perp,
         // Timeframes win where spellings overlap (`1D`, `1M`); otherwise try a range (`5D`, `YTD`),
         // then the indicator catalog (`RSI`, `BB 20 2.5`).
         _ => {
@@ -418,9 +424,20 @@ pub fn hint(input: &str) -> String {
     match parse(input) {
         None if input.trim().is_empty() => "Type a ticker and press <GO> (Enter).  HELP for functions.".into(),
         None => "Unrecognised command".into(),
-        Some(Command::Symbol(s)) => match Security::parse(&s).and_then(|x| x.name()) {
-            Some(name) => format!("Load {s} — {name}"),
-            None => format!("Load {s}"),
+        Some(Command::Symbol(s)) => {
+            let badge = tr_core::perps::is_perp(&s).then(|| tr_core::perps::badge(&s));
+            match (Security::parse(&s).and_then(|x| x.name()), badge) {
+                (Some(name), Some(b)) => format!("Load {s} — {name} · {b}"),
+                (None, Some(b)) => format!("Load {s} · {b}"),
+                (Some(name), None) => format!("Load {s} — {name}"),
+                (None, None) => format!("Load {s}"),
+            }
+        }
+        Some(Command::SymbolFunction(s, Function::Perp)) => match tr_core::perps::counterpart(&s) {
+            Some(other) if tr_core::perps::is_perp(&s) => format!("{s}: switch to {other}"),
+            Some(perp) => format!("{s}: open its HIP-3 perp {perp} ({})", tr_core::perps::badge(perp)),
+            None if tr_core::perps::is_perp(&s) => format!("{s}: no listed instrument is linked to it"),
+            None => format!("{s}: no HIP-3 perp is linked to it"),
         },
         Some(Command::SymbolFunction(s, f)) => format!("{s}: {}", describe(&f)),
         Some(Command::Function(f)) => describe(&f),
@@ -534,6 +551,7 @@ fn describe(f: &Function) -> String {
         }
         Function::AccountMode(false) => "Switch to the DEMO account (paper trading)".into(),
         Function::AccountMode(true) => "Switch to LIVE brokerage accounts (asks first)".into(),
+        Function::Perp => "Switch between the security and its HIP-3 perp (PERP · HL xyz)".into(),
     }
 }
 
@@ -711,6 +729,30 @@ mod tests {
             Some(Command::SymbolFunction("AAPL US Equity".into(), Function::Timeframe(Timeframe::W1)))
         );
         assert_eq!(parse("AAPL WHATEVER"), None);
+    }
+
+    #[test]
+    fn hip3_perps() {
+        let sym = |s: &str| Some(Command::Symbol(s.into()));
+        assert_eq!(parse("xyz:aapl"), sym("xyz:AAPL"));
+        assert_eq!(parse("XYZ:AAPL <GO>"), sym("xyz:AAPL"));
+        assert_eq!(parse("aapl"), sym("AAPL US Equity"), "a ticker is still the listed stock");
+        assert_eq!(
+            parse("xyz:AAPL 5"),
+            Some(Command::SymbolFunction("xyz:AAPL".into(), Function::Timeframe(Timeframe::M5)))
+        );
+        assert_eq!(parse("xyz:GOLD OB"), Some(Command::SymbolFunction("xyz:GOLD".into(), Function::OrderBook(None))));
+        // `PERP` after a security asks for its perp; alone it switches the focused pane.
+        let perp = |s: &str| Some(Command::SymbolFunction(s.into(), Function::Perp));
+        assert_eq!(parse("AAPL PERP"), perp("AAPL US Equity"));
+        assert_eq!(parse("aapl <equity> perp"), perp("AAPL US Equity"));
+        assert_eq!(parse("EURUSD CRNCY PERP"), perp("EURUSD Curncy"));
+        assert_eq!(parse("PERP"), Some(Command::Function(Function::Perp)));
+        assert_eq!(hint("xyz:aapl"), "Load xyz:AAPL — Apple Inc perp · PERP · HL xyz");
+        assert_eq!(hint("xyz:SKHX"), "Load xyz:SKHX · PERP · HL xyz");
+        assert_eq!(hint("AAPL PERP"), "AAPL US Equity: open its HIP-3 perp xyz:AAPL (PERP · HL xyz)");
+        assert_eq!(hint("xyz:AAPL PERP"), "xyz:AAPL: switch to AAPL US Equity");
+        assert_eq!(hint("NDX INDEX PERP"), "NDX Index: no HIP-3 perp is linked to it");
     }
 
     #[test]

@@ -141,6 +141,12 @@ pub fn accent_wash() -> Color32 {
     Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), if palette().dark { 70 } else { 45 })
 }
 
+/// HIP-3 perp badges and labels: a colour no listed instrument uses, so a perp never reads as
+/// the stock, future or FX rate it references.
+pub fn perp() -> Color32 {
+    if palette().dark { Color32::from_rgb(196, 150, 255) } else { Color32::from_rgb(118, 64, 196) }
+}
+
 pub fn dem() -> Color32 {
     if palette().dark { Color32::from_rgb(64, 156, 255) } else { Color32::from_rgb(0, 102, 214) }
 }

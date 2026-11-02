@@ -1,11 +1,12 @@
 //! Securities across asset classes, addressed with Bloomberg-style market keys:
 //! `AAPL US Equity`, `SPX Index`, `BTCUSD Curncy`, `EURUSD Curncy`, `US10Y Govt`, `CL1 Comdty`.
+//! Hyperliquid HIP-3 perps keep the venue's own name, `xyz:AAPL` (see [`crate::perps`]).
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog;
+use crate::{catalog, perps};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AssetClass {
@@ -16,6 +17,8 @@ pub enum AssetClass {
     Crypto,
     Govt,
     Cmdty,
+    /// A Hyperliquid HIP-3 perpetual (`xyz:AAPL`): its own instrument, never the listed one.
+    Perp,
 }
 
 /// The Bloomberg "yellow key" a security lives under.
@@ -26,11 +29,14 @@ pub enum YellowKey {
     Curncy,
     Govt,
     Comdty,
+    /// HIP-3 perps, which Bloomberg has no key for. Nothing typed parses to it: a perp is named
+    /// by its venue key (`xyz:AAPL`), and `PERP` after a security is a function.
+    Perp,
 }
 
 impl YellowKey {
-    pub const ALL: [YellowKey; 5] =
-        [YellowKey::Equity, YellowKey::Index, YellowKey::Curncy, YellowKey::Govt, YellowKey::Comdty];
+    pub const ALL: [YellowKey; 6] =
+        [YellowKey::Equity, YellowKey::Index, YellowKey::Curncy, YellowKey::Govt, YellowKey::Comdty, YellowKey::Perp];
 
     /// Accepts `<CRNCY>`, `CURNCY`, `crncy`, `CMDTY`, `COMDTY`, `GOVT`, `INDEX`, `EQUITY`, `EQ`, `ETF`.
     pub fn parse(s: &str) -> Option<Self> {
@@ -52,6 +58,7 @@ impl YellowKey {
             YellowKey::Curncy => "Curncy",
             YellowKey::Govt => "Govt",
             YellowKey::Comdty => "Comdty",
+            YellowKey::Perp => "Perp",
         }
     }
 }
@@ -64,6 +71,7 @@ impl AssetClass {
             AssetClass::Fx | AssetClass::Crypto => YellowKey::Curncy,
             AssetClass::Govt => YellowKey::Govt,
             AssetClass::Cmdty => YellowKey::Comdty,
+            AssetClass::Perp => YellowKey::Perp,
         }
     }
 
@@ -76,6 +84,7 @@ impl AssetClass {
             AssetClass::Crypto => "Crypto",
             AssetClass::Govt => "Govt",
             AssetClass::Cmdty => "Comdty",
+            AssetClass::Perp => "Perp",
         }
     }
 
@@ -87,13 +96,14 @@ impl AssetClass {
             AssetClass::Fx => 0.08,
             AssetClass::Crypto => 0.60,
             AssetClass::Govt => 0.20,
-            AssetClass::Cmdty => 0.30,
+            AssetClass::Cmdty | AssetClass::Perp => 0.30,
         }
     }
 
-    /// Exchanges trade crypto around the clock; everything else has sessions.
+    /// Exchanges trade crypto around the clock, and HIP-3 perps too (even while the market they
+    /// reference is closed); everything else has sessions.
     pub fn trades_24_7(self) -> bool {
-        self == AssetClass::Crypto
+        matches!(self, AssetClass::Crypto | AssetClass::Perp)
     }
 }
 
@@ -122,9 +132,15 @@ impl Security {
         Self::new(ticker, AssetClass::Equity)
     }
 
-    /// Canonical market key, e.g. `AAPL US Equity`, `BTCUSD Curncy`.
+    /// A HIP-3 perp from its venue key in any case (`XYZ:aapl` is `xyz:AAPL`).
+    pub fn perp(key: &str) -> Option<Self> {
+        Some(Self { ticker: perps::normalize(key)?, class: AssetClass::Perp })
+    }
+
+    /// Canonical market key, e.g. `AAPL US Equity`, `BTCUSD Curncy`, `xyz:AAPL`.
     pub fn key(&self) -> String {
         match self.class {
+            AssetClass::Perp => self.ticker.clone(),
             AssetClass::Equity | AssetClass::Etf => format!("{} US Equity", self.ticker),
             c => format!("{} {}", self.ticker, c.yellow_key().label()),
         }
@@ -134,6 +150,9 @@ impl Security {
     /// Returns the security and how many input tokens it consumed.
     pub fn resolve_tokens(tokens: &[&str]) -> Option<(Self, usize)> {
         let (&head, rest) = tokens.split_first()?;
+        if let Some(perp) = Self::perp(head) {
+            return Some((perp, 1));
+        }
         // `BTC/USD` is a pair; `BRK/B` is a share class.
         let up = head.trim().to_ascii_uppercase();
         let ticker = match up.split_once('/') {
@@ -187,7 +206,7 @@ impl Security {
                     AssetClass::Crypto
                 }
             }
-            Some(YellowKey::Equity) => AssetClass::Equity,
+            Some(YellowKey::Equity) | Some(YellowKey::Perp) => AssetClass::Equity,
             None if ticker.len() == 6 && is_fiat(&ticker[..3]) && is_fiat(&ticker[3..]) => AssetClass::Fx,
             None => AssetClass::Equity,
         };
@@ -196,6 +215,9 @@ impl Security {
 
     /// Display name from the catalog, if known.
     pub fn name(&self) -> Option<&'static str> {
+        if self.class == AssetClass::Perp {
+            return perps::link_for(&self.ticker).map(|l| l.name);
+        }
         catalog::lookup(&self.ticker, Some(self.class.yellow_key())).filter(|l| l.class == self.class).map(|l| l.name)
     }
 
@@ -218,6 +240,10 @@ impl Security {
             AssetClass::Govt => 3,
             AssetClass::Fx if self.ticker.ends_with("JPY") => 3,
             AssetClass::Fx => 4,
+            // Hyperliquid quotes five significant figures, at most six decimals.
+            AssetClass::Perp if price.is_finite() && price != 0.0 => {
+                (4 - price.abs().log10().floor() as i64).clamp(0, 6) as usize
+            }
             _ => match price.abs() {
                 p if p >= 1000.0 => 2,
                 p if p >= 1.0 => 2,
@@ -289,6 +315,27 @@ mod tests {
         assert_eq!(Security::resolve_tokens(&t).unwrap().1, 1);
         let t = ["AAPL", "US", "CONG"];
         assert_eq!(Security::resolve_tokens(&t).unwrap().1, 1);
+    }
+
+    #[test]
+    fn hip3_perps_are_their_own_instruments() {
+        let p = r("xyz:AAPL");
+        assert_eq!(p, Security { ticker: "xyz:AAPL".into(), class: AssetClass::Perp });
+        assert_eq!(r("XYZ:aapl"), p, "any case");
+        assert_eq!(p.key(), "xyz:AAPL");
+        assert_eq!(r("AAPL"), Security::new("AAPL", AssetClass::Equity), "AAPL stays the listed stock");
+        assert_eq!(r("AAPL US Equity").key(), "AAPL US Equity");
+        assert_eq!(Security::resolve_tokens(&["xyz:AAPL", "5"]).unwrap().1, 1);
+        assert_eq!(p.name(), Some("Apple Inc perp"));
+        assert_eq!(r("xyz:SKHX").name(), None, "unlinked perps have no catalog name");
+        assert_eq!((p.class.label(), p.class.yellow_key().label()), ("Perp", "Perp"));
+        assert!(p.class.trades_24_7() && !p.has_congress_trades() && p.pair().is_none());
+        // Prices show the five significant figures Hyperliquid quotes.
+        assert_eq!(r("xyz:EUR").decimals(1.1208), 4);
+        assert_eq!(r("xyz:JPY").decimals(157.74), 2);
+        assert_eq!(r("xyz:GOLD").decimals(3958.05), 1);
+        assert_eq!(r("xyz:XYZ100").decimals(28390.5), 0);
+        assert_eq!(r("para:ANSEM").decimals(0.041887), 6);
     }
 
     #[test]

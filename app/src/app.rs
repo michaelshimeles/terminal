@@ -155,18 +155,29 @@ pub struct BookPane {
     pub book: Option<OrderBook>,
     pub error: Option<String>,
     pub fetched: Option<Instant>,
+    /// The latest trades, oldest first, when the book comes from the Terminal server.
+    pub trades: Vec<tr_data::TradePrint>,
 }
 
 impl BookPane {
     pub fn new(symbol: &str, depth: usize, group: f64) -> Self {
-        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None }
+        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None, trades: Vec::new() }
+    }
+
+    /// Whether the book came through the Terminal server, which also has the market's trades.
+    pub fn served_by_server(&self) -> bool {
+        self.book.as_ref().is_some_and(|b| b.source.ends_with("Terminal server"))
     }
 }
 
 impl PaneKind {
     /// Short tab title.
     fn tab_title(&self) -> String {
-        let short = |s: &str| tr_data::security(s).ticker;
+        // A perp's tab says so: `xyz:AAPL PERP`.
+        let short = |s: &str| {
+            let sec = tr_data::security(s);
+            if sec.class == tr_core::AssetClass::Perp { format!("{} PERP", sec.ticker) } else { sec.ticker }
+        };
         match self {
             PaneKind::Chart(c) => short(&c.symbol),
             PaneKind::Feed { .. } => "Congress".into(),
@@ -464,6 +475,10 @@ pub struct TerminalApp {
     wei_updated: Option<String>,
     /// Latest network search results and the query they answer.
     net_hits: (String, Vec<SearchHit>),
+    /// HIP-3 perps the Terminal server lists as live (`None` until it has answered once), and
+    /// when they were last asked for.
+    live_perps: Option<Vec<String>>,
+    last_perps: Option<(Instant, bool)>,
     /// Query typed in the command line awaiting a debounced network search.
     search_pending: Option<(String, Instant)>,
     suggestion: Option<usize>,
@@ -519,6 +534,19 @@ pub struct TerminalApp {
 }
 
 /// Resolve a run of words (`BTCUSD CRNCY AAPL US EQUITY MSFT`) into market keys.
+/// Lay fresh quotes over the ones shown, and return the keys that got one. A perp that was
+/// asked for and left out has no other source, so its old quote goes rather than pass for current.
+fn merge_quotes(shown: &mut HashMap<String, Quote>, asked: &[String], quotes: Vec<Quote>) -> Vec<String> {
+    let keys: Vec<String> = quotes.iter().map(|q| q.symbol.clone()).collect();
+    for gone in asked.iter().filter(|k| tr_data::is_perp(k) && !keys.contains(k)) {
+        shown.remove(gone);
+    }
+    for q in quotes {
+        shown.insert(q.symbol.clone(), q);
+    }
+    keys
+}
+
 fn keys_from_words(words: &[String]) -> Vec<String> {
     let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
     let mut out = Vec::new();
@@ -612,6 +640,8 @@ impl TerminalApp {
             last_curve: None,
             wei_updated: None,
             net_hits: (String::new(), Vec::new()),
+            live_perps: None,
+            last_perps: None,
             search_pending: None,
             suggestion: None,
             cmd: String::new(),
@@ -778,6 +808,7 @@ impl TerminalApp {
                 self.status = format!("{s}: option chain");
             }
             Command::SymbolFunction(s, Function::Portfolio(view, arg)) => self.portfolio_command(view, &arg, Some(s)),
+            Command::SymbolFunction(s, Function::Perp) => self.open_perp(Some(s)),
             Command::SymbolFunction(s, Function::Trade(mut t)) => {
                 t.symbol = Some(s);
                 self.open_ticket(t, None);
@@ -932,6 +963,10 @@ impl TerminalApp {
                 }
                 self.set_account_mode(mode, false);
             }
+            Function::Perp => {
+                let key = symbol.or_else(|| self.focused_symbol());
+                self.open_perp(key);
+            }
         }
     }
 
@@ -993,14 +1028,11 @@ impl TerminalApp {
                         c.on_markers(&symbol, trades);
                     }
                 }
-                Response::Quotes(q) => {
-                    if q.len() > 20 {
+                Response::Quotes { asked, quotes } => {
+                    if quotes.len() > 20 {
                         self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
                     }
-                    let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
-                    for x in q {
-                        self.quotes.insert(x.symbol.clone(), x);
-                    }
+                    let keys = merge_quotes(&mut self.quotes, &asked, quotes);
                     self.demo_on_quotes(&keys);
                 }
                 Response::Latest(t) => self.latest = t,
@@ -1067,6 +1099,15 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::Trades { pane, symbol, trades } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::OrderBook(b) = &mut p.kind
+                        && b.symbol == symbol
+                    {
+                        // A failed fetch clears the list rather than leave old trades up.
+                        b.trades = trades.unwrap_or_default();
+                    }
+                }
                 Response::Portfolio(result) => {
                     let result = self.keep_simulated_trades(result);
                     self.on_portfolio(result)
@@ -1086,6 +1127,17 @@ impl TerminalApp {
                 Response::Status(s) => self.status = s,
                 Response::Curves(c) => self.curves = Some(c),
                 Response::SearchHits { query, hits } => self.net_hits = (query, hits),
+                Response::PerpMarkets(result) => {
+                    let ok = result.is_ok();
+                    match result {
+                        Ok(perps) => self.live_perps = Some(perps),
+                        // Keep what the server said last; links to perps it listed stay usable.
+                        Err(e) => tracing::debug!("live perps: {e}"),
+                    }
+                    if let Some((_, answered)) = &mut self.last_perps {
+                        *answered = ok;
+                    }
+                }
                 Response::Trade(r) => self.on_trade(*r),
                 Response::CongressRefreshed(summary) => {
                     self.congress_status = summary.to_string();
@@ -1289,6 +1341,8 @@ impl TerminalApp {
             | A::ResetView
             | A::LogScale
             | A::Magnet => self.focused_is_chart(),
+            // Otherwise ⇧P types a P into the command line.
+            A::TogglePerp => self.focused_symbol().is_some_and(|s| self.switch_target(&s).is_some()),
             a => a.layout_slot().is_none_or(|i| i < self.layout_names.len()),
         }
     }
@@ -1308,6 +1362,7 @@ impl TerminalApp {
             A::Orders => self.apply(Function::Portfolio(command::PortView::Orders, String::new())),
             A::Buy => self.quick_trade(true),
             A::Sell => self.quick_trade(false),
+            A::TogglePerp => self.apply(Function::Perp),
             A::NextPane => self.cycle_focus(1),
             A::PrevPane => self.cycle_focus(-1),
             A::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
@@ -1359,6 +1414,12 @@ impl TerminalApp {
             self.worker.send(Request::Quotes(markets_view::overview_keys()));
             self.last_wei = Some(Instant::now());
         }
+        // Which perps are live: every 5 minutes, or every minute while the server isn't answering.
+        let every = |ok: bool| Duration::from_secs(if ok { 300 } else { 60 });
+        if self.last_perps.is_none_or(|(t, ok)| t.elapsed() > every(ok)) {
+            self.worker.send(Request::PerpMarkets);
+            self.last_perps = Some((Instant::now(), self.last_perps.is_none_or(|(_, ok)| ok)));
+        }
         if shown(&|k| matches!(k, PaneKind::Curve))
             && self.last_curve.is_none_or(|t| t.elapsed() > Duration::from_secs(600))
         {
@@ -1384,6 +1445,9 @@ impl TerminalApp {
                 PaneKind::OrderBook(b) if b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) => {
                     b.fetched = Some(Instant::now());
                     self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
+                    if b.served_by_server() {
+                        self.worker.send(Request::Trades { pane: p.id, symbol: b.symbol.clone() });
+                    }
                 }
                 _ => {}
             }
@@ -1624,6 +1688,25 @@ mod tests {
         let new: Settings = serde_json::from_str(r#"{"watchlist":[],"active_layout":"Desk"}"#).unwrap();
         assert!(migrate_legacy(&new, &prefs::PanelDefaults::default()).is_none());
         assert_eq!(new.active_layout.as_deref(), Some("Desk"));
+    }
+
+    /// When the server can't quote a perp, the watchlist drops its old price instead of showing
+    /// it as current. Listed instruments keep theirs, as before.
+    #[test]
+    fn perps_left_out_of_an_answer_lose_their_old_quote() {
+        let q = |s: &str, last: f64| Quote { symbol: s.into(), last, prev_close: last, ts: 0, spark: vec![] };
+        let mut shown: HashMap<String, Quote> =
+            [q("xyz:AAPL", 336.0), q("xyz:GOLD", 3958.0), q("AAPL US Equity", 336.5)]
+                .map(|x| (x.symbol.clone(), x))
+                .into();
+        let asked: Vec<String> = ["xyz:AAPL", "xyz:GOLD", "AAPL US Equity"].map(String::from).to_vec();
+        let got = merge_quotes(&mut shown, &asked, vec![q("xyz:GOLD", 3960.0)]);
+        assert_eq!(got, ["xyz:GOLD"]);
+        assert!(!shown.contains_key("xyz:AAPL"), "the perp the server didn't quote");
+        assert_eq!(shown["xyz:GOLD"].last, 3960.0);
+        assert_eq!(shown["AAPL US Equity"].last, 336.5, "a listed instrument keeps its last quote");
+        merge_quotes(&mut shown, &["xyz:SP500".into()], vec![]);
+        assert!(shown.contains_key("xyz:GOLD"), "a perp nobody asked about this time stays");
     }
 
     #[test]

@@ -412,7 +412,7 @@ pub fn yahoo_symbol(sec: &Security) -> String {
             Some((b, q)) => format!("{b}-{}", if q == "USDT" { "USD" } else { q }),
             None => sec.ticker.clone(),
         },
-        AssetClass::Govt | AssetClass::Cmdty => sec.ticker.clone(),
+        AssetClass::Govt | AssetClass::Cmdty | AssetClass::Perp => sec.ticker.clone(),
     }
 }
 

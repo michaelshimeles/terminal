@@ -319,6 +319,54 @@ impl TerminalApp {
         })
     }
 
+    /// HIP-3 perps search can offer: those the server lists as live, or the linked ones until it
+    /// has answered.
+    pub(super) fn perp_candidates(&self) -> Vec<&str> {
+        match &self.live_perps {
+            Some(v) => v.iter().map(String::as_str).collect(),
+            None => tr_core::perps::LINKS.iter().map(|l| l.coin).collect(),
+        }
+    }
+
+    /// Whether the Terminal server lists the HIP-3 perp `coin` as live.
+    pub(super) fn perp_is_live(&self, coin: &str) -> bool {
+        self.live_perps.as_ref().is_some_and(|v| v.iter().any(|x| x == coin))
+    }
+
+    /// Where a pane on `key` can switch to: a perp's linked instrument, or an instrument's live
+    /// perp. Links to perps show only once the server has listed them live.
+    pub(super) fn switch_target(&self, key: &str) -> Option<&'static str> {
+        tr_core::perps::switch_target(key, |c| self.perp_is_live(c))
+    }
+
+    /// `PERP`: from a security to its HIP-3 perp, or from a perp back to its security.
+    pub(super) fn open_perp(&mut self, key: Option<String>) {
+        use tr_core::perps;
+        let Some(key) = key.map(|k| tr_data::security(&k).key()) else {
+            self.status = "PERP needs a security, for example AAPL PERP".into();
+            return;
+        };
+        if perps::is_perp(&key) {
+            match perps::link_for(&key) {
+                Some(l) => self.open_security(l.underlying),
+                None => self.status = format!("{key} is a HIP-3 perp; no listed instrument is linked to it"),
+            }
+            return;
+        }
+        let Some(l) = perps::perp_for(&key) else {
+            self.status = format!("No HIP-3 perp is linked to {key}");
+            return;
+        };
+        // Until the server has answered, try anyway: the pane says why if it can't load.
+        if self.live_perps.is_some() && !self.perp_is_live(l.coin) {
+            self.status = format!("{} isn't live on the Terminal server right now", l.coin);
+            return;
+        }
+        self.open_security(l.coin);
+        self.status =
+            format!("{} ({}) references {}. It is a perp, not {key}.", l.coin, perps::badge(l.coin), l.reference);
+    }
+
     /// The focused security if it has listed options (US equity, ETF, index), else AAPL.
     pub(super) fn optionable_symbol(&self) -> String {
         use tr_core::AssetClass as C;

@@ -3,7 +3,8 @@
 //! A page can only read sources that allow cross-origin requests. Binance and Coinbase do,
 //! so crypto is live: REST history, quotes and order books, and websocket bars. Yahoo,
 //! Treasury.gov, Alpaca and CoinDesk do not, so every other asset class comes from the
-//! sample generator and there are no headlines or network search.
+//! sample generator and there are no headlines or network search. HIP-3 perps come only from
+//! the Terminal server, so here they have no data at all.
 //!
 //! When the page has a Terminal server ([`server_url`]), [`crate::for_browser`] puts
 //! [`crate::remote::RemoteMarkets`] in front of these, so crypto comes from the server and
@@ -18,7 +19,7 @@ use tr_core::{AssetClass, Bar, Timeframe};
 
 use crate::crypto::CryptoProvider;
 use crate::sample::SampleProvider;
-use crate::{LiveFeed, MarketData, OrderBook, Quote, YieldCurves, security};
+use crate::{LiveFeed, MarketData, OrderBook, Quote, YieldCurves, is_perp, perp_needs_server, security};
 
 pub struct WebMarkets {
     crypto: CryptoProvider,
@@ -74,6 +75,9 @@ impl MarketData for WebMarkets {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if is_perp(symbol) {
+            return Err(perp_needs_server(symbol));
+        }
         if is_crypto(symbol) {
             self.crypto.history(&security(symbol), tf, end, limit).await
         } else {
@@ -82,7 +86,8 @@ impl MarketData for WebMarkets {
     }
 
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
-        let (crypto, other): (Vec<String>, Vec<String>) = symbols.iter().cloned().partition(|s| is_crypto(s));
+        let listed = symbols.iter().filter(|s| !is_perp(s)).cloned();
+        let (crypto, other): (Vec<String>, Vec<String>) = listed.partition(|s| is_crypto(s));
         let mut out = self.sample.quotes(&other).await?;
         if !crypto.is_empty() {
             let secs: Vec<_> = crypto.iter().map(|k| (k.clone(), security(k))).collect();
@@ -128,6 +133,15 @@ mod tests {
         assert!(m.order_book("AAPL US Equity", 10).await.is_err());
         assert_eq!(m.yield_curves().await.unwrap().current.points.len(), 11);
         assert!(is_crypto("BTCUSD Curncy") && !is_crypto("US10Y Govt"));
+    }
+
+    #[tokio::test]
+    async fn perps_need_the_server() {
+        let m = WebMarkets::new().unwrap();
+        assert!(m.history("xyz:AAPL", Timeframe::D1, None, 50).await.is_err());
+        assert!(m.order_book("xyz:AAPL", 10).await.is_err());
+        let q = m.quotes(&["xyz:AAPL".into(), "AAPL US Equity".into()]).await.unwrap();
+        assert_eq!(q.iter().map(|q| q.symbol.as_str()).collect::<Vec<_>>(), ["AAPL US Equity"]);
     }
 
     #[test]

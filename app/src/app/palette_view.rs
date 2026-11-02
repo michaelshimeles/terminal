@@ -37,6 +37,7 @@ const COMMANDS: &[(&str, &str, &str, Option<Action>)] = &[
     ("WL", "", "watchlist monitor", Some(Action::Watchlist)),
     ("N", "", "news headlines", None),
     ("OB", "", "order book depth dom", None),
+    ("PERP", "", "hip-3 perpetual hyperliquid xyz perps stock perp", Some(Action::TogglePerp)),
     ("WEI", "", "world equity indices markets", None),
     ("GC", "", "yield curve treasury rates", None),
     ("SECF", "Security search", "search find", None),
@@ -217,6 +218,19 @@ fn indicator_items(active: &[IndicatorSpec]) -> Vec<Item> {
 }
 
 fn ticker_item(key: &str) -> Item {
+    use tr_core::perps;
+    if perps::is_perp(key) {
+        // A perp's row says it is one, and finds it by the underlying's ticker and name too.
+        let link = perps::link_for(key);
+        let badge = perps::badge(key);
+        let sub = match link {
+            Some(l) => format!("{} · {badge}", l.name),
+            None => badge.clone(),
+        };
+        let under = link.and_then(|l| tr_core::Security::parse(l.underlying)).map(|s| s.ticker).unwrap_or_default();
+        let words = format!("{under} {} perp perpetual hyperliquid hip-3 {}", link.map_or("", |l| l.name), badge);
+        return Item::new(Kind::Ticker, key, sub, Target::Run(key.into())).keywords(words);
+    }
     let name = tr_core::Security::parse(key).and_then(|s| s.name()).unwrap_or("");
     Item::new(
         Kind::Ticker,
@@ -277,6 +291,9 @@ impl TerminalApp {
         if !q.is_empty() {
             for l in tr_core::catalog::search(q, 12) {
                 v.push(ticker_item(&l.key()));
+            }
+            for key in tr_core::perps::search(q, self.perp_candidates(), 8) {
+                v.push(ticker_item(key));
             }
             // Whatever the command line would do with the query, offered as-is.
             match command::parse(q) {
@@ -652,6 +669,23 @@ mod tests {
         assert!(b.contains(&"Open Brokerage settings".to_string()) && b.contains(&"Settings › Brokerage".to_string()));
         let b = best2("yield curve");
         assert!(b.contains(&"GC".to_string()), "{b:?}");
+    }
+
+    /// A perp's row is labelled as one and found by its underlying, after the listed stock.
+    #[test]
+    fn perp_rows_say_what_they_are() {
+        let perp = ticker_item("xyz:AAPL");
+        assert_eq!((perp.title.as_str(), perp.subtitle.as_str()), ("xyz:AAPL", "Apple Inc perp · PERP · HL xyz"));
+        assert_eq!(perp.target, Target::Run("xyz:AAPL".into()));
+        assert_eq!(command::parse("xyz:AAPL"), Some(command::Command::Symbol("xyz:AAPL".into())));
+        assert_eq!(ticker_item("xyz:SKHX").subtitle, "PERP · HL xyz");
+        let items = vec![ticker_item("AAPL US Equity"), perp];
+        let titles = |q: &str| rank(&items, &[], q).into_iter().map(|i| i.title).collect::<Vec<_>>();
+        assert_eq!(titles("aapl"), ["AAPL US Equity", "xyz:AAPL"], "the listed stock first");
+        assert_eq!(titles("apple perp"), ["xyz:AAPL"]);
+        assert_eq!(titles("hyperliquid"), ["xyz:AAPL"]);
+        let perp_cmd = static_items().into_iter().find(|i| i.title == "PERP").expect("PERP is offered");
+        assert_eq!(perp_cmd.hotkey, Some(Action::TogglePerp));
     }
 
     #[test]

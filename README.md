@@ -84,6 +84,11 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
   | US Treasuries | Treasury.gov daily par yield curve CSV (FRED fallback); Yahoo `^IRX/^FVX/^TNX/^TYX` intraday | Treasury.gov | — |
   | FX, indices, futures | Yahoo Finance (`EURUSD=X`, `^GSPC`, `CL=F`) | Yahoo spark (batched) | — |
   | Stocks, ETFs | Alpaca when `APCA_API_KEY_ID`/`APCA_API_SECRET_KEY` are set, else Yahoo | Yahoo spark | — |
+  | Hyperliquid HIP-3 perps (`xyz:AAPL`, `xyz:GOLD`, `xyz:EUR`) | The Terminal data server only (`TR_SERVER_URL`) | Server mids | Server candles, book and trades |
+
+  A HIP-3 perp is its own instrument, labelled `PERP · HL xyz` everywhere. `AAPL US Equity` stays the
+  listed stock. `AAPL PERP` opens the perp linked to it, and `PERP` or ⇧P switches back and forth.
+  A perp has no other source, so it never gets sample data; without the server it shows why.
 
   No keys are required. `TR_PROVIDER=sample` runs fully offline on deterministic, class-aware sample
   data (BTCUSD near 65,000, EURUSD near 1.09, US10Y near 4.2%) **with simulated live ticks**, and
@@ -227,6 +232,8 @@ What the browser build can and can't do yet:
   books and websocket bars all come from them. Yahoo, Treasury.gov, Alpaca and CoinDesk don't allow
   them, so every other market shows sample data and the toolbar says "Crypto live". A same-origin
   proxy can fix that later.
+- HIP-3 perps (`xyz:AAPL`) are live through the Terminal data server the page is built with. They
+  never fall back to sample data: while the server is unreachable they say so.
 - Congress disclosures, SnapTrade accounts and live order entry need the desktop app. The paper
   trading demo account works.
 - Layouts, settings, themes and the demo account are saved in `localStorage` under `terminal/`.

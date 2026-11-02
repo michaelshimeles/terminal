@@ -10,7 +10,7 @@ cargo run --release -p tr-gateway
 
 It listens on `localhost:8787`. Clients connect to `ws://localhost:8787/ws`. `/healthz` says the process is up, `/readyz` says the upstream is connected and every venue's mids have arrived, `/metrics` is Prometheus text and `/stats` is JSON.
 
-The desktop app uses it for crypto markets when `TR_SERVER_URL` is set:
+The desktop app uses it for crypto markets and Hyperliquid HIP-3 perps (`xyz:AAPL`) when `TR_SERVER_URL` is set. Perps have no other source, so without a server they don't load:
 
 ```sh
 TR_SERVER_URL=ws://localhost:8787 cargo run --release
@@ -58,5 +58,7 @@ Per IP, Hyperliquid allows 10 websocket connections, 30 new connections a minute
 - The gateway subscribes every dex's mids for good, on a connection of their own.
 - It subscribes a market's book, trades and candles only while some client watches it, and drops them `TR_LINGER_SECS` after the last one leaves.
 - Hyperliquid closes the whole connection when asked for a coin it doesn't list, so the gateway only subscribes coins that have a live mid.
+- Hyperliquid keeps publishing mids for delisted markets. The gateway reads `isDelisted` from each dex's `meta` and doesn't list, resolve or stream them; asking for one gets `Unavailable { UnknownMarket, "xyz:VIX is delisted" }`. A dex with nothing live gets no mids subscription.
+- HIP-3 markets go by their prefixed coin everywhere (`l2Book xyz:AAPL`, `candleSnapshot xyz:AAPL`) and share the budgets above. `cli markets xyz:` lists the live ones.
 - History comes from `candleSnapshot`, which serves only the most recent 5000 bars per interval.
 - It makes read-only public calls only: `info` requests and public websocket channels. No `exchange` endpoint, no user data, no orders.

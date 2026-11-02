@@ -1,5 +1,5 @@
 //! A client for the Terminal data server (`tr-gateway`), and [`RemoteMarkets`], which serves
-//! crypto markets through it (docs/architecture/server.md §4.6).
+//! crypto markets and Hyperliquid HIP-3 perps through it (docs/architecture/server.md §4.6).
 //!
 //! [`Client`] keeps one connection per server, shared by every subscription and request. It
 //! reconnects with backoff, resubscribes everything (each subscription then gets a fresh
@@ -17,13 +17,17 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 use tr_core::{AssetClass, Bar, Timeframe};
 use tr_proto::{
-    ApiError, BarDelta, ClientInfo, ClientMsg, Encoding, ErrorCode, Frame, MarketKey, PROTOCOL_VERSION, ReqId,
-    ResyncReason, Rpc, RpcResult, ServerMsg, SubId, TopicData, TopicDelta, TopicReq, TopicStatus, UnavailableReason,
+    ApiError, BarDelta, ClientInfo, ClientMsg, Encoding, ErrorCode, Frame, InstrumentKind, MarketKey, PROTOCOL_VERSION,
+    ReqId, ResyncReason, Rpc, RpcResult, ServerMsg, SubId, TopicData, TopicDelta, TopicReq, TopicStatus,
+    UnavailableReason,
 };
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ws::{Message, Socket};
-use crate::{LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, rt, security};
+use crate::{
+    LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, TradePrint, YieldCurves, is_perp, rt,
+    security,
+};
 
 /// What a subscription receives.
 #[derive(Debug, Clone, PartialEq)]
@@ -412,17 +416,48 @@ fn route(
 
 // ---- RemoteMarkets ----
 
-/// What the order book pane shows as the source of a book that came through the server.
+/// What the order book pane shows as the source of a core perp's book that came through the server.
 pub const BOOK_SOURCE: &str = "Hyperliquid perp · Terminal server";
+
+/// A server error for the user, saying it came from the Terminal server.
+fn server_error(e: &ApiError) -> anyhow::Error {
+    from_server(&e.message)
+}
+
+fn from_server(message: &str) -> anyhow::Error {
+    if message.contains("Terminal server") { anyhow!("{message}") } else { anyhow!("Terminal server: {message}") }
+}
+
+/// The source line for a book from the server: HIP-3 books name their dex.
+pub fn book_source(symbol: &str) -> String {
+    match tr_core::perps::venue(symbol) {
+        Some(dex) => format!("Hyperliquid {dex} perp · Terminal server"),
+        None => BOOK_SOURCE.into(),
+    }
+}
 
 struct BookFeed {
     latest: watch::Receiver<Option<Result<OrderBook, String>>>,
     used: Arc<Mutex<Instant>>,
 }
 
+/// Trades a tape subscription keeps for the pane.
+const TAPE_KEPT: usize = 100;
+
+/// What a book or tape says while the server is up but its own upstream is down. The last
+/// values are old by then, so the pane shows this instead, until fresh data arrives.
+const UPSTREAM_LOST: &str = "the Terminal server lost its Hyperliquid feed";
+
+struct TapeFeed {
+    latest: watch::Receiver<Option<Result<Vec<TradePrint>, String>>>,
+    used: Arc<Mutex<Instant>>,
+}
+
 /// Crypto markets (`BTCUSD Curncy`) through the Terminal server, which backs them with
-/// Hyperliquid perps; everything else, and anything the server doesn't list, from `inner`.
-/// The connection opens on first use, inside the worker's runtime.
+/// Hyperliquid perps; everything else, and any crypto market the server doesn't list, from
+/// `inner`. HIP-3 perps (`xyz:AAPL`) come only from the server: no other source has them, so
+/// while it's unreachable they fail rather than fall back. The connection opens on first use,
+/// inside the worker's runtime.
 pub struct RemoteMarkets<P> {
     url: String,
     client: OnceLock<Client>,
@@ -436,6 +471,7 @@ pub struct RemoteMarkets<P> {
     /// connection that was up then (0 for none). A newer connection moves their charts back.
     fallbacks: Mutex<HashMap<String, u64>>,
     books: Arc<Mutex<HashMap<String, BookFeed>>>,
+    tapes: Arc<Mutex<HashMap<String, TapeFeed>>>,
     sparks: Mutex<HashMap<String, (Instant, Vec<f64>)>>,
 }
 
@@ -450,6 +486,7 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
             unknown: Mutex::default(),
             served: Mutex::default(),
             books: Arc::default(),
+            tapes: Arc::default(),
             sparks: Mutex::default(),
             fallbacks: Mutex::default(),
         }
@@ -461,7 +498,9 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
     }
 
     fn routed(&self, symbol: &str) -> bool {
-        security(symbol).class == AssetClass::Crypto && !self.unknown.lock().expect("unknown lock").contains(symbol)
+        is_perp(symbol)
+            || security(symbol).class == AssetClass::Crypto
+                && !self.unknown.lock().expect("unknown lock").contains(symbol)
     }
 
     fn served(&self, symbol: &str) -> bool {
@@ -539,6 +578,9 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
     }
 
     async fn server_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
+        if !self.client().wait_up(Duration::from_secs(3)).await {
+            bail!("the Terminal server is not reachable");
+        }
         let mut latest = {
             let mut books = self.books.lock().expect("books lock");
             match books.get(symbol) {
@@ -569,6 +611,84 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
     }
 }
 
+impl<P: MarketData + 'static> RemoteMarkets<P> {
+    async fn server_trades(&self, symbol: &str, n: usize) -> Result<Vec<TradePrint>> {
+        if !self.client().wait_up(Duration::from_secs(3)).await {
+            bail!("the Terminal server is not reachable");
+        }
+        let mut latest = {
+            let mut tapes = self.tapes.lock().expect("tapes lock");
+            match tapes.get(symbol) {
+                Some(f) => {
+                    *f.used.lock().expect("used lock") = Instant::now();
+                    f.latest.clone()
+                }
+                None => {
+                    let (tx, latest) = watch::channel(None);
+                    let used = Arc::new(Mutex::new(Instant::now()));
+                    let sub = self.client().subscribe(TopicReq::Trades { key: MarketKey::new(symbol) });
+                    rt::spawn(tape_feed(symbol.to_string(), sub, tx, used.clone(), self.tapes.clone()));
+                    tapes.insert(symbol.to_string(), TapeFeed { latest: latest.clone(), used });
+                    latest
+                }
+            }
+        };
+        let got = rt::timeout(Duration::from_secs(3), latest.wait_for(Option::is_some))
+            .await
+            .context("no trades from the Terminal server")?
+            .map_err(|_| anyhow!("trades feed stopped"))?
+            .clone();
+        let trades = got.expect("waited for Some").map_err(|e| anyhow!(e))?;
+        Ok(trades[trades.len().saturating_sub(n)..].to_vec())
+    }
+}
+
+/// Keep one trades subscription per market while the pane keeps asking, with the latest
+/// [`TAPE_KEPT`] trades, and drop it 30 s after the last ask.
+async fn tape_feed(
+    symbol: String,
+    mut sub: Subscription,
+    tx: watch::Sender<Option<Result<Vec<TradePrint>, String>>>,
+    used: Arc<Mutex<Instant>>,
+    tapes: Arc<Mutex<HashMap<String, TapeFeed>>>,
+) {
+    let print =
+        |t: &tr_proto::Trade| TradePrint { ts_ms: t.time_ms, px: t.px, sz: t.sz, buy: t.side == tr_proto::Side::Buy };
+    let mut tape: Vec<TradePrint> = Vec::new();
+    let mut check = rt::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            u = sub.next() => {
+                let Some(u) = u else { break };
+                match u.event {
+                    // A snapshot starts over: after a resync the trades in between may be missing.
+                    Event::Snapshot(TopicData::Trades(t)) => tape = t.iter().map(print).collect(),
+                    Event::Delta(TopicDelta::Trades(t)) => tape.extend(t.iter().map(print)),
+                    Event::Status(TopicStatus::Unavailable { detail, .. }) => {
+                        tx.send_replace(Some(Err(detail)));
+                        continue;
+                    }
+                    Event::Status(TopicStatus::Stale { .. }) => {
+                        tx.send_replace(Some(Err(UPSTREAM_LOST.into())));
+                        continue;
+                    }
+                    Event::Reconnecting => {
+                        tx.send_replace(Some(Err("the Terminal server is not reachable".into())));
+                        continue;
+                    }
+                    _ => continue,
+                }
+                tape.drain(..tape.len().saturating_sub(TAPE_KEPT));
+                tx.send_replace(Some(Ok(tape.clone())));
+            }
+            _ = check.tick() => if used.lock().expect("used lock").elapsed() > Duration::from_secs(30) {
+                break;
+            },
+        }
+    }
+    tapes.lock().expect("tapes lock").remove(&symbol);
+}
+
 /// Keep one book subscription per market while the pane keeps asking, and drop it 30 s after
 /// the last ask.
 async fn book_feed(
@@ -589,6 +709,10 @@ async fn book_feed(
                         tx.send_replace(Some(Err(detail)));
                         continue;
                     }
+                    Event::Status(TopicStatus::Stale { .. }) => {
+                        tx.send_replace(Some(Err(UPSTREAM_LOST.into())));
+                        continue;
+                    }
                     // The last book goes stale while the connection is down; the next snapshot replaces it.
                     Event::Reconnecting => {
                         tx.send_replace(Some(Err("the Terminal server is not reachable".into())));
@@ -601,7 +725,7 @@ async fn book_feed(
                     symbol: symbol.clone(),
                     bids: book.bids.iter().map(level).collect(),
                     asks: book.asks.iter().map(level).collect(),
-                    source: BOOK_SOURCE.into(),
+                    source: book_source(&symbol),
                     simulated: false,
                 })));
             }
@@ -761,6 +885,20 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if is_perp(symbol) {
+            return match self.server_history(symbol, tf, end, limit).await {
+                Ok(bars) => {
+                    self.served.lock().expect("served lock").insert(symbol.to_string());
+                    Ok(bars)
+                }
+                Err(e) => {
+                    if end.is_none() {
+                        self.served.lock().expect("served lock").remove(symbol);
+                    }
+                    Err(server_error(&e))
+                }
+            };
+        }
         // Older pages come from wherever the bars already shown came from, so a chart never
         // splices one venue's bars onto another's.
         if end.is_some() {
@@ -799,9 +937,11 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
                 }
                 Err(e) => {
                     tracing::debug!("terminal server quotes: {e:#}");
-                    other.extend(routed);
+                    other.extend(routed.into_iter().filter(|s| !is_perp(s)));
                 }
             }
+            // Perps the server had no quote for have no other source.
+            other.retain(|s| !is_perp(s));
         }
         if !other.is_empty() {
             match self.inner.quotes(&other).await {
@@ -814,6 +954,9 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     }
 
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
+        if !self.served(symbol) && is_perp(symbol) {
+            return None;
+        }
         if !self.served(symbol) {
             let feed = self.inner.live(symbol, tf)?;
             if !self.routed(symbol) {
@@ -846,6 +989,9 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     }
 
     async fn order_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
+        if is_perp(symbol) {
+            return self.server_book(symbol, depth).await.map_err(|e| from_server(&format!("{e:#}")));
+        }
         if self.routed(symbol) {
             match self.server_book(symbol, depth).await {
                 Ok(b) => return Ok(b),
@@ -853,6 +999,26 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
             }
         }
         self.inner.order_book(symbol, depth).await
+    }
+
+    /// The server's tape for the markets it serves; nothing else has one.
+    async fn trades(&self, symbol: &str, n: usize) -> Result<Vec<TradePrint>> {
+        if !self.routed(symbol) {
+            return self.inner.trades(symbol, n).await;
+        }
+        self.server_trades(symbol, n).await.map_err(|e| from_server(&format!("{e:#}")))
+    }
+
+    /// The server's live HIP-3 perps, from its market list.
+    async fn perp_markets(&self) -> Result<Vec<String>> {
+        match self.client().request(Rpc::Markets).await.map_err(|e| server_error(&e))? {
+            RpcResult::Markets(list) => Ok(list
+                .into_iter()
+                .filter(|m| m.kind == InstrumentKind::Perp && is_perp(m.key.as_str()))
+                .map(|m| m.key.0)
+                .collect()),
+            _ => bail!("Terminal server: unexpected reply"),
+        }
     }
 
     async fn yield_curves(&self) -> Result<YieldCurves> {
