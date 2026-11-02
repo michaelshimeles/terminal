@@ -87,6 +87,9 @@ pub struct InstrumentDef {
     pub kind: InstrumentKind,
     /// The price 24 hours earlier, for change figures, when the provider has one.
     pub prev_day: Option<f64>,
+    /// Still listed but no longer trading. Hyperliquid keeps publishing mids for delisted
+    /// markets, so this is the only sign; the gateway serves none of them.
+    pub delisted: bool,
 }
 
 /// One upstream event and when it arrived.

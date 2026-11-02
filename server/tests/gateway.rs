@@ -43,6 +43,8 @@ struct Mock {
     /// `candleSnapshot` requests being answered now, and the most there ever were at once.
     candles_inflight: AtomicUsize,
     candles_peak: AtomicUsize,
+    /// The coin of every `candleSnapshot` request.
+    candle_coins: Mutex<Vec<String>>,
 }
 
 /// Counts a `candleSnapshot` request as in flight until it's answered.
@@ -184,15 +186,18 @@ async fn mock_info(State(m): State<Arc<Mock>>, axum::Json(req): axum::Json<Value
     }
     axum::Json(match req["type"].as_str().unwrap() {
         "perpDexs" => json!([null, {"name": "xyz"}]),
-        "metaAndAssetCtxs" if req["dex"] == "xyz" => {
-            json!([{"universe": [{"name": "xyz:TSLA"}]}, [{"prevDayPx": "400.0"}]])
-        }
+        // Hyperliquid keeps delisted markets in `meta`, flagged, and keeps publishing their mids.
+        "metaAndAssetCtxs" if req["dex"] == "xyz" => json!([
+            {"universe": [{"name": "xyz:TSLA"}, {"name": "xyz:OLDX", "isDelisted": true}]},
+            [{"prevDayPx": "400.0"}, {"prevDayPx": "9.0"}]
+        ]),
         "metaAndAssetCtxs" => json!([
             {"universe": [{"name": "BTC"}, {"name": "ETH"}, {"name": "OLD", "isDelisted": true}]},
             [{"prevDayPx": "100.0"}, {"prevDayPx": "10.0"}, {"prevDayPx": "1.0"}]
         ]),
         "candleSnapshot" => {
             let r = &req["req"];
+            m.candle_coins.lock().unwrap().push(r["coin"].as_str().unwrap_or_default().to_string());
             if r["coin"] == "SLOW" {
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
@@ -263,7 +268,11 @@ impl Setup {
     }
 
     fn xyz_mids(&self) {
-        self.mock.push("allMids:xyz", "allMids", json!({"dex": "xyz", "mids": {"xyz:TSLA": "401.5"}}));
+        self.mock.push(
+            "allMids:xyz",
+            "allMids",
+            json!({"dex": "xyz", "mids": {"xyz:TSLA": "401.5", "xyz:OLDX": "9.5"}}),
+        );
     }
 
     fn client(&self, enc: Encoding) -> Client {
@@ -505,6 +514,73 @@ async fn bars_stream_closed_before_the_next_bar_and_history_merges() {
     assert_eq!(h.last().map(|b| (b.ts, b.close)), Some((t0 + 60, 103.0)));
 }
 
+/// A HIP-3 market streams through the server under its venue name: its book, trades, bars and
+/// history all go upstream as `xyz:TSLA`, and come back to the client that asked.
+#[tokio::test]
+async fn hip3_markets_stream_under_their_dex_prefix() {
+    let s = Setup::new(|_| {}).await;
+    let client = s.client(Encoding::Postcard);
+    let key = || MarketKey::new("xyz:TSLA");
+    let mut book = client.subscribe(TopicReq::Book { key: key(), depth: 10, group: None });
+    let mut trades = client.subscribe(TopicReq::Trades { key: key() });
+    let mut bars = client.subscribe(TopicReq::Bars { key: key(), tf: Timeframe::M1, history: 5 });
+    let want = set(&["l2Book:xyz:TSLA", "trades:xyz:TSLA", "candle:xyz:TSLA:1m"]);
+    s.mock.until("xyz:TSLA's streams upstream", |m| m.subs().is_superset(&want)).await;
+    s.mock.push("l2Book:xyz:TSLA", "l2Book", book_msg("xyz:TSLA", "401.0"));
+    let Event::Snapshot(TopicData::Book(b)) = next_data(&mut book).await else { panic!("book") };
+    assert_eq!((b.bids[0].px, b.asks[0].px), (401.0, 101.0));
+    let t = json!([{"coin": "xyz:TSLA", "side": "A", "px": "401.25", "sz": "2", "time": 5, "hash": "0x0", "tid": 77, "users": ["0x0", "0x0"]}]);
+    s.mock.push("trades:xyz:TSLA", "trades", t);
+    loop {
+        match next_data(&mut trades).await {
+            Event::Snapshot(TopicData::Trades(v)) | Event::Delta(TopicDelta::Trades(v))
+                if v.iter().any(|x| x.tid == 77) =>
+            {
+                let x = v.iter().find(|x| x.tid == 77).unwrap();
+                break assert_eq!((x.px, x.sz, x.side), (401.25, 2.0, tr_proto::Side::Sell));
+            }
+            _ => {}
+        }
+    }
+    let Event::Snapshot(TopicData::Bars(h)) = next_data(&mut bars).await else { panic!("bars") };
+    assert_eq!(h.len(), 5);
+    let Ok(RpcResult::History(h)) =
+        client.request(Rpc::History { key: key(), tf: Timeframe::D1, end: None, limit: 3 }).await
+    else {
+        panic!("history")
+    };
+    assert_eq!(h.len(), 3);
+    let coins = s.mock.candle_coins.lock().unwrap().clone();
+    assert!(!coins.is_empty() && coins.iter().all(|c| c == "xyz:TSLA"), "{coins:?}");
+}
+
+/// A delisted market's mid keeps coming from Hyperliquid, but the server neither lists it nor
+/// takes subscriptions or requests for it, and says why.
+#[tokio::test]
+async fn delisted_markets_are_neither_listed_nor_streamed() {
+    let s = Setup::new(|_| {}).await;
+    assert!(s.gw.hub().mids.contains("xyz:OLDX"), "the upstream still publishes its mid");
+    let client = s.client(Encoding::Postcard);
+    let Ok(RpcResult::Markets(m)) = client.request(Rpc::Markets).await else { panic!("markets") };
+    assert!(m.iter().any(|x| x.key.as_str() == "xyz:TSLA"));
+    assert!(!m.iter().any(|x| x.key.as_str() == "xyz:OLDX"), "delisted markets aren't listed");
+    let mut book = client.subscribe(TopicReq::Book { key: MarketKey::new("xyz:OLDX"), depth: 5, group: None });
+    match next(&mut book).await {
+        Event::Status(TopicStatus::Unavailable { reason: UnavailableReason::UnknownMarket, detail }) => {
+            assert!(detail.contains("delisted"), "{detail}")
+        }
+        e => panic!("expected a refusal, got {e:?}"),
+    }
+    let r =
+        client.request(Rpc::History { key: MarketKey::new("xyz:OLDX"), tf: Timeframe::D1, end: None, limit: 3 }).await;
+    assert!(matches!(&r, Err(e) if e.code == ErrorCode::UnknownMarket), "{r:?}");
+    let keys = vec![MarketKey::new("xyz:OLDX"), MarketKey::new("xyz:TSLA")];
+    let mut q = client.subscribe(TopicReq::Quotes { keys, max_hz: 4 });
+    let Event::Snapshot(TopicData::Quotes(quotes)) = next(&mut q).await else { panic!("quotes") };
+    assert_eq!(quotes.iter().map(|q| q.key.as_str()).collect::<Vec<_>>(), ["xyz:TSLA"]);
+    assert!(s.mock.log.lock().unwrap().iter().all(|e| !e.contains("OLDX")), "nothing went upstream for it");
+}
+
 #[tokio::test]
 async fn json_is_a_debug_encoding() {
     let s = Setup::new(|_| {}).await;
@@ -624,6 +700,44 @@ async fn order_books_fall_back_while_the_server_is_away() {
             break;
         }
         assert!(t0.elapsed() < WAIT, "still the server's last book {:?} after it went away", book.bids[0]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// HIP-3 perps come from the server and nowhere else: while it's up they're live there, labelled
+/// with their venue, and when it's gone they fail rather than take the fallback's sample data.
+#[tokio::test]
+async fn perps_come_only_from_the_server() {
+    let s = Setup::new(|_| {}).await;
+    let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());
+    assert_eq!(m.perp_markets().await.unwrap(), ["xyz:TSLA"], "live perps only, delisted ones left out");
+    let bars = m.history("xyz:TSLA", Timeframe::D1, None, 5).await.unwrap();
+    assert_eq!(bars.len(), 5);
+    assert!(s.mock.candle_coins.lock().unwrap().iter().any(|c| c == "xyz:TSLA"), "the server's bars");
+    let q = m.quotes(&["xyz:TSLA".into(), "AAPL US Equity".into()]).await.unwrap();
+    let px = |k: &str| q.iter().find(|q| q.symbol == k).map(|q| q.last);
+    assert_eq!(px("xyz:TSLA"), Some(401.5), "the perp's mid");
+    assert!(px("AAPL US Equity").is_some(), "the listed stock from its own source");
+    let push = async {
+        s.mock.until("l2Book:xyz:TSLA upstream", |mk| mk.subs().contains("l2Book:xyz:TSLA")).await;
+        s.mock.push("l2Book:xyz:TSLA", "l2Book", book_msg("xyz:TSLA", "401.0"));
+    };
+    let (book, ()) = tokio::join!(m.order_book("xyz:TSLA", 10), push);
+    let book = book.unwrap();
+    assert!(!book.simulated && book.bids[0].0 == 401.0);
+    assert_eq!(book.source, "Hyperliquid xyz perp · Terminal server");
+    // The server goes away: no stand-in data for the perp, while the stock keeps its source.
+    let Setup { mock: _mock, gw } = s;
+    tokio::time::timeout(WAIT, gw.shutdown()).await.expect("shutdown finishes");
+    let e = m.history("xyz:TSLA", Timeframe::D1, None, 5).await.unwrap_err();
+    assert!(format!("{e:#}").contains("Terminal server"), "{e:#}");
+    assert!(m.history("xyz:TSLA", Timeframe::D1, Some(bars[0].ts), 5).await.is_err(), "nor older pages");
+    let q = m.quotes(&["xyz:TSLA".into(), "AAPL US Equity".into()]).await.unwrap();
+    assert_eq!(q.iter().map(|q| q.symbol.as_str()).collect::<Vec<_>>(), ["AAPL US Equity"]);
+    assert!(m.perp_markets().await.is_err(), "the list says the server is unreachable");
+    let t0 = tokio::time::Instant::now();
+    while m.order_book("xyz:TSLA", 10).await.is_ok() {
+        assert!(t0.elapsed() < WAIT, "the server's last book outlived the server");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

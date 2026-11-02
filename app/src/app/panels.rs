@@ -18,8 +18,14 @@ impl TerminalApp {
         let mut actions = Vec::new();
         let id = self.panes[i].id;
         let dragging = self.drag.is_some_and(|d| d.active);
+        let switch_to = self.panes[i].kind.symbol().and_then(|s| self.switch_target(s));
+        let perps: Vec<String> = match self.panes[i].kind {
+            PaneKind::Search { .. } => self.perp_candidates().into_iter().map(String::from).collect(),
+            _ => Vec::new(),
+        };
         if let PaneKind::Chart(c) = &mut self.panes[i].kind {
             c.hover_enabled = !dragging;
+            c.switch_to = switch_to;
             let clicked = c.show(ui, rect, focused, &self.worker);
             actions.append(&mut c.actions);
             return (actions, clicked);
@@ -55,7 +61,8 @@ impl TerminalApp {
             PaneKind::Curve => actions.extend(markets_view::curve(ui, self.curves.as_deref())),
             PaneKind::Search { query } => {
                 let hits = if self.net_hits.0 == *query { self.net_hits.1.as_slice() } else { &[] };
-                let (a, changed) = markets_view::search(ui, query, hits);
+                let perps: Vec<&str> = perps.iter().map(String::as_str).collect();
+                let (a, changed) = markets_view::search(ui, query, hits, &perps);
                 actions.extend(a);
                 if changed && query.trim().len() >= 2 {
                     self.search_pending = Some((query.clone(), Instant::now()));
@@ -76,7 +83,7 @@ impl TerminalApp {
                 }
             }
             PaneKind::OrderBook(b) => {
-                if let Some(a) = order_book(ui, b) {
+                if let Some(a) = order_book(ui, b, switch_to) {
                     actions.push(a);
                 }
             }
@@ -149,14 +156,14 @@ impl TerminalApp {
                 let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
                 widgets::hover_wash(ui, r, &resp, false);
                 let p = ui.painter();
-                p.text(pos2(col(r, 0), r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.5), amber());
-                p.text(
-                    pos2(col(r, 0) + 74.0, r.center().y),
-                    Align2::LEFT_CENTER,
-                    sec.class.yellow_key().label(),
-                    ui_font(11.0),
-                    muted(),
-                );
+                let tick = p.layout_no_wrap(sec.ticker.clone(), mono(12.5), amber());
+                let label_x = col(r, 0) + tick.size().x.max(66.0) + 8.0;
+                p.galley(pos2(col(r, 0), r.center().y - tick.size().y / 2.0), tick, amber());
+                let (label, lc) = match sec.class {
+                    tr_core::AssetClass::Perp => (tr_core::perps::badge(s), theme::perp()),
+                    c => (c.yellow_key().label().to_string(), muted()),
+                };
+                p.text(pos2(label_x, r.center().y), Align2::LEFT_CENTER, label, ui_font(11.0), lc);
                 match self.quotes.get(s) {
                     Some(q) => {
                         let c = if q.change() >= 0.0 { theme::up() } else { theme::down() };
@@ -328,17 +335,30 @@ fn fmt_size(q: f64) -> String {
     }
 }
 
-/// Price ladder: asks above, bids below, depth bars by cumulative size.
-fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
+/// Price ladder: asks above, bids below, depth bars by cumulative size. `perp` is the live
+/// HIP-3 perp linked to the pane's security, whose book it can show instead of a simulated one.
+fn order_book(ui: &mut Ui, b: &mut super::BookPane, perp: Option<&'static str>) -> Option<Action> {
     let mut action = None;
     let key = tr_data::security(&b.symbol);
     let book: Option<OrderBook> = b.book.as_ref().map(|x| x.grouped(b.group));
+    let mut show_perp = false;
     ui.horizontal_wrapped(|ui| {
         let r = ui.label(RichText::new(&key.ticker).font(mono(13.0)).color(amber())).interact(Sense::click());
         if r.clicked() {
             action = Some(Action::OpenChart(b.symbol.clone()));
         }
         r.on_hover_text("Open chart");
+        if key.class == tr_core::AssetClass::Perp {
+            let tip = match tr_core::perps::link_for(&b.symbol) {
+                Some(l) => format!(
+                    "The perp's own book on Hyperliquid. It references {}; it is not that market's book.",
+                    l.reference
+                ),
+                None => "The perp's own book on Hyperliquid.".into(),
+            };
+            ui.label(RichText::new(tr_core::perps::badge(&b.symbol)).font(ui_font(11.5)).color(theme::perp()))
+                .on_hover_text(tip);
+        }
         if let Some(bk) = &book {
             ui.label(RichText::new(&bk.source).font(ui_font(11.5)).color(muted()));
             if bk.simulated {
@@ -349,6 +369,25 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane) -> Option<Action> {
             }
         }
     });
+    // A listed instrument with no public book, but a live perp on the same underlying.
+    if let Some(perp) = perp.filter(|p| tr_core::perps::is_perp(p) && book.as_ref().is_none_or(|bk| bk.simulated)) {
+        ui.horizontal_wrapped(|ui| {
+            let label = format!("Show the {perp} perp's book");
+            let tip = format!(
+                "Load the book of {perp} ({}) here. It is the perp's order book on Hyperliquid, not {}'s.",
+                tr_core::perps::badge(perp),
+                key.key()
+            );
+            show_perp = ui.small_button(RichText::new(label).color(theme::perp())).on_hover_text(tip).clicked();
+        });
+    }
+    if show_perp && let Some(perp) = perp {
+        b.symbol = perp.to_string();
+        b.book = None;
+        b.error = None;
+        b.fetched = None;
+        return action;
+    }
     ui.horizontal_wrapped(|ui| {
         let depths = [10usize, 20, 50];
         let dl = ["10", "20", "50"];

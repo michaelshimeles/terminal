@@ -132,6 +132,8 @@ pub enum Request {
     Forget(PaneId),
     YieldCurves,
     Search(String),
+    /// The HIP-3 perps the Terminal server lists as live.
+    PerpMarkets,
     /// Order entry (see `app::trading`); only sent once trading is enabled.
     Trade(TradeRequest),
 }
@@ -293,6 +295,8 @@ pub enum Response {
         query: String,
         hits: Vec<SearchHit>,
     },
+    /// Live HIP-3 perps (`xyz:AAPL`), or why the server couldn't say.
+    PerpMarkets(Result<Vec<String>, String>),
     Trade(Box<TradeResponse>),
 }
 
@@ -738,6 +742,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::RefreshCongress => congress_refresh(s).await,
         Request::Forget(pane) => {
             s.series.lock().expect("series lock").remove(&pane);
+        }
+        Request::PerpMarkets => {
+            let perps = s.provider.perp_markets().await.map_err(|e| format!("{e:#}"));
+            s.send(Response::PerpMarkets(perps));
         }
         Request::YieldCurves => match s.provider.yield_curves().await {
             Ok(c) => s.send(Response::Curves(Box::new(c))),

@@ -115,6 +115,9 @@ pub struct ChartState {
     /// The workspace drew this chart's controls in the pane's tab strip, so skip the
     /// header row and give the plot the space.
     pub controls_in_strip: bool,
+    /// What `PERP` would switch this chart to (its live HIP-3 perp, or a perp's listed
+    /// instrument), set by the app each frame.
+    pub switch_to: Option<&'static str>,
 }
 
 impl ChartState {
@@ -161,6 +164,7 @@ impl ChartState {
             actions: Vec::new(),
             hover_enabled: true,
             controls_in_strip: false,
+            switch_to: None,
         }
     }
 
@@ -562,6 +566,9 @@ impl ChartState {
             );
             hui.spacing_mut().item_spacing.x = 6.0;
             hui.label(RichText::new(&self.sec.ticker).font(mono(12.0)).color(amber()));
+            if self.sec.class == AssetClass::Perp {
+                hui.label(RichText::new(tr_core::perps::badge(&self.symbol)).font(ui_font(11.0)).color(theme::perp()));
+            }
             if hui.available_width() > Self::controls_width(&hui) {
                 clicked |= self.controls(&mut hui, w);
             } else {
@@ -614,6 +621,9 @@ impl ChartState {
             }
             rx = lr.right();
         }
+        if let Some(target) = self.switch_to {
+            clicked |= self.switch_chip(ui, &painter, pos2(rx + 10.0, range_row.center().y), target);
+        }
         let status = match (&self.error, self.loading, self.paging) {
             (Some(e), _, _) => format!("ERR {e}"),
             (_, true, _) => "loading…".into(),
@@ -641,6 +651,11 @@ impl ChartState {
 
         let Some(gpu) = self.gpu.clone() else {
             let msg = self.error.clone().unwrap_or_else(|| format!("Loading {} {}…", self.symbol, self.tf));
+            if self.sec.class == AssetClass::Perp {
+                let badge = tr_core::perps::badge(&self.symbol);
+                let below = plot_all.center() + vec2(0.0, 20.0);
+                painter.text(below, Align2::CENTER_CENTER, badge, ui_font(11.5), theme::perp());
+            }
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
             return clicked;
         };
@@ -1086,6 +1101,33 @@ impl ChartState {
         }
     }
 
+    /// The range row's link between a security and its HIP-3 perp. Clicking it (or ⇧P) loads
+    /// the other one here.
+    fn switch_chip(&mut self, ui: &Ui, painter: &egui::Painter, left: Pos2, target: &str) -> bool {
+        let to_perp = tr_core::perps::is_perp(target);
+        let label = if to_perp { format!("⇄ {target} PERP") } else { format!("⇄ {target}") };
+        let g = painter.layout_no_wrap(label, mono(11.0), theme::perp());
+        let r = Rect::from_min_size(pos2(left.x, left.y - RANGE_H / 2.0 + 2.0), vec2(g.size().x + 10.0, RANGE_H - 4.0));
+        let resp = ui.interact(r, ui.id().with((self.id, "perp-switch")), Sense::click());
+        let fill = if resp.hovered() { theme::control_hover() } else { theme::control() };
+        painter.rect_filled(r, 3.0, fill);
+        painter.galley(pos2(r.left() + 5.0, r.center().y - g.size().y / 2.0), g, theme::perp());
+        let tip = match tr_core::perps::link_for(if to_perp { target } else { &self.symbol }) {
+            Some(l) if to_perp => format!(
+                "Open {target}, the HIP-3 perp on Hyperliquid's {} dex (⇧P). It references {}. A perp's price \
+                 can differ from the listed instrument's, and it trades when that market is closed.",
+                tr_core::perps::venue(target).unwrap_or("xyz"),
+                l.reference
+            ),
+            _ => format!("Open {target}, the listed instrument this perp references (⇧P)"),
+        };
+        let resp = resp.on_hover_text(tip);
+        if resp.clicked() {
+            self.actions.push(Action::OpenChart(target.to_string()));
+        }
+        resp.clicked()
+    }
+
     fn paint_legend(&self, ui: &Ui, price_rect: Rect, i: usize, sub_rects: &[(Rect, usize, PriceScale)]) {
         let Some(b) = self.bars.get(i) else { return };
         let p = ui.painter_at(price_rect);
@@ -1101,6 +1143,9 @@ impl ChartState {
             *x += g.size().x + 8.0;
         };
         put(format!("{} · {}", self.sec.ticker, self.tf), amber(), &mut x);
+        if self.sec.class == AssetClass::Perp {
+            put(tr_core::perps::badge(&self.symbol), theme::perp(), &mut x);
+        }
         for (k, val) in [("O", b.open), ("H", b.high), ("L", b.low), ("C", b.close)] {
             put(format!("{k}{val:.dec$}"), col, &mut x);
         }

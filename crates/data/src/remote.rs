@@ -1,5 +1,5 @@
 //! A client for the Terminal data server (`tr-gateway`), and [`RemoteMarkets`], which serves
-//! crypto markets through it (docs/architecture/server.md §4.6).
+//! crypto markets and Hyperliquid HIP-3 perps through it (docs/architecture/server.md §4.6).
 //!
 //! [`Client`] keeps one connection per server, shared by every subscription and request. It
 //! reconnects with backoff, resubscribes everything (each subscription then gets a fresh
@@ -17,13 +17,16 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 use tr_core::{AssetClass, Bar, Timeframe};
 use tr_proto::{
-    ApiError, BarDelta, ClientInfo, ClientMsg, Encoding, ErrorCode, Frame, MarketKey, PROTOCOL_VERSION, ReqId,
-    ResyncReason, Rpc, RpcResult, ServerMsg, SubId, TopicData, TopicDelta, TopicReq, TopicStatus, UnavailableReason,
+    ApiError, BarDelta, ClientInfo, ClientMsg, Encoding, ErrorCode, Frame, InstrumentKind, MarketKey, PROTOCOL_VERSION,
+    ReqId, ResyncReason, Rpc, RpcResult, ServerMsg, SubId, TopicData, TopicDelta, TopicReq, TopicStatus,
+    UnavailableReason,
 };
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ws::{Message, Socket};
-use crate::{LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, rt, security};
+use crate::{
+    LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, is_perp, rt, security,
+};
 
 /// What a subscription receives.
 #[derive(Debug, Clone, PartialEq)]
@@ -412,8 +415,25 @@ fn route(
 
 // ---- RemoteMarkets ----
 
-/// What the order book pane shows as the source of a book that came through the server.
+/// What the order book pane shows as the source of a core perp's book that came through the server.
 pub const BOOK_SOURCE: &str = "Hyperliquid perp · Terminal server";
+
+/// A server error for the user, saying it came from the Terminal server.
+fn server_error(e: &ApiError) -> anyhow::Error {
+    if e.message.contains("Terminal server") {
+        anyhow!("{}", e.message)
+    } else {
+        anyhow!("Terminal server: {}", e.message)
+    }
+}
+
+/// The source line for a book from the server: HIP-3 books name their dex.
+pub fn book_source(symbol: &str) -> String {
+    match tr_core::perps::venue(symbol) {
+        Some(dex) => format!("Hyperliquid {dex} perp · Terminal server"),
+        None => BOOK_SOURCE.into(),
+    }
+}
 
 struct BookFeed {
     latest: watch::Receiver<Option<Result<OrderBook, String>>>,
@@ -421,8 +441,10 @@ struct BookFeed {
 }
 
 /// Crypto markets (`BTCUSD Curncy`) through the Terminal server, which backs them with
-/// Hyperliquid perps; everything else, and anything the server doesn't list, from `inner`.
-/// The connection opens on first use, inside the worker's runtime.
+/// Hyperliquid perps; everything else, and any crypto market the server doesn't list, from
+/// `inner`. HIP-3 perps (`xyz:AAPL`) come only from the server: no other source has them, so
+/// while it's unreachable they fail rather than fall back. The connection opens on first use,
+/// inside the worker's runtime.
 pub struct RemoteMarkets<P> {
     url: String,
     client: OnceLock<Client>,
@@ -461,7 +483,9 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
     }
 
     fn routed(&self, symbol: &str) -> bool {
-        security(symbol).class == AssetClass::Crypto && !self.unknown.lock().expect("unknown lock").contains(symbol)
+        is_perp(symbol)
+            || security(symbol).class == AssetClass::Crypto
+                && !self.unknown.lock().expect("unknown lock").contains(symbol)
     }
 
     fn served(&self, symbol: &str) -> bool {
@@ -601,7 +625,7 @@ async fn book_feed(
                     symbol: symbol.clone(),
                     bids: book.bids.iter().map(level).collect(),
                     asks: book.asks.iter().map(level).collect(),
-                    source: BOOK_SOURCE.into(),
+                    source: book_source(&symbol),
                     simulated: false,
                 })));
             }
@@ -761,6 +785,20 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     }
 
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if is_perp(symbol) {
+            return match self.server_history(symbol, tf, end, limit).await {
+                Ok(bars) => {
+                    self.served.lock().expect("served lock").insert(symbol.to_string());
+                    Ok(bars)
+                }
+                Err(e) => {
+                    if end.is_none() {
+                        self.served.lock().expect("served lock").remove(symbol);
+                    }
+                    Err(server_error(&e))
+                }
+            };
+        }
         // Older pages come from wherever the bars already shown came from, so a chart never
         // splices one venue's bars onto another's.
         if end.is_some() {
@@ -799,9 +837,11 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
                 }
                 Err(e) => {
                     tracing::debug!("terminal server quotes: {e:#}");
-                    other.extend(routed);
+                    other.extend(routed.into_iter().filter(|s| !is_perp(s)));
                 }
             }
+            // Perps the server had no quote for have no other source.
+            other.retain(|s| !is_perp(s));
         }
         if !other.is_empty() {
             match self.inner.quotes(&other).await {
@@ -814,6 +854,9 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     }
 
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
+        if !self.served(symbol) && is_perp(symbol) {
+            return None;
+        }
         if !self.served(symbol) {
             let feed = self.inner.live(symbol, tf)?;
             if !self.routed(symbol) {
@@ -846,6 +889,9 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
     }
 
     async fn order_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
+        if is_perp(symbol) {
+            return self.server_book(symbol, depth).await.map_err(|e| anyhow!("Terminal server: {e:#}"));
+        }
         if self.routed(symbol) {
             match self.server_book(symbol, depth).await {
                 Ok(b) => return Ok(b),
@@ -853,6 +899,18 @@ impl<P: MarketData + 'static> MarketData for RemoteMarkets<P> {
             }
         }
         self.inner.order_book(symbol, depth).await
+    }
+
+    /// The server's live HIP-3 perps, from its market list.
+    async fn perp_markets(&self) -> Result<Vec<String>> {
+        match self.client().request(Rpc::Markets).await.map_err(|e| server_error(&e))? {
+            RpcResult::Markets(list) => Ok(list
+                .into_iter()
+                .filter(|m| m.kind == InstrumentKind::Perp && is_perp(m.key.as_str()))
+                .map(|m| m.key.0)
+                .collect()),
+            _ => bail!("Terminal server: unexpected reply"),
+        }
     }
 
     async fn yield_curves(&self) -> Result<YieldCurves> {

@@ -166,7 +166,11 @@ impl BookPane {
 impl PaneKind {
     /// Short tab title.
     fn tab_title(&self) -> String {
-        let short = |s: &str| tr_data::security(s).ticker;
+        // A perp's tab says so: `xyz:AAPL PERP`.
+        let short = |s: &str| {
+            let sec = tr_data::security(s);
+            if sec.class == tr_core::AssetClass::Perp { format!("{} PERP", sec.ticker) } else { sec.ticker }
+        };
         match self {
             PaneKind::Chart(c) => short(&c.symbol),
             PaneKind::Feed { .. } => "Congress".into(),
@@ -464,6 +468,10 @@ pub struct TerminalApp {
     wei_updated: Option<String>,
     /// Latest network search results and the query they answer.
     net_hits: (String, Vec<SearchHit>),
+    /// HIP-3 perps the Terminal server lists as live (`None` until it has answered once), and
+    /// when they were last asked for.
+    live_perps: Option<Vec<String>>,
+    last_perps: Option<(Instant, bool)>,
     /// Query typed in the command line awaiting a debounced network search.
     search_pending: Option<(String, Instant)>,
     suggestion: Option<usize>,
@@ -612,6 +620,8 @@ impl TerminalApp {
             last_curve: None,
             wei_updated: None,
             net_hits: (String::new(), Vec::new()),
+            live_perps: None,
+            last_perps: None,
             search_pending: None,
             suggestion: None,
             cmd: String::new(),
@@ -778,6 +788,7 @@ impl TerminalApp {
                 self.status = format!("{s}: option chain");
             }
             Command::SymbolFunction(s, Function::Portfolio(view, arg)) => self.portfolio_command(view, &arg, Some(s)),
+            Command::SymbolFunction(s, Function::Perp) => self.open_perp(Some(s)),
             Command::SymbolFunction(s, Function::Trade(mut t)) => {
                 t.symbol = Some(s);
                 self.open_ticket(t, None);
@@ -931,6 +942,10 @@ impl TerminalApp {
                     self.status = format!("Already using the {} account", if live { "LIVE" } else { "DEMO" });
                 }
                 self.set_account_mode(mode, false);
+            }
+            Function::Perp => {
+                let key = symbol.or_else(|| self.focused_symbol());
+                self.open_perp(key);
             }
         }
     }
@@ -1086,6 +1101,17 @@ impl TerminalApp {
                 Response::Status(s) => self.status = s,
                 Response::Curves(c) => self.curves = Some(c),
                 Response::SearchHits { query, hits } => self.net_hits = (query, hits),
+                Response::PerpMarkets(result) => {
+                    let ok = result.is_ok();
+                    match result {
+                        Ok(perps) => self.live_perps = Some(perps),
+                        // Keep what the server said last; links to perps it listed stay usable.
+                        Err(e) => tracing::debug!("live perps: {e}"),
+                    }
+                    if let Some((_, answered)) = &mut self.last_perps {
+                        *answered = ok;
+                    }
+                }
                 Response::Trade(r) => self.on_trade(*r),
                 Response::CongressRefreshed(summary) => {
                     self.congress_status = summary.to_string();
@@ -1289,6 +1315,8 @@ impl TerminalApp {
             | A::ResetView
             | A::LogScale
             | A::Magnet => self.focused_is_chart(),
+            // Otherwise ⇧P types a P into the command line.
+            A::TogglePerp => self.focused_symbol().is_some_and(|s| self.switch_target(&s).is_some()),
             a => a.layout_slot().is_none_or(|i| i < self.layout_names.len()),
         }
     }
@@ -1308,6 +1336,7 @@ impl TerminalApp {
             A::Orders => self.apply(Function::Portfolio(command::PortView::Orders, String::new())),
             A::Buy => self.quick_trade(true),
             A::Sell => self.quick_trade(false),
+            A::TogglePerp => self.apply(Function::Perp),
             A::NextPane => self.cycle_focus(1),
             A::PrevPane => self.cycle_focus(-1),
             A::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
@@ -1358,6 +1387,12 @@ impl TerminalApp {
         {
             self.worker.send(Request::Quotes(markets_view::overview_keys()));
             self.last_wei = Some(Instant::now());
+        }
+        // Which perps are live: every 5 minutes, or every minute while the server isn't answering.
+        let every = |ok: bool| Duration::from_secs(if ok { 300 } else { 60 });
+        if self.last_perps.is_none_or(|(t, ok)| t.elapsed() > every(ok)) {
+            self.worker.send(Request::PerpMarkets);
+            self.last_perps = Some((Instant::now(), self.last_perps.is_none_or(|(_, ok)| ok)));
         }
         if shown(&|k| matches!(k, PaneKind::Curve))
             && self.last_curve.is_none_or(|t| t.elapsed() > Duration::from_secs(600))

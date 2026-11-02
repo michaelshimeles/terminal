@@ -233,6 +233,7 @@ pub enum Action {
     Orders,
     Buy,
     Sell,
+    TogglePerp,
     NextPane,
     PrevPane,
     ToggleSidebar,
@@ -276,7 +277,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 52] = [
+    pub const ALL: [Action; 53] = [
         Action::Help,
         Action::Congress,
         Action::Politicians,
@@ -289,6 +290,7 @@ impl Action {
         Action::Orders,
         Action::Buy,
         Action::Sell,
+        Action::TogglePerp,
         Action::NextPane,
         Action::PrevPane,
         Action::ToggleSidebar,
@@ -345,6 +347,7 @@ impl Action {
             Action::Orders => "Brokerage orders".into(),
             Action::Buy => "Buy the current security".into(),
             Action::Sell => "Sell the current security".into(),
+            Action::TogglePerp => "Switch between a security and its HIP-3 perp".into(),
             Action::NextPane => "Next pane".into(),
             Action::PrevPane => "Previous pane".into(),
             Action::ToggleSidebar => "Toggle sidebar".into(),
@@ -585,6 +588,7 @@ impl Default for Keymap {
         // Shift keeps plain typing free for the type-anywhere command line.
         bind(Action::Buy, "Shift+B");
         bind(Action::Sell, "Shift+S");
+        bind(Action::TogglePerp, "Shift+P");
         bind(Action::NextPane, "Tab");
         bind(Action::PrevPane, "Shift+Tab");
         bind(Action::ToggleSidebar, if mac { "Ctrl+Cmd+S" } else { "Ctrl+Shift+S" });

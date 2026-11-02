@@ -89,8 +89,9 @@ impl Provider for HlPublicProvider {
         UpstreamStats { rest_weight_last_min: used, rest_weight_per_min: budget, ..self.pool.stats() }
     }
 
-    /// Perps on the core dex and the selected HIP-3 dexes, with their previous-day prices. Spot
-    /// markets aren't listed here, but they stream: the core dex's mids carry them.
+    /// Perps on the core dex and the selected HIP-3 dexes, with their previous-day prices, and
+    /// delisted ones flagged. Spot markets aren't listed here, but they stream: the core dex's
+    /// mids carry them.
     async fn instruments(&self) -> Result<Vec<InstrumentDef>> {
         let mut dexes = self.info.perp_dexs().await?;
         if let Some(want) = &self.dexes {
@@ -99,11 +100,12 @@ impl Provider for HlPublicProvider {
         let mut out = Vec::new();
         for dex in dexes {
             match self.info.perps(&dex).await {
-                Ok(perps) => out.extend(perps.into_iter().filter(|p| !p.delisted).map(|p| InstrumentDef {
+                Ok(perps) => out.extend(perps.into_iter().map(|p| InstrumentDef {
                     id: InstrumentId(p.name),
                     venue: dex.clone(),
                     kind: InstrumentKind::Perp,
                     prev_day: p.prev_day,
+                    delisted: p.delisted,
                 })),
                 // One dex failing shouldn't hide the others.
                 Err(e) => tracing::warn!("dex {dex:?}: {e:#}"),

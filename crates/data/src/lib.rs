@@ -275,6 +275,12 @@ pub trait MarketData: Send + Sync {
         anyhow::bail!("no public order book for {symbol}")
     }
 
+    /// The HIP-3 perps (`xyz:AAPL`) the Terminal server lists as live right now. Empty when
+    /// there is no server, and an error when it can't be reached.
+    async fn perp_markets(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// The US Treasury curve. The default assembles it from each tenor's daily history.
     async fn yield_curves(&self) -> Result<YieldCurves> {
         let tenors = catalog::treasury_curve();
@@ -327,8 +333,8 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
         match self.primary.history(symbol, tf, end, limit).await {
             Ok(b) => Ok(b),
-            // Paging older history: never splice sample bars onto real ones.
-            Err(e) if end.is_some() => Err(e),
+            // Paging older history: never splice sample bars onto real ones. Perps never get them.
+            Err(e) if end.is_some() || is_perp(symbol) => Err(e),
             Err(e) => {
                 tracing::warn!("{} history {symbol} {tf} failed, using sample data: {e:#}", self.name);
                 self.sample.history(symbol, tf, end, limit).await
@@ -339,10 +345,11 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
         match self.primary.quotes(symbols).await {
             // If the primary produced nothing at all (offline), serve sample quotes rather
-            // than an empty panel; partial results are never mixed with synthetic prices.
+            // than an empty panel; partial results are never mixed with synthetic prices. Perps
+            // are never filled in.
             Ok(mut q) => {
                 let missing: Vec<String> =
-                    symbols.iter().filter(|s| !q.iter().any(|x| &x.symbol == *s)).cloned().collect();
+                    symbols.iter().filter(|s| !is_perp(s) && !q.iter().any(|x| &x.symbol == *s)).cloned().collect();
                 if !missing.is_empty() && q.is_empty() {
                     q.extend(self.sample.quotes(&missing).await.unwrap_or_default());
                 }
@@ -350,7 +357,8 @@ impl<P: MarketData> MarketData for Fallback<P> {
             }
             Err(e) => {
                 tracing::warn!("{} quotes failed, using sample data: {e:#}", self.name);
-                self.sample.quotes(symbols).await
+                let listed: Vec<String> = symbols.iter().filter(|s| !is_perp(s)).cloned().collect();
+                self.sample.quotes(&listed).await
             }
         }
     }
@@ -370,6 +378,7 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn options(&self, symbol: &str, expiration: Option<i64>) -> Result<OptionChain> {
         match self.primary.options(symbol, expiration).await {
             Ok(c) => Ok(c),
+            Err(e) if is_perp(symbol) => Err(e),
             Err(e) => {
                 tracing::warn!("{} options {symbol}: {e:#}; simulating", self.name);
                 self.sample.options(symbol, expiration).await
@@ -381,11 +390,16 @@ impl<P: MarketData> MarketData for Fallback<P> {
     async fn order_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
         match self.primary.order_book(symbol, depth).await {
             Ok(b) => Ok(b),
+            Err(e) if is_perp(symbol) => Err(e),
             Err(e) => {
                 tracing::debug!("{} order book {symbol}: {e:#}; simulating", self.name);
                 self.sample.order_book(symbol, depth).await
             }
         }
+    }
+
+    async fn perp_markets(&self) -> Result<Vec<String>> {
+        self.primary.perp_markets().await
     }
 
     async fn yield_curves(&self) -> Result<YieldCurves> {
@@ -402,6 +416,17 @@ impl<P: MarketData> MarketData for Fallback<P> {
 /// Resolve a market key or bare ticker.
 pub fn security(symbol: &str) -> Security {
     Security::parse(symbol).unwrap_or_else(|| Security::equity(symbol))
+}
+
+/// Whether `symbol` is a HIP-3 perp (`xyz:AAPL`).
+pub fn is_perp(symbol: &str) -> bool {
+    tr_core::perps::is_perp(symbol)
+}
+
+/// What a source other than the Terminal server says about a HIP-3 perp. Only the server
+/// carries them, and nothing stands in for them, not even sample data.
+pub fn perp_needs_server(symbol: &str) -> anyhow::Error {
+    anyhow::anyhow!("{symbol} is a HIP-3 perp, which only the Terminal server provides")
 }
 
 /// Build the provider described in the crate docs from environment variables.
@@ -521,6 +546,24 @@ mod tests {
         // Paging must surface the error instead of mixing in synthetic bars.
         assert!(p.history("AAPL", Timeframe::D1, Some(bars[0].ts), 100).await.is_err());
         assert_eq!(p.name(), "broken");
+    }
+
+    /// A HIP-3 perp has no source but the Terminal server, so nothing stands in for it: no
+    /// sample bars, quotes or books when a source fails, and none in offline sample mode.
+    #[tokio::test]
+    async fn perps_never_get_stand_in_data() {
+        assert!(is_perp("xyz:AAPL") && is_perp("XYZ:aapl") && !is_perp("AAPL US Equity") && !is_perp("BTCUSD Curncy"));
+        let p = Fallback::new(Broken);
+        assert!(p.history("xyz:AAPL", Timeframe::D1, None, 10).await.is_err());
+        assert!(p.order_book("xyz:AAPL", 10).await.is_err());
+        let q = p.quotes(&["xyz:AAPL".into(), "AAPL US Equity".into()]).await.unwrap();
+        assert_eq!(q.iter().map(|q| q.symbol.as_str()).collect::<Vec<_>>(), ["AAPL US Equity"]);
+        let s = sample::SampleProvider::default().with_live_ticks();
+        let e = s.history("xyz:AAPL", Timeframe::D1, None, 10).await.unwrap_err();
+        assert!(format!("{e:#}").contains("Terminal server"), "{e:#}");
+        assert!(s.order_book("xyz:AAPL", 10).await.is_err() && s.live("xyz:AAPL", Timeframe::M1).is_none());
+        let q = s.quotes(&["xyz:AAPL".into(), "AAPL US Equity".into()]).await.unwrap();
+        assert_eq!(q.iter().map(|q| q.symbol.as_str()).collect::<Vec<_>>(), ["AAPL US Equity"]);
     }
 
     #[tokio::test]

@@ -456,7 +456,7 @@ impl TerminalApp {
             return Vec::new();
         }
         let net: &[SearchHit] = if self.net_hits.0 == q { &self.net_hits.1 } else { &[] };
-        let mut v = markets_view::merged_hits(q, net);
+        let mut v = markets_view::merged_hits(q, net, &self.perp_candidates());
         v.truncate(8);
         v
     }
@@ -567,7 +567,9 @@ impl TerminalApp {
                 let resp = row_frame(ui, false);
                 let r = resp.rect;
                 let pt = ui.painter();
-                pt.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.0), text());
+                let perp = sec.class == tr_core::AssetClass::Perp;
+                let tc = if perp { theme::perp() } else { text() };
+                pt.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.0), tc);
                 if let Some(q) = self.quotes.get(key) {
                     let up = q.change() >= 0.0;
                     let c = if up { theme::up() } else { theme::down() };
@@ -595,7 +597,15 @@ impl TerminalApp {
                 if resp.clicked() {
                     out.push(SidebarCmd::Action(Action::OpenChart(key.clone())));
                 }
-                let resp = resp.on_hover_text(format!("{} — {}", sec.key(), sec.name().unwrap_or(&sec.ticker)));
+                let resp = resp.on_hover_text(match perp {
+                    true => format!(
+                        "{} — {} · {}",
+                        sec.key(),
+                        sec.name().unwrap_or("HIP-3 perp"),
+                        tr_core::perps::badge(key)
+                    ),
+                    false => format!("{} — {}", sec.key(), sec.name().unwrap_or(&sec.ticker)),
+                });
                 resp.context_menu(|ui| {
                     if ui.button("Open Chart").clicked() {
                         out.push(SidebarCmd::Action(Action::OpenChart(key.clone())));
