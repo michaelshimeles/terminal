@@ -35,6 +35,10 @@ mv /usr/local/bin/tr-gateway.new /usr/local/bin/tr-gateway
 install -m 0755 target/release/examples/cli /usr/local/bin/tr-cli
 git rev-parse HEAD > /opt/terminal/DEPLOYED_COMMIT
 
+# Settings and secrets (TR_METRICS_TOKEN and the like) go in /etc/tr-gateway/env, which only
+# root reads. This script never writes or prints that file; see README.md.
+install -d -m 0700 -o root -g root /etc/tr-gateway
+
 cat > /etc/systemd/system/tr-gateway.service <<'UNIT'
 [Unit]
 Description=Terminal data server (tr-gateway)
@@ -47,14 +51,38 @@ StartLimitIntervalSec=0
 User=trgw
 Environment=TR_GATEWAY_BIND=0.0.0.0:8080
 Environment=RUST_LOG=info
+# Optional; read by systemd as root before it drops to trgw. Overrides the lines above.
+EnvironmentFile=-/etc/tr-gateway/env
 ExecStart=/usr/local/bin/tr-gateway
 Restart=always
 RestartSec=2
+# SIGTERM closes every session and upstream connection first; that takes a second or two.
+TimeoutStopSec=15
 LimitNOFILE=65536
+# The gateway uses tens of MiB. Past MemoryHigh the kernel reclaims hard; past MemoryMax it's
+# killed and restarted, before the VM itself runs out.
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=512
+UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

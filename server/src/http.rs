@@ -1,20 +1,23 @@
 //! The gateway's HTTP side: the client websocket at `/ws`, and `/healthz`, `/readyz`,
-//! `/metrics` (Prometheus text) and `/stats` (JSON) for operators.
+//! `/metrics` (Prometheus text) and `/stats` (JSON) for operators. With an operator token set,
+//! those two answer 404 to requests without it.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use axum::Router;
-use axum::extract::{State, WebSocketUpgrade};
-use axum::http::{StatusCode, header};
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::access::{self, PerIp, Secret};
 use crate::metrics::{Metrics, Quantiles, TopicKind};
 use crate::provider::UpstreamStats;
 use crate::session::{self, SessionConfig};
@@ -29,6 +32,25 @@ pub struct AppState {
     closing: watch::Receiver<bool>,
     next_session: Arc<AtomicU64>,
     started: Instant,
+    access: Arc<Access>,
+}
+
+/// Who may use the gateway. Open by default: no token, no per-address cap.
+#[derive(Default)]
+pub struct Access {
+    /// Required, as a bearer token, by `/stats` and `/metrics`.
+    pub metrics_token: Option<Secret>,
+    pub per_ip: PerIp,
+    /// The header the edge puts the client's address in.
+    pub client_ip_header: Option<HeaderName>,
+    /// Whether the first client connection has been looked at (see [`note_forwarding`]).
+    noted: AtomicBool,
+}
+
+impl Access {
+    pub fn new(metrics_token: Option<Secret>, max_per_ip: usize, client_ip_header: Option<HeaderName>) -> Self {
+        Self { metrics_token, per_ip: PerIp::new(max_per_ip), client_ip_header, noted: AtomicBool::new(false) }
+    }
 }
 
 impl AppState {
@@ -40,7 +62,13 @@ impl AppState {
             closing,
             next_session: Arc::new(AtomicU64::new(1)),
             started: Instant::now(),
+            access: Arc::default(),
         }
+    }
+
+    pub fn with_access(mut self, access: Access) -> Self {
+        self.access = Arc::new(access);
+        self
     }
 }
 
@@ -54,14 +82,44 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn ws(State(st): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
+async fn ws(
+    State(st): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     if st.hub.metrics.clients.load(Ordering::Relaxed) >= st.max_clients as i64 {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many clients\n").into_response();
     }
+    let a = &st.access;
+    note_forwarding(a, &headers);
+    let peer = peer.map_or(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), |Extension(ConnectInfo(p))| p);
+    let Some(slot) = a.per_ip.admit(access::client_ip(peer, a.client_ip_header.as_ref(), &headers)) else {
+        tracing::debug!("refused a client: too many connections from its address");
+        return (StatusCode::TOO_MANY_REQUESTS, "too many connections from your address\n").into_response();
+    };
     let id = st.next_session.fetch_add(1, Ordering::Relaxed);
-    upgrade
-        .max_message_size(64 * 1024)
-        .on_upgrade(move |socket| session::run(socket, st.hub, st.sessions, id, st.closing))
+    upgrade.max_message_size(64 * 1024).on_upgrade(move |socket| async move {
+        session::run(socket, st.hub, st.sessions, id, st.closing).await;
+        drop(slot);
+    })
+}
+
+/// Log once whether client connections arrive with the client-address header, so an operator
+/// can tell whether `TR_CLIENT_IP_HEADER` and a per-address cap will work behind their edge.
+/// Only whether the header is there, never what it holds.
+fn note_forwarding(a: &Access, headers: &HeaderMap) {
+    if a.noted.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let name = a.client_ip_header.clone().unwrap_or(HeaderName::from_static("x-forwarded-for"));
+    let seen = if headers.contains_key(&name) { "carries" } else { "has no" };
+    tracing::info!("the first client connection {seen} a {name} header");
+}
+
+/// `/stats` and `/metrics` as if they weren't there, unless the request carries the token.
+fn hidden(st: &AppState, headers: &HeaderMap) -> Option<Response> {
+    (!access::operator(st.access.metrics_token.as_ref(), headers)).then(|| StatusCode::NOT_FOUND.into_response())
 }
 
 async fn readyz(State(st): State<AppState>) -> Response {
@@ -127,11 +185,17 @@ pub fn stats(st: &AppState) -> Stats {
     }
 }
 
-async fn stats_json(State(st): State<AppState>) -> Response {
+async fn stats_json(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(r) = hidden(&st, &headers) {
+        return r;
+    }
     axum::Json(stats(&st)).into_response()
 }
 
-async fn metrics(State(st): State<AppState>) -> Response {
+async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(r) = hidden(&st, &headers) {
+        return r;
+    }
     let s = stats(&st);
     let mut o = String::new();
     let mut put = |name: &str, kind: &str, help: &str, rows: &[(String, f64)]| {
