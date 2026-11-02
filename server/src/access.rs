@@ -33,14 +33,16 @@ impl fmt::Debug for Secret {
 }
 
 /// Whether a request may read `/stats` and `/metrics`: always without a token, and with one
-/// only when it sends `Authorization: Bearer <token>`.
+/// only when it sends `Authorization: Bearer <token>`. The scheme's case doesn't matter (RFC
+/// 9110 §11.1); the token's does.
 pub fn operator(token: Option<&Secret>, headers: &HeaderMap) -> bool {
     let Some(token) = token else { return true };
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|given| token.matches(given.trim()))
+        .and_then(|v| v.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .is_some_and(|(_, given)| token.matches(given.trim()))
 }
 
 /// The client's address: the last entry of `header` when it is set and parses (the entry the
@@ -141,6 +143,10 @@ mod tests {
         assert!(!operator(Some(&t), &headers(&[("authorization", "Basic s3cret")])));
         assert!(!operator(Some(&t), &headers(&[("authorization", "s3cret")])));
         assert!(operator(Some(&t), &headers(&[("authorization", "Bearer s3cret")])));
+        assert!(operator(Some(&t), &headers(&[("authorization", "bearer s3cret")])), "the scheme ignores case");
+        assert!(operator(Some(&t), &headers(&[("authorization", "BEARER  s3cret")])));
+        assert!(!operator(Some(&t), &headers(&[("authorization", "Bearer S3CRET")])), "the token doesn't");
+        assert!(!operator(Some(&t), &headers(&[("authorization", "Bearers3cret")])));
         assert_eq!(format!("{t:?}"), "Secret(..)", "Debug never shows the value");
     }
 

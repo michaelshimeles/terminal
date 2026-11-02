@@ -92,6 +92,7 @@ async fn a_token_hides_stats_and_metrics_from_everyone_without_it() {
         assert_eq!(get(&gw, path, Some("Bearer wrong")).await, 404, "{path} with a wrong token");
         assert_eq!(get(&gw, path, Some("t0ken")).await, 404, "{path} without the Bearer scheme");
         assert_eq!(get(&gw, path, Some("Bearer t0ken")).await, 200, "{path} with the token");
+        assert_eq!(get(&gw, path, Some("bearer t0ken")).await, 200, "{path}: the scheme ignores case");
     }
     assert_eq!(get(&gw, "/healthz", None).await, 200, "health checks need no token");
     let mut ws = connect(&gw, None).await.expect("clients need no token");
