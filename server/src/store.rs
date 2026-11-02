@@ -115,13 +115,14 @@ impl MidsTable {
         let v = *self.version.borrow() + 1;
         let mut changed = false;
         {
+            // The map, then the delisted set: the same order as `set_delisted`.
             let mut map = self.map.write().expect("mids lock");
+            let delisted = self.delisted.read().expect("delisted lock");
             let present: HashSet<&str> = mids.iter().map(|(c, _)| c.as_str()).collect();
             let before = map.len();
-            map.retain(|c, m| &*m.venue != venue || present.contains(c.as_str()));
+            map.retain(|c, m| (&*m.venue != venue || present.contains(c.as_str())) && !delisted.contains(c));
             changed |= map.len() != before;
             let name: Arc<str> = Arc::from(venue);
-            let delisted = self.delisted.read().expect("delisted lock");
             for (coin, px) in mids.into_iter().filter(|(c, _)| !delisted.contains(c)) {
                 match map.get_mut(&coin) {
                     Some(m) if m.px == px => {}
@@ -143,14 +144,16 @@ impl MidsTable {
     }
 
     /// Take the venues' latest delisted markets, and drop their mids.
+    /// Both change under the map's lock, so a mids message can't slip a newly delisted market
+    /// back in between.
     fn set_delisted(&self, delisted: HashSet<String>) {
         let removed = {
             let mut map = self.map.write().expect("mids lock");
             let before = map.len();
             map.retain(|c, _| !delisted.contains(c));
+            *self.delisted.write().expect("delisted lock") = delisted;
             map.len() != before
         };
-        *self.delisted.write().expect("delisted lock") = delisted;
         if removed {
             self.bump();
         }
@@ -1188,6 +1191,40 @@ mod tests {
         );
         assert_eq!(merge_bars(hist, &[bar(180, 4.0)], 2).len(), 2);
         assert_eq!(merge_bars(vec![], &[bar(0, 1.0)], 5), [bar(0, 1.0)]);
+    }
+
+    /// A delisting can't lose a race with a mids message: once `set_delisted` returns, the market
+    /// is out of the table and stays out, however the venue's feed interleaves with it.
+    #[test]
+    fn a_delisting_never_loses_a_race_with_the_feed() {
+        let feed = || vec![("xyz:TSLA".to_string(), 400.0), ("xyz:AAPL".to_string(), 337.0)];
+        for round in 0..300 {
+            let m = Arc::new(MidsTable::default());
+            m.apply("xyz", Instant::now(), 1, feed());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer = std::thread::spawn({
+                let (m, stop) = (m.clone(), stop.clone());
+                move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        m.apply("xyz", Instant::now(), 2, feed());
+                    }
+                }
+            });
+            std::thread::yield_now();
+            m.set_delisted(["xyz:TSLA".to_string()].into());
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            writer.join().unwrap();
+            m.apply("xyz", Instant::now(), 3, feed());
+            assert!(!m.contains("xyz:TSLA"), "round {round}: the delisted market came back");
+            assert!(m.contains("xyz:AAPL"));
+        }
+        // What a lost race would leave: the market delisted but still in the table. The next
+        // message from its venue takes it out.
+        let m = MidsTable::default();
+        m.apply("xyz", Instant::now(), 1, feed());
+        *m.delisted.write().unwrap() = ["xyz:TSLA".to_string()].into();
+        m.apply("xyz", Instant::now(), 2, feed());
+        assert!(!m.contains("xyz:TSLA"), "a delisted market in the table goes with the next message");
     }
 
     #[test]
