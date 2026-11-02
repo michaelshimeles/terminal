@@ -303,9 +303,14 @@ So `PORT`/`POS`/`ORD`/`ACTV` render HL with modest UI change, **but the market l
 As modelled above, an HL perp row would have no live repricing, no chart link and no trade buttons. The integration therefore adds:
 
 1. **A venue-native market key on `Position`.** A new optional, serde-defaulted field (`market: Option<String>`) that the HL adapter fills with the exact key the gateway publishes in `MarketInfo.key` (`xyz:AAPL` for HIP-3, the core-perp and spot keys as `tr-proto` names them) [repo]. `Position::market_key()` returns it before falling back to today's kind-based mapping, so SnapTrade and demo rows are unchanged. HIP-3 keys resolve through `Security::perp` (`AssetClass::Perp`) [repo: `crates/core/src/security.rs`], never through the stock path.
-2. **Repricing from that key.** `live_price` then works for HL rows unchanged. On testnet, the HL adapter supplies testnet mids under the same keys, so mainnet gateway quotes never price a testnet position.
+2. **Repricing from that key, kept separate per network.** Mainnet HL rows reprice through today's path: `live_price` reads the shared quote map, which `broker_periodic` fills from the gateway [repo]. Testnet rows **must not** use that map. Testnet and mainnet use the same market keys (`xyz:AAPL`), so either network's price could overwrite the other's. The plan:
+   - a separate `testnet_quotes` map owned by the HL adapter, filled only from testnet `allMids` (per dex);
+   - `live_price` takes the account's network (from `Account.is_paper` / the HL account's network) and reads only the matching map;
+   - `broker_periodic` requests gateway quotes only for keys from mainnet accounts (and SnapTrade/demo), never for testnet rows;
+   - the ticket's reference price, fee and liquidation estimates use the same network-selected source (§6.2);
+   - tests feed interleaved mainnet and testnet updates for the same key and assert each row and ticket reads only its own network.
 3. **Row actions.** The `tradable` check in `portfolio_view.rs` also allows rows from an enabled HL account that have a `market`. Close sends a reduce-only order (§6.1), through the same confirmation (§6.3). Chart and key menus use `market`.
-4. **Tests.** Unit tests for `market_key()` precedence (an HL row with `market` set, a SnapTrade `Future` row still `None`), and a `live_price` test with a perp quote.
+4. **Tests.** Unit tests for `market_key()` precedence (an HL row with `market` set, a SnapTrade `Future` row still `None`), and `live_price` tests with perp quotes on both networks.
 
 Unrealized PnL is then repriced from the gateway's live marks on mainnet, or testnet mids on testnet, as the panes already do for SnapTrade rows that have a key [repo]. Realized PnL = Σ `closedPnl` − Σ `fee` over the selected range, with funding shown separately.
 
@@ -315,7 +320,7 @@ Unrealized PnL is then repriced from the gateway's live marks on mainnet, or tes
 
 - `crates/hl` (`tr-hl`): `signing` (§3.4), `actions` (order, cancel, cancelByCloid, modify, batchModify, updateLeverage, scheduleCancel, noop, approveAgent, approveBuilderFee, structs with explicit field order), `assets` (the registry, §5.1), `rounding` (§5.2), `client` (`/info` and `/exchange` over `reqwest`, which already compiles for wasm in this workspace [repo]), `stream` (user websocket), `nonce`. No `tokio` "full"; it follows `tr-broker`'s wasm split [repo].
 - `tr-broker`: `secrets` gains a second store for agent keys (Keychain service `terminal.hyperliquid`). The existing SnapTrade item is untouched.
-- `tr-broker` `model`: `Position.market: Option<String>` (serde default) and the `market_key()` precedence change from §9. `app/src/app/portfolio_view.rs`: the HL row actions. `app/src/app/broker.rs` `live_price`: no change beyond using the new key.
+- `tr-broker` `model`: `Position.market: Option<String>` (serde default) and the `market_key()` precedence change from §9. `app/src/app/portfolio_view.rs`: the HL row actions. `app/src/app/broker.rs`: a network-aware `live_price` with a separate testnet quote map, and `broker_periodic` requesting gateway quotes only for mainnet keys (§9).
 - `app`: `TradingPrefs.hl: HlPrefs { enabled, network, max_order_value, max_leverage, daily_notional_cap, slippage_bps, dead_mans_switch, agent: Option<AgentMeta> }`. `AgentMeta` holds the public address, name, expiry and network, never the key. New `TradeRequest::Hl(HlRequest)` and `TradeResponse::Hl(..)` variants in the worker. The ticket gets an HL variant, and Settings › Trading gets a Hyperliquid section.
 - `tr-proto` / `tr-gateway`: **no change.** Market data keeps flowing as today. User data and orders never touch the server.
 
