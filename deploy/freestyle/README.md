@@ -6,6 +6,8 @@ The Terminal data server runs on a Freestyle VM at **https://terminal-gateway.st
 TR_SERVER_URL=wss://terminal-gateway.style.dev cargo run --release
 ```
 
+The desktop reads `TR_SERVER_URL` at startup, and the site's deploy workflow reads the repository variable of the same name (`server/README.md`), so moving to another domain changes no code.
+
 ## What runs where
 
 - One VM, slug `terminal-gateway`, from the `freestyle/ubuntu-sm` snapshot: 2 vCPU, 4 GiB of memory, 16 GB of disk.
@@ -36,7 +38,7 @@ A deploy restarts the gateway, which drops every client connection. Clients reco
 curl -fsS https://terminal-gateway.style.dev/healthz   # the process is up
 curl -fsS https://terminal-gateway.style.dev/readyz    # upstream connected, every venue's mids in
 cli() { cargo run -q --release -p tr-gateway --example cli -- --url wss://terminal-gateway.style.dev "$@"; }
-cli stats
+TR_METRICS_TOKEN=... cli stats   # the token only when the gateway has one
 cli watch --quotes BTC --book BTC --trades BTC --bars BTC:1m --secs 30
 ```
 
@@ -46,6 +48,17 @@ On the VM, `systemctl status tr-gateway` and `journalctl -u tr-gateway` show the
 
 2 vCPU and 4 GiB running around the clock come to about $80 a month of Freestyle usage above the free allowance.
 
-## `/stats` and `/metrics` are public
+## Settings and the operator token
 
-Anyone can read `/stats` (JSON) and `/metrics` (Prometheus text) through the public URL right now. They show counts, budgets, latency and the upstream subscriptions, which reveal the markets clients are watching. They carry no client addresses or user data. Micky hasn't decided whether to restrict them, so they stay as they are for now. Restricting them later means serving them on a second port the edge doesn't publish, or checking a token.
+`/stats` (JSON) and `/metrics` (Prometheus text) show counts, budgets, latency and the upstream subscriptions, which reveal the markets clients are watching. They carry no client addresses or user data. With `TR_METRICS_TOKEN` set they answer 404 to anyone without the token, and `/healthz` and `/readyz` stay public.
+
+Settings for the service go in `/etc/tr-gateway/env` on the VM, one `NAME=value` a line, readable only by root. `vm-setup.sh` creates the directory but never writes or prints the file, so a deploy keeps it. To create a token on the VM without it crossing the network or a terminal:
+
+```sh
+npx -y freestyle@0.2.21 vm exec terminal-gateway --linux-user root -- bash -c \
+  'umask 077; f=/etc/tr-gateway/env; grep -q ^TR_METRICS_TOKEN= "$f" 2>/dev/null || echo "TR_METRICS_TOKEN=$(openssl rand -hex 32)" >> "$f"; systemctl restart tr-gateway'
+```
+
+Reading it back for `cli stats` or a scraper prints it, so do that off stream. Without the token, `cli stats` says the server answered 404.
+
+The unit also caps the service at 3 GiB of memory (reclaiming hard past 2 GiB) and 512 tasks, and runs it with most of systemd's sandboxing on: no capabilities, a read-only system, no devices, no kernel tunables or modules, and only IP, Unix and netlink sockets. `systemd-analyze security` rates it 3.1 (OK), down from 8.3 (exposed) before.

@@ -50,7 +50,14 @@ jobs:
           echo "$SHA256  $RUNNER_TEMP/binaryen.tar.gz" | sha256sum -c -
           tar xzf "$RUNNER_TEMP/binaryen.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/binaryen-$BINARYEN/bin" >> "$GITHUB_PATH"
-      - run: scripts/build-web.sh
+      # The repository variable TR_SERVER_URL, when set, picks the server the site connects to,
+      # for example after the gateway moves to a custom domain. Unset, build-web.sh's default holds.
+      - name: Build the browser app
+        env:
+          SERVER_URL: ${{ vars.TR_SERVER_URL }}
+        run: |
+          if [ -n "$SERVER_URL" ]; then export TR_SERVER_URL="$SERVER_URL"; fi
+          scripts/build-web.sh
       - uses: actions/upload-artifact@v7
         with:
           name: web-app

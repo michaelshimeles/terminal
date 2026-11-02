@@ -265,6 +265,9 @@ async fn serve(
     let mut writer_done = false;
     let mut rpcs = tokio::task::JoinSet::new();
     let rate = crate::limit::WindowLimiter::new(cfg.max_messages_per_10s, Duration::from_secs(10));
+    // Messages over the budget, each answered with RateLimited. Another budget's worth of those
+    // in 10 s and the client is flooding, not bursting: it's closed.
+    let strikes = crate::limit::WindowLimiter::new(cfg.max_messages_per_10s, Duration::from_secs(10));
 
     loop {
         tokio::select! {
@@ -278,6 +281,14 @@ async fn serve(
                     continue;
                 };
                 if rate.try_acquire(1).is_err() {
+                    if strikes.try_acquire(1).is_err() {
+                        tracing::debug!("session {session}: still flooding after RateLimited; closing");
+                        let m = format!("over {} messages in 10 s, again and again; closing", cfg.max_messages_per_10s);
+                        link.send(&ServerMsg::Error { code: ErrorCode::RateLimited, message: m }, None).await;
+                        let close = Message::Close(Some(CloseFrame { code: 1008, reason: "rate limited".into() }));
+                        let _ = tokio::time::timeout(cfg.slow_consumer, link.out.send(Out { msg: close, recv: None })).await;
+                        break;
+                    }
                     let m = format!("more than {} messages in 10 s; this one was ignored", cfg.max_messages_per_10s);
                     link.send(&ServerMsg::Error { code: ErrorCode::RateLimited, message: m }, None).await;
                     continue;

@@ -87,12 +87,20 @@ impl Default for VenueState {
 pub struct MidsTable {
     map: RwLock<HashMap<String, Mid>>,
     venues: RwLock<HashMap<String, VenueState>>,
+    /// Markets the venues list as delisted. Hyperliquid keeps publishing their mids, which
+    /// never enter the table.
+    delisted: RwLock<HashSet<String>>,
     version: watch::Sender<u64>,
 }
 
 impl Default for MidsTable {
     fn default() -> Self {
-        Self { map: RwLock::default(), venues: RwLock::default(), version: watch::channel(0).0 }
+        Self {
+            map: RwLock::default(),
+            venues: RwLock::default(),
+            delisted: RwLock::default(),
+            version: watch::channel(0).0,
+        }
     }
 }
 
@@ -107,13 +115,15 @@ impl MidsTable {
         let v = *self.version.borrow() + 1;
         let mut changed = false;
         {
+            // The map, then the delisted set: the same order as `set_delisted`.
             let mut map = self.map.write().expect("mids lock");
+            let delisted = self.delisted.read().expect("delisted lock");
             let present: HashSet<&str> = mids.iter().map(|(c, _)| c.as_str()).collect();
             let before = map.len();
-            map.retain(|c, m| &*m.venue != venue || present.contains(c.as_str()));
+            map.retain(|c, m| (&*m.venue != venue || present.contains(c.as_str())) && !delisted.contains(c));
             changed |= map.len() != before;
             let name: Arc<str> = Arc::from(venue);
-            for (coin, px) in mids {
+            for (coin, px) in mids.into_iter().filter(|(c, _)| !delisted.contains(c)) {
                 match map.get_mut(&coin) {
                     Some(m) if m.px == px => {}
                     Some(m) => {
@@ -130,6 +140,22 @@ impl MidsTable {
         changed |= self.set_venue(venue, |st| st.status = TopicStatus::Live);
         if changed {
             self.version.send_replace(v);
+        }
+    }
+
+    /// Take the venues' latest delisted markets, and drop their mids.
+    /// Both change under the map's lock, so a mids message can't slip a newly delisted market
+    /// back in between.
+    fn set_delisted(&self, delisted: HashSet<String>) {
+        let removed = {
+            let mut map = self.map.write().expect("mids lock");
+            let before = map.len();
+            map.retain(|c, _| !delisted.contains(c));
+            *self.delisted.write().expect("delisted lock") = delisted;
+            map.len() != before
+        };
+        if removed {
+            self.bump();
         }
     }
 
@@ -615,12 +641,27 @@ impl Hub {
 
     async fn refresh_registry(self: &Arc<Self>) -> Result<usize> {
         let list = self.provider.instruments().await?;
-        let n = list.len();
-        let mut venues: Vec<String> =
-            list.iter().filter(|d| d.kind == InstrumentKind::Perp).map(|d| d.venue.clone()).collect();
+        let (n, mut venues, delisted, newly) = {
+            let mut reg = self.registry.write().expect("registry lock");
+            // A venue missing from this list failed to load: it keeps what it listed last time,
+            // so its delisted markets stay delisted.
+            let fresh: HashSet<&str> = list.iter().map(|d| d.venue.as_str()).collect();
+            let kept: Vec<InstrumentDef> =
+                reg.values().filter(|d| !fresh.contains(d.venue.as_str())).cloned().collect();
+            let before: HashSet<String> = reg.values().filter(|d| d.delisted).map(|d| d.id.0.clone()).collect();
+            *reg = list.into_iter().chain(kept).map(|d| (d.id.0.clone(), d)).collect();
+            let delisted: HashSet<String> = reg.values().filter(|d| d.delisted).map(|d| d.id.0.clone()).collect();
+            let newly: HashSet<String> = delisted.difference(&before).cloned().collect();
+            let live = reg.values().filter(|d| !d.delisted);
+            // Only venues with something live get a mids feed.
+            let venues: Vec<String> =
+                live.clone().filter(|d| d.kind == InstrumentKind::Perp).map(|d| d.venue.clone()).collect();
+            (live.count(), venues, delisted, newly)
+        };
         venues.sort();
         venues.dedup();
-        *self.registry.write().expect("registry lock") = list.into_iter().map(|d| (d.id.0.clone(), d)).collect();
+        self.mids.set_delisted(delisted);
+        self.end_delisted(&newly);
         self.listing
             .lock()
             .expect("listing lock")
@@ -660,6 +701,25 @@ impl Hub {
         Ok(n)
     }
 
+    /// End the streams of markets that were just delisted: their subscribers hear why, and the
+    /// upstream subscriptions go.
+    fn end_delisted(&self, newly: &HashSet<String>) {
+        if newly.is_empty() {
+            return;
+        }
+        let ended: Vec<(InstrumentId, Entry)> = {
+            let mut topics = self.topics.lock().expect("topics lock");
+            let keys: Vec<TopicKey> =
+                topics.keys().filter(|k| newly.contains(k.channel().1.as_str())).cloned().collect();
+            keys.into_iter().filter_map(|k| Some((k.channel().1.clone(), topics.remove(&k)?))).collect()
+        };
+        // Dropping an entry drops its upstream handle; do it outside the hub's locks.
+        for (inst, e) in ended {
+            let detail = format!("{inst} is delisted");
+            e.topic.fail(TopicStatus::Unavailable { reason: UnavailableReason::UnknownMarket, detail });
+        }
+    }
+
     /// Note that a venue's mids feed sent data or was refused. The hub is ready once every venue
     /// from the first instrument list has done so. A venue that stays silent holds it back for
     /// `venue_grace` at most. Mids stream all the time, so the first message after that settles it.
@@ -693,7 +753,9 @@ impl Hub {
     /// Why `key` doesn't resolve. While venues are still loading that is an upstream problem,
     /// which clients retry, rather than an unknown market, which they don't.
     pub fn unknown(&self, key: &MarketKey) -> Unavailable {
-        if self.loading() {
+        if self.delisted(key.as_str().trim()) {
+            (UnavailableReason::UnknownMarket, format!("{key} is delisted"))
+        } else if self.loading() {
             (UnavailableReason::Upstream, format!("{key} isn't known yet; some venues are still loading"))
         } else {
             (UnavailableReason::UnknownMarket, format!("unknown market {key}"))
@@ -717,13 +779,19 @@ impl Hub {
         let _ = self.ready.subscribe().wait_for(|r| *r).await;
     }
 
+    /// Whether the venue lists `coin` but no longer trades it.
+    pub fn delisted(&self, coin: &str) -> bool {
+        self.registry.read().expect("registry lock").get(coin).is_some_and(|d| d.delisted)
+    }
+
     /// Map a client's market key to the upstream instrument. Venue-native keys (`BTC`,
-    /// `xyz:TSLA`, `@107`, `PURR/USDC`) pass through when the venue lists them. Crypto market
-    /// keys (`BTCUSD Curncy`) map to the core perp, which every quote labels with its source.
-    /// Nothing maps an equity key to a HIP-3 perp yet (open question 9 in the design).
+    /// `xyz:TSLA`, `@107`, `PURR/USDC`) pass through when the venue lists them and they aren't
+    /// delisted. Crypto market keys (`BTCUSD Curncy`) map to the core perp, which every quote
+    /// labels with its source. An equity key never maps to a HIP-3 perp: `AAPL US Equity` is
+    /// the listed stock, and clients ask for its perp by name, `xyz:AAPL` (design §7).
     pub fn resolve(&self, key: &MarketKey) -> Option<InstrumentId> {
         let k = key.as_str().trim();
-        let known = |c: &str| self.mids.contains(c).then(|| InstrumentId::new(c));
+        let known = |c: &str| (self.mids.contains(c) && !self.delisted(c)).then(|| InstrumentId::new(c));
         if let Some(i) = known(k) {
             return Some(i);
         }
@@ -742,20 +810,21 @@ impl Hub {
         self.registry.read().expect("registry lock").get(coin).and_then(|d| d.prev_day)
     }
 
-    /// Every market with a live mid.
+    /// Every market with a live mid that isn't delisted.
     pub fn markets(&self) -> Vec<MarketInfo> {
         let reg = self.registry.read().expect("registry lock");
-        let mut out: Vec<MarketInfo> = self
-            .mids
-            .coins()
-            .into_iter()
-            .map(|c| {
-                let (venue, kind) = match reg.get(&c) {
+        let mids = self.mids.map.read().expect("mids lock");
+        let mut out: Vec<MarketInfo> = mids
+            .iter()
+            .filter_map(|(c, m)| {
+                let (venue, kind) = match reg.get(c) {
+                    Some(d) if d.delisted => return None,
                     Some(d) => (d.venue.clone(), d.kind),
                     None if c.starts_with('@') || c.contains('/') => ("spot".into(), InstrumentKind::Spot),
-                    None => (String::new(), InstrumentKind::Perp),
+                    // Listed after the last instrument refresh: its feed says where it trades.
+                    None => (m.venue.to_string(), InstrumentKind::Perp),
                 };
-                MarketInfo { key: MarketKey(c), venue, kind }
+                Some(MarketInfo { key: MarketKey(c.clone()), venue, kind })
             })
             .collect();
         out.sort_by(|a, b| (&a.venue, &a.key).cmp(&(&b.venue, &b.key)));
@@ -893,6 +962,151 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{Capabilities, DisplayPolicy, ProviderId};
+
+    /// A provider that lists the instruments a test sets, records which venues' mids are
+    /// subscribed, and counts the other upstream subscriptions dropped.
+    struct Listed(Mutex<Vec<InstrumentDef>>, Mutex<Vec<String>>, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Listed {
+        fn new(defs: Vec<InstrumentDef>) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(defs), Mutex::default(), Arc::default()))
+        }
+        fn set(&self, defs: Vec<InstrumentDef>) {
+            *self.0.lock().unwrap() = defs;
+        }
+        fn dropped(&self) -> usize {
+            self.2.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Listed {
+        fn id(&self) -> ProviderId {
+            ProviderId("listed")
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { channels: vec![], kinds: vec![] }
+        }
+        fn display_policy(&self) -> DisplayPolicy {
+            DisplayPolicy { public_display: true, entitlement: None, delay: None, attribution: "test" }
+        }
+        async fn instruments(&self) -> Result<Vec<InstrumentDef>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn history(&self, _: &InstrumentId, _: Timeframe, _: Option<i64>, _: usize) -> Result<Vec<Bar>> {
+            Ok(vec![])
+        }
+        async fn subscribe(
+            &self,
+            ch: Channel,
+            i: &InstrumentId,
+            _: UpstreamSink,
+        ) -> Result<UpstreamHandle, SubscribeError> {
+            if ch == Channel::Mids {
+                self.1.lock().unwrap().push(i.0.clone());
+                return Ok(UpstreamHandle::new(()));
+            }
+            Ok(UpstreamHandle::new(Counted(self.2.clone())))
+        }
+    }
+
+    fn def(id: &str, venue: &str, delisted: bool) -> InstrumentDef {
+        InstrumentDef {
+            id: InstrumentId::new(id),
+            venue: venue.into(),
+            kind: InstrumentKind::Perp,
+            prev_day: None,
+            delisted,
+        }
+    }
+
+    /// Hyperliquid keeps publishing mids for delisted markets, on the core dex and on HIP-3 dexes
+    /// (all 56 delisted core perps and all 155 delisted HIP-3 perps had one on 2026-11-02). Only
+    /// the instrument list says they're gone, and the gateway must not list, resolve or stream them.
+    #[tokio::test]
+    async fn delisted_markets_are_not_served() {
+        let defs = vec![
+            def("BTC", "", false),
+            def("MATIC", "", true),
+            def("xyz:TSLA", "xyz", false),
+            def("xyz:VIX", "xyz", true),
+            def("flx:NVDA", "flx", true),
+        ];
+        let provider = Listed::new(defs);
+        let hub = Hub::new(provider.clone(), HubConfig::default(), Arc::default());
+        hub.refresh_registry().await.unwrap();
+        let now = Instant::now();
+        let mids = |v: &[(&str, f64)]| v.iter().map(|(c, p)| (c.to_string(), *p)).collect::<Vec<_>>();
+        hub.mids.apply("", now, 1, mids(&[("BTC", 100.0), ("MATIC", 0.2), ("@107", 30.0)]));
+        hub.mids.apply("xyz", now, 1, mids(&[("xyz:TSLA", 400.0), ("xyz:VIX", 16.0)]));
+        let resolve = |k: &str| hub.resolve(&MarketKey::new(k)).map(|i| i.0);
+        assert_eq!(resolve("xyz:TSLA").as_deref(), Some("xyz:TSLA"));
+        assert_eq!(resolve("BTCUSD Curncy").as_deref(), Some("BTC"));
+        assert_eq!(resolve("@107").as_deref(), Some("@107"), "spot isn't in the perp list and still resolves");
+        for gone in ["xyz:VIX", "MATIC", "MATIC-PERP", "MATICUSD Curncy"] {
+            assert_eq!(resolve(gone), None, "{gone}");
+        }
+        let (reason, detail) = hub.unknown(&MarketKey::new("xyz:VIX"));
+        assert_eq!(reason, UnavailableReason::UnknownMarket);
+        assert!(detail.contains("delisted"), "{detail}");
+        let listed: Vec<(String, String)> = hub.markets().into_iter().map(|m| (m.key.0, m.venue)).collect();
+        let want = [("BTC", ""), ("@107", "spot"), ("xyz:TSLA", "xyz")].map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(listed, want);
+        assert_eq!(*provider.1.lock().unwrap(), ["", "xyz"], "a dex with nothing live gets no mids feed");
+    }
+
+    /// A dex whose `meta` call fails is missing from that refresh. Its markets keep what the
+    /// last refresh said, so its delisted ones stay delisted. A market delisted while clients
+    /// watch it loses its streams: they're told why, and the upstream subscriptions go.
+    #[tokio::test]
+    async fn delistings_hold_through_failed_refreshes_and_end_open_streams() {
+        let listing = |tsla_delisted: bool| {
+            vec![
+                def("BTC", "", false),
+                def("xyz:TSLA", "xyz", tsla_delisted),
+                def("xyz:AAPL", "xyz", false),
+                def("xyz:VIX", "xyz", true),
+            ]
+        };
+        let provider = Listed::new(listing(false));
+        let hub = Hub::new(provider.clone(), HubConfig::default(), Arc::default());
+        hub.refresh_registry().await.unwrap();
+        let now = Instant::now();
+        let xyz = || [("xyz:TSLA", 400.0), ("xyz:AAPL", 337.0), ("xyz:VIX", 16.0)].map(|(c, p)| (c.to_string(), p));
+        hub.mids.apply("xyz", now, 1, xyz().to_vec());
+        assert!(!hub.mids.contains("xyz:VIX"), "a delisted market's mid never enters the table");
+        let resolve = |k: &str| hub.resolve(&MarketKey::new(k)).map(|i| i.0);
+        // xyz's `meta` call fails: the refresh lists only the core dex.
+        provider.set(vec![def("BTC", "", false)]);
+        hub.refresh_registry().await.unwrap();
+        hub.mids.apply("xyz", now, 2, xyz().to_vec());
+        assert_eq!(resolve("xyz:VIX"), None, "still delisted");
+        assert_eq!(resolve("xyz:TSLA").as_deref(), Some("xyz:TSLA"), "still live");
+        // xyz:TSLA is delisted while a client watches its book and trades.
+        let book = hub.acquire(TopicKey::Book(InstrumentId::new("xyz:TSLA"))).await.unwrap();
+        let trades = hub.acquire(TopicKey::Trades(InstrumentId::new("xyz:TSLA"))).await.unwrap();
+        let (Topic::Book(b), Topic::Trades(t)) = (&book.topic, &trades.topic) else { panic!("topics") };
+        let mut rx = b.state.subscribe();
+        provider.set(listing(true));
+        hub.refresh_registry().await.unwrap();
+        let gone = |s: &TopicStatus| matches!(s, TopicStatus::Unavailable { reason: UnavailableReason::UnknownMarket, detail } if detail.contains("delisted"));
+        assert!(gone(&rx.borrow_and_update().status), "book subscribers are told");
+        assert!(gone(&t.snapshot().2), "trades subscribers are told");
+        assert_eq!(provider.dropped(), 2, "both upstream subscriptions went");
+        assert_eq!((hub.topic_counts().book, hub.topic_counts().trades), (0, 0));
+        assert!(!hub.mids.contains("xyz:TSLA") && resolve("xyz:TSLA").is_none());
+        assert_eq!(hub.markets().into_iter().map(|m| m.key.0).collect::<Vec<_>>(), ["xyz:AAPL"]);
+        drop((book, trades));
+    }
 
     fn up(event: UpstreamEvent) -> Upstream {
         Upstream { recv: Instant::now(), recv_ms: 1, event }
@@ -977,6 +1191,40 @@ mod tests {
         );
         assert_eq!(merge_bars(hist, &[bar(180, 4.0)], 2).len(), 2);
         assert_eq!(merge_bars(vec![], &[bar(0, 1.0)], 5), [bar(0, 1.0)]);
+    }
+
+    /// A delisting can't lose a race with a mids message: once `set_delisted` returns, the market
+    /// is out of the table and stays out, however the venue's feed interleaves with it.
+    #[test]
+    fn a_delisting_never_loses_a_race_with_the_feed() {
+        let feed = || vec![("xyz:TSLA".to_string(), 400.0), ("xyz:AAPL".to_string(), 337.0)];
+        for round in 0..300 {
+            let m = Arc::new(MidsTable::default());
+            m.apply("xyz", Instant::now(), 1, feed());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer = std::thread::spawn({
+                let (m, stop) = (m.clone(), stop.clone());
+                move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        m.apply("xyz", Instant::now(), 2, feed());
+                    }
+                }
+            });
+            std::thread::yield_now();
+            m.set_delisted(["xyz:TSLA".to_string()].into());
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            writer.join().unwrap();
+            m.apply("xyz", Instant::now(), 3, feed());
+            assert!(!m.contains("xyz:TSLA"), "round {round}: the delisted market came back");
+            assert!(m.contains("xyz:AAPL"));
+        }
+        // What a lost race would leave: the market delisted but still in the table. The next
+        // message from its venue takes it out.
+        let m = MidsTable::default();
+        m.apply("xyz", Instant::now(), 1, feed());
+        *m.delisted.write().unwrap() = ["xyz:TSLA".to_string()].into();
+        m.apply("xyz", Instant::now(), 2, feed());
+        assert!(!m.contains("xyz:TSLA"), "a delisted market in the table goes with the next message");
     }
 
     #[test]

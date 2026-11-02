@@ -97,6 +97,8 @@ pub struct ChartState {
     paging: bool,
     exhausted: bool,
     error: Option<String>,
+    /// Why the bars shown, from the disk cache, couldn't be refreshed.
+    stale: Option<String>,
     built: Vec<BuiltIndicator>,
     compare_line: Option<LineRef>,
     compare_scale: f64,
@@ -115,6 +117,9 @@ pub struct ChartState {
     /// The workspace drew this chart's controls in the pane's tab strip, so skip the
     /// header row and give the plot the space.
     pub controls_in_strip: bool,
+    /// What `PERP` would switch this chart to (its live HIP-3 perp, or a perp's listed
+    /// instrument), set by the app each frame.
+    pub switch_to: Option<&'static str>,
 }
 
 impl ChartState {
@@ -148,6 +153,7 @@ impl ChartState {
             paging: false,
             exhausted: false,
             error: None,
+            stale: None,
             built: Vec::new(),
             compare_line: None,
             compare_scale: 1.0,
@@ -161,6 +167,7 @@ impl ChartState {
             actions: Vec::new(),
             hover_enabled: true,
             controls_in_strip: false,
+            switch_to: None,
         }
     }
 
@@ -175,6 +182,7 @@ impl ChartState {
         self.paging = false;
         self.exhausted = false;
         self.error = None;
+        self.stale = None;
         self.viewport = None;
         self.manual_scale = None;
         self.glide = None;
@@ -425,6 +433,7 @@ impl ChartState {
         self.exhausted = end_of_history(self.exhausted, exhausted, prepended, full);
         if !from_cache {
             self.loading = false;
+            self.stale = None;
         }
         self.error = None;
         match self.viewport.as_mut() {
@@ -451,13 +460,33 @@ impl ChartState {
         }
     }
 
+    /// The range row's status: errors, loading, or how many bars are shown and from where.
+    fn status_text(&self) -> String {
+        match (&self.error, self.loading, self.paging) {
+            (Some(e), _, _) => format!("ERR {e}"),
+            (_, true, _) => "loading…".into(),
+            (_, _, true) => "loading history…".into(),
+            _ => format!(
+                "{} {}bars{}{}{}",
+                self.bars.len(),
+                if self.stale.is_some() { "cached " } else { "" },
+                self.stale.as_deref().map(|e| format!(" · {e}")).unwrap_or_default(),
+                if self.log { "  LOG" } else { "" },
+                if self.magnet { "  MAGNET" } else { "" }
+            ),
+        }
+    }
+
     pub fn on_history_error(&mut self, generation: u64, error: String) {
         if generation == self.generation {
+            let paging = std::mem::take(&mut self.paging);
             self.loading = false;
-            self.paging = false;
             self.exhausted = true;
             if self.bars.is_empty() {
                 self.error = Some(error);
+            } else if !paging {
+                // The refresh after painting from the disk cache failed.
+                self.stale = Some(error);
             }
         }
     }
@@ -562,6 +591,9 @@ impl ChartState {
             );
             hui.spacing_mut().item_spacing.x = 6.0;
             hui.label(RichText::new(&self.sec.ticker).font(mono(12.0)).color(amber()));
+            if self.sec.class == AssetClass::Perp {
+                hui.label(RichText::new(tr_core::perps::badge(&self.symbol)).font(ui_font(11.0)).color(theme::perp()));
+            }
             if hui.available_width() > Self::controls_width(&hui) {
                 clicked |= self.controls(&mut hui, w);
             } else {
@@ -614,24 +646,18 @@ impl ChartState {
             }
             rx = lr.right();
         }
-        let status = match (&self.error, self.loading, self.paging) {
-            (Some(e), _, _) => format!("ERR {e}"),
-            (_, true, _) => "loading…".into(),
-            (_, _, true) => "loading history…".into(),
-            _ => format!(
-                "{} bars{}{}",
-                self.bars.len(),
-                if self.log { "  LOG" } else { "" },
-                if self.magnet { "  MAGNET" } else { "" }
-            ),
-        };
-        painter.text(
+        let status_color = if self.error.is_some() || self.stale.is_some() { theme::down() } else { muted() };
+        let status = painter.text(
             pos2(range_row.right() - 6.0, range_row.center().y),
             Align2::RIGHT_CENTER,
-            status,
+            self.status_text(),
             mono(10.5),
-            muted(),
+            status_color,
         );
+        if let Some(target) = self.switch_to {
+            let room = status.left() - 12.0 - (rx + 10.0);
+            clicked |= self.switch_chip(ui, &painter, pos2(rx + 10.0, range_row.center().y), room, target);
+        }
 
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
         let plot_all = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
@@ -641,6 +667,11 @@ impl ChartState {
 
         let Some(gpu) = self.gpu.clone() else {
             let msg = self.error.clone().unwrap_or_else(|| format!("Loading {} {}…", self.symbol, self.tf));
+            if self.sec.class == AssetClass::Perp {
+                let badge = tr_core::perps::badge(&self.symbol);
+                let below = plot_all.center() + vec2(0.0, 20.0);
+                painter.text(below, Align2::CENTER_CENTER, badge, ui_font(11.5), theme::perp());
+            }
             painter.text(plot_all.center(), Align2::CENTER_CENTER, msg, mono(13.0), amber_dim());
             return clicked;
         };
@@ -1086,6 +1117,36 @@ impl ChartState {
         }
     }
 
+    /// The range row's link between a security and its HIP-3 perp, drawn when it fits in
+    /// `room`. Clicking it (or ⇧P) loads the other one here.
+    fn switch_chip(&mut self, ui: &Ui, painter: &egui::Painter, left: Pos2, room: f32, target: &str) -> bool {
+        let to_perp = tr_core::perps::is_perp(target);
+        let label = if to_perp { format!("⇄ {target} PERP") } else { format!("⇄ {target}") };
+        let g = painter.layout_no_wrap(label, mono(11.0), theme::perp());
+        if g.size().x + 10.0 > room {
+            return false;
+        }
+        let r = Rect::from_min_size(pos2(left.x, left.y - RANGE_H / 2.0 + 2.0), vec2(g.size().x + 10.0, RANGE_H - 4.0));
+        let resp = ui.interact(r, ui.id().with((self.id, "perp-switch")), Sense::click());
+        let fill = if resp.hovered() { theme::control_hover() } else { theme::control() };
+        painter.rect_filled(r, 3.0, fill);
+        painter.galley(pos2(r.left() + 5.0, r.center().y - g.size().y / 2.0), g, theme::perp());
+        let tip = match tr_core::perps::link_for(if to_perp { target } else { &self.symbol }) {
+            Some(l) if to_perp => format!(
+                "Open {target}, the HIP-3 perp on Hyperliquid's {} dex (⇧P). It references {}. A perp's price \
+                 can differ from the listed instrument's, and it trades when that market is closed.",
+                tr_core::perps::venue(target).unwrap_or("xyz"),
+                l.reference
+            ),
+            _ => format!("Open {target}, the listed instrument this perp references (⇧P)"),
+        };
+        let resp = resp.on_hover_text(tip);
+        if resp.clicked() {
+            self.actions.push(Action::OpenChart(target.to_string()));
+        }
+        resp.clicked()
+    }
+
     fn paint_legend(&self, ui: &Ui, price_rect: Rect, i: usize, sub_rects: &[(Rect, usize, PriceScale)]) {
         let Some(b) = self.bars.get(i) else { return };
         let p = ui.painter_at(price_rect);
@@ -1101,6 +1162,9 @@ impl ChartState {
             *x += g.size().x + 8.0;
         };
         put(format!("{} · {}", self.sec.ticker, self.tf), amber(), &mut x);
+        if self.sec.class == AssetClass::Perp {
+            put(tr_core::perps::badge(&self.symbol), theme::perp(), &mut x);
+        }
         for (k, val) in [("O", b.open), ("H", b.high), ("L", b.low), ("C", b.close)] {
             put(format!("{k}{val:.dec$}"), col, &mut x);
         }
@@ -1446,6 +1510,27 @@ fn end_of_history(was: bool, exhausted: bool, prepended: usize, full: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bars from the disk cache whose refresh failed say so, so a perp whose server is down
+    /// never passes for live. A failed page of older bars leaves the shown ones as they are.
+    #[test]
+    fn cached_bars_that_could_not_refresh_say_why() {
+        let down = "the Terminal server is not reachable";
+        let mut c = ChartState::new(1, "xyz:AAPL", Timeframe::M15);
+        c.on_history_error(c.generation, down.into());
+        assert_eq!(c.status_text(), format!("ERR {down}"), "with nothing to show, the error is the message");
+        c.error = None;
+        c.bars = Arc::new((0..3).map(|i| Bar::new(i * 900, 1.0, 1.0, 1.0, 1.0, 1.0)).collect());
+        c.on_history_error(c.generation, down.into());
+        assert_eq!(c.status_text(), format!("3 cached bars · {down}"));
+        c.on_history_error(c.generation + 1, "another load".into());
+        assert_eq!(c.status_text(), format!("3 cached bars · {down}"), "other generations are ignored");
+        let mut p = ChartState::new(2, "xyz:AAPL", Timeframe::M15);
+        p.bars = c.bars.clone();
+        p.paging = true;
+        p.on_history_error(p.generation, down.into());
+        assert_eq!(p.status_text(), "3 bars", "a failed page doesn't make the shown bars stale");
+    }
 
     #[test]
     fn a_full_load_from_a_new_source_can_page_again() {

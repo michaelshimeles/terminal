@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tr_core::{Bar, Timeframe, sample};
 
-use crate::{LiveFeed, MarketData, OptionChain, OrderBook, rt, security};
+use crate::{LiveFeed, MarketData, OptionChain, OrderBook, Quote, is_perp, perp_needs_server, rt, security};
 
 /// Deterministic synthetic data anchored at a fixed "now" per process, so paging is
 /// consistent: page N+1 is exactly the bars preceding page N. Levels and volatility
@@ -48,25 +48,48 @@ impl MarketData for SampleProvider {
         "sample"
     }
 
+    /// HIP-3 perps have no sample data: only the Terminal server provides them.
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
+        if is_perp(symbol) {
+            return Err(perp_needs_server(symbol));
+        }
         Ok(crate::clip(self.bars(symbol, tf), end, limit))
+    }
+
+    /// From daily history, like the default, but leaving out perps instead of failing on them.
+    async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
+        let mut out = Vec::with_capacity(symbols.len());
+        for s in symbols.iter().filter(|s| !is_perp(s)) {
+            let bars = self.history(s, Timeframe::D1, None, 2).await?;
+            if let Some(last) = bars.last() {
+                let prev = if bars.len() > 1 { bars[bars.len() - 2].close } else { last.open };
+                out.push(Quote { symbol: s.clone(), last: last.close, prev_close: prev, ts: last.ts, spark: vec![] });
+            }
+        }
+        Ok(out)
     }
 
     /// A synthetic chain priced with Black-Scholes around the last price.
     async fn options(&self, symbol: &str, expiration: Option<i64>) -> Result<OptionChain> {
+        if is_perp(symbol) {
+            return Err(perp_needs_server(symbol));
+        }
         let spot = self.bars(symbol, Timeframe::D1).last().map(|b| b.close).unwrap_or(100.0);
         Ok(simulated_chain(symbol, spot, expiration, chrono::Utc::now().timestamp()))
     }
 
     /// A synthetic book around the last price; sizes vary with the clock so it moves.
     async fn order_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
+        if is_perp(symbol) {
+            return Err(perp_needs_server(symbol));
+        }
         let last = self.bars(symbol, Timeframe::M1).last().map(|b| b.close).unwrap_or(100.0);
         Ok(simulated_book(symbol, last, depth, chrono::Utc::now().timestamp_millis() as u64 / 500))
     }
 
     /// Random-walk ticks on the last bar every 400 ms, rolling into new bars on schedule.
     fn live(&self, symbol: &str, tf: Timeframe) -> Option<LiveFeed> {
-        if !self.live_ticks {
+        if !self.live_ticks || is_perp(symbol) {
             return None;
         }
         let mut bar = *self.bars(symbol, tf).last()?;

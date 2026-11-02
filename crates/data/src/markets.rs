@@ -6,6 +6,9 @@
 //! | Govt | Treasury.gov daily curve (FRED fallback); Yahoo `^TNX` etc. intraday | Treasury.gov | — |
 //! | Equity/ETF | Alpaca if keyed, else Yahoo | Yahoo spark | — |
 //! | FX/Index/Comdty | Yahoo (`EURUSD=X`, `^GSPC`, `CL=F`) | Yahoo spark | — |
+//! | HIP-3 perps (`xyz:AAPL`) | — | — | — |
+//!
+//! HIP-3 perps come only from the Terminal server ([`crate::remote::RemoteMarkets`]).
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -15,7 +18,9 @@ use crate::alpaca::AlpacaProvider;
 use crate::crypto::CryptoProvider;
 use crate::treasury::TreasuryProvider;
 use crate::yahoo::{YahooProvider, yahoo_symbol};
-use crate::{LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, security};
+use crate::{
+    LiveFeed, MarketData, NewsItem, OptionChain, OrderBook, Quote, SearchHit, YieldCurves, perp_needs_server, security,
+};
 
 pub struct Markets {
     yahoo: YahooProvider,
@@ -47,6 +52,7 @@ impl MarketData for Markets {
     async fn history(&self, symbol: &str, tf: Timeframe, end: Option<i64>, limit: usize) -> Result<Vec<Bar>> {
         let sec = security(symbol);
         match sec.class {
+            AssetClass::Perp => Err(perp_needs_server(symbol)),
             AssetClass::Crypto => self.crypto.history(&sec, tf, end, limit).await,
             AssetClass::Govt if tf.is_intraday() => match catalog::by_security(&sec).and_then(|l| l.yahoo) {
                 Some(y) => self.yahoo.history(y, tf, end, limit).await,
@@ -69,6 +75,7 @@ impl MarketData for Markets {
         for key in symbols {
             let sec = security(key);
             match sec.class {
+                AssetClass::Perp => {}
                 AssetClass::Crypto => crypto.push((key.clone(), sec)),
                 AssetClass::Govt => govt.push((key.clone(), sec)),
                 _ => other.push((key.clone(), sec)),
@@ -123,6 +130,11 @@ impl MarketData for Markets {
             Some(sec) => match sec.class {
                 // Yahoo has no crypto headlines; use CoinDesk's feed.
                 AssetClass::Crypto => return self.crypto.news(&sec).await,
+                // A linked perp shares its underlying's headlines.
+                AssetClass::Perp => match tr_core::perps::link_for(&sec.ticker) {
+                    Some(l) => yahoo_symbol(&security(l.underlying)),
+                    None => return Ok(Vec::new()),
+                },
                 AssetClass::Govt => catalog::by_security(&sec).and_then(|l| l.yahoo).unwrap_or("^TNX").to_string(),
                 _ => yahoo_symbol(&sec),
             },

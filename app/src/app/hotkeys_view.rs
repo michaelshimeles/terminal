@@ -242,6 +242,10 @@ impl TerminalApp {
                     (&["BTCUSD CRNCY", "EURUSD CRNCY"], "Crypto (live) and FX"),
                     (&["US10Y GOVT"], "US Treasury yields"),
                     (&["CL1 CMDTY", "GC1 CMDTY"], "Futures and commodities"),
+                    (
+                        &["xyz:AAPL", "AAPL PERP", "PERP"],
+                        "Hyperliquid HIP-3 perps (needs the Terminal server); PERP or ⇧P switches",
+                    ),
                     (&["SECF gold"], "Search securities"),
                 ],
             );

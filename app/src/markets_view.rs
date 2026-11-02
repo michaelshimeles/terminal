@@ -261,12 +261,22 @@ pub fn curve(ui: &mut Ui, curves: Option<&YieldCurves>) -> Vec<Action> {
     out
 }
 
-/// Merge catalog matches with network hits, catalog first, without duplicates.
-pub fn merged_hits(query: &str, network: &[SearchHit]) -> Vec<SearchHit> {
+/// A search hit for a HIP-3 perp, labelled with its venue.
+pub fn perp_hit(key: &str) -> SearchHit {
+    let name = tr_core::perps::link_for(key).map_or_else(
+        || format!("Hyperliquid {} perp", tr_core::perps::venue(key).unwrap_or("HIP-3")),
+        |l| l.name.to_string(),
+    );
+    SearchHit { key: key.to_string(), name, class: AssetClass::Perp, exchange: Some(tr_core::perps::badge(key)) }
+}
+
+/// Merge catalog matches, then HIP-3 perps among `perps`, then network hits, without duplicates.
+pub fn merged_hits(query: &str, network: &[SearchHit], perps: &[&str]) -> Vec<SearchHit> {
     let mut out: Vec<SearchHit> = catalog::search(query, 30)
         .into_iter()
         .map(|l| SearchHit { key: l.key(), name: l.name.to_string(), class: l.class, exchange: None })
         .collect();
+    out.extend(tr_core::perps::search(query, perps.iter().copied(), 10).into_iter().map(perp_hit));
     for h in network {
         if !out.iter().any(|o| o.key == h.key) {
             out.push(h.clone());
@@ -284,11 +294,12 @@ pub fn class_color(c: AssetClass) -> Color32 {
         AssetClass::Crypto => Color32::from_rgb(255, 150, 60),
         AssetClass::Govt => Color32::from_rgb(190, 160, 255),
         AssetClass::Cmdty => Color32::from_rgb(230, 200, 90),
+        AssetClass::Perp => theme::perp(),
     }
 }
 
-/// Security search panel (`SECF <query>`).
-pub fn search(ui: &mut Ui, query: &mut String, network: &[SearchHit]) -> (Vec<Action>, bool) {
+/// Security search panel (`SECF <query>`). `perps` are the HIP-3 perps it can offer.
+pub fn search(ui: &mut Ui, query: &mut String, network: &[SearchHit], perps: &[&str]) -> (Vec<Action>, bool) {
     let mut out = Vec::new();
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -306,7 +317,7 @@ pub fn search(ui: &mut Ui, query: &mut String, network: &[SearchHit]) -> (Vec<Ac
             .color(amber())
             .background_color(theme::header()),
     );
-    let hits = merged_hits(query, network);
+    let hits = merged_hits(query, network, perps);
     if hits.is_empty() && !query.trim().is_empty() {
         ui.label(RichText::new("No matches.").font(mono(12.0)).color(muted()));
     }
@@ -374,8 +385,20 @@ mod tests {
                 exchange: None,
             },
         ];
-        let m = merged_hits("bitcoin", &net);
+        let m = merged_hits("bitcoin", &net, &[]);
         assert_eq!(m.iter().filter(|h| h.key == "BTCUSD Curncy").count(), 1);
         assert!(m.iter().any(|h| h.key == "BITO US Equity"));
+    }
+
+    /// The listed instrument comes first; its perp follows, labelled as one.
+    #[test]
+    fn search_offers_perps_after_listed_instruments() {
+        let m = merged_hits("aapl", &[], &["xyz:AAPL", "xyz:GOLD"]);
+        let keys: Vec<&str> = m.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, ["AAPL US Equity", "xyz:AAPL"]);
+        assert_eq!((m[1].class, m[1].name.as_str()), (AssetClass::Perp, "Apple Inc perp"));
+        assert_eq!(m[1].exchange.as_deref(), Some("PERP · HL xyz"));
+        assert_eq!(perp_hit("xyz:SKHX").name, "Hyperliquid xyz perp");
+        assert!(merged_hits("aapl", &[], &[]).iter().all(|h| h.class != AssetClass::Perp));
     }
 }

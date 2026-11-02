@@ -3,6 +3,7 @@
 //! For now it carries Hyperliquid's public feed ([`hl::HlPublicProvider`]): one shared set of
 //! upstream connections, fanned out to every client over the protocol in `tr-proto`.
 
+pub mod access;
 pub mod config;
 pub mod hl;
 pub mod http;
@@ -75,7 +76,8 @@ pub async fn start(cfg: Config) -> Result<Gateway> {
     let hub = Hub::new(provider, cfg.hub.clone(), metrics);
     hub.start();
     let (closing, closing_rx) = watch::channel(false);
-    let state = http::AppState::new(hub, cfg.session.clone(), cfg.max_clients, closing_rx);
+    let access = http::Access::new(cfg.metrics_token.clone(), cfg.max_clients_per_ip, cfg.client_ip_header.clone());
+    let state = http::AppState::new(hub, cfg.session.clone(), cfg.max_clients, closing_rx).with_access(access);
     let listener = tokio::net::TcpListener::bind(cfg.bind).await.context("binding the listen address")?;
     let addr = listener.local_addr()?;
     let (stop, stopped) = oneshot::channel::<()>();
@@ -84,7 +86,10 @@ pub async fn start(cfg: Config) -> Result<Gateway> {
         let shutdown = async {
             let _ = stopped.await;
         };
-        if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown).await {
+        if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(shutdown)
+            .await
+        {
             tracing::error!("server: {e}");
         }
     });

@@ -102,7 +102,7 @@ impl TerminalApp {
         resp.context_menu(|ui| self.view_menu(ui));
 
         // Data source chip (the window title itself is redundant in a compact toolbar).
-        let (label, live) = self.source_chip();
+        let (label, live) = source_chip(&self.provider);
         let chip_text = p.layout_no_wrap(label.into(), ui_font(11.0), muted());
         let chip = Rect::from_min_size(pos2(x, cy - 9.0), vec2(chip_text.size().x + 20.0, 18.0));
         p.rect_filled(chip, 9.0, theme::control());
@@ -282,18 +282,6 @@ impl TerminalApp {
         }
     }
 
-    /// The data-source chip's label, and whether any of the data is live.
-    fn source_chip(&self) -> (&'static str, bool) {
-        let n = self.provider.to_lowercase();
-        if n == "sample" {
-            ("Offline", false)
-        } else if n.contains("sample") {
-            ("Crypto live", true)
-        } else {
-            ("Live", true)
-        }
-    }
-
     /// The Bloomberg command line, drawn as a rounded macOS search field.
     fn command_field(&mut self, ui: &mut Ui, field: Rect) -> bool {
         let suggestions = self.suggestions();
@@ -456,7 +444,7 @@ impl TerminalApp {
             return Vec::new();
         }
         let net: &[SearchHit] = if self.net_hits.0 == q { &self.net_hits.1 } else { &[] };
-        let mut v = markets_view::merged_hits(q, net);
+        let mut v = markets_view::merged_hits(q, net, &self.perp_candidates());
         v.truncate(8);
         v
     }
@@ -567,7 +555,9 @@ impl TerminalApp {
                 let resp = row_frame(ui, false);
                 let r = resp.rect;
                 let pt = ui.painter();
-                pt.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.0), text());
+                let perp = sec.class == tr_core::AssetClass::Perp;
+                let tc = if perp { theme::perp() } else { text() };
+                pt.text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &sec.ticker, mono(12.0), tc);
                 if let Some(q) = self.quotes.get(key) {
                     let up = q.change() >= 0.0;
                     let c = if up { theme::up() } else { theme::down() };
@@ -595,7 +585,15 @@ impl TerminalApp {
                 if resp.clicked() {
                     out.push(SidebarCmd::Action(Action::OpenChart(key.clone())));
                 }
-                let resp = resp.on_hover_text(format!("{} — {}", sec.key(), sec.name().unwrap_or(&sec.ticker)));
+                let resp = resp.on_hover_text(match perp {
+                    true => format!(
+                        "{} — {} · {}",
+                        sec.key(),
+                        sec.name().unwrap_or("HIP-3 perp"),
+                        tr_core::perps::badge(key)
+                    ),
+                    false => format!("{} — {}", sec.key(), sec.name().unwrap_or(&sec.ticker)),
+                });
                 resp.context_menu(|ui| {
                     if ui.button("Open Chart").clicked() {
                         out.push(SidebarCmd::Action(Action::OpenChart(key.clone())));
@@ -978,6 +976,20 @@ fn nav_row(ui: &mut Ui, icon: Icon, label: &str, trailing: Option<&str>, selecte
 }
 
 /// What the data-source chip says on hover, from the provider's name.
+/// The data-source chip's label, and whether any of the data is live.
+fn source_chip(provider: &str) -> (&'static str, bool) {
+    let n = provider.to_lowercase();
+    if n == "sample" {
+        ("Offline", false)
+    } else if n.contains("sample") && n.starts_with("server+") {
+        ("Crypto + perps live", true)
+    } else if n.contains("sample") {
+        ("Crypto live", true)
+    } else {
+        ("Live", true)
+    }
+}
+
 fn provider_label(provider: &str) -> String {
     let n = provider.to_lowercase();
     if n == "sample" {
@@ -987,10 +999,14 @@ fn provider_label(provider: &str) -> String {
         // (tr_data::web::WebMarkets) or the desktop's.
         if rest.contains("sample") {
             "Live crypto from Hyperliquid perps through the Terminal server, or from Binance and Coinbase while \
-             it is unreachable; every other market is sample data in the browser"
+             it is unreachable, and HIP-3 perps (xyz:AAPL) from the server only; every other market is sample \
+             data in the browser"
                 .into()
         } else {
-            format!("Live · crypto from Hyperliquid perps through the Terminal server; other markets from {rest}")
+            format!(
+                "Live · crypto from Hyperliquid perps and HIP-3 perps (xyz:AAPL) through the Terminal server; other \
+                 markets from {rest}"
+            )
         }
     } else if n.contains("sample") {
         // The browser build (tr_data::web::WebMarkets).
@@ -1002,7 +1018,7 @@ fn provider_label(provider: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::provider_label;
+    use super::{provider_label, source_chip};
 
     #[test]
     fn the_source_tooltip_names_the_terminal_server() {
@@ -1012,5 +1028,15 @@ mod tests {
         assert!(web.contains("Terminal server") && web.contains("sample data in the browser"), "{web}");
         let desktop = provider_label("server+markets");
         assert!(desktop.contains("Terminal server") && desktop.ends_with("other markets from markets"), "{desktop}");
+        assert!(web.contains("HIP-3 perps") && desktop.contains("HIP-3 perps"), "{web} / {desktop}");
+    }
+
+    /// With a server in front, the browser build has live perps as well as crypto.
+    #[test]
+    fn the_source_chip_says_what_is_live() {
+        assert_eq!(source_chip("sample"), ("Offline", false));
+        assert_eq!(source_chip("binance+sample"), ("Crypto live", true));
+        assert_eq!(source_chip("server+binance+sample"), ("Crypto + perps live", true));
+        assert_eq!(source_chip("server+yahoo+binance+ust"), ("Live", true));
     }
 }

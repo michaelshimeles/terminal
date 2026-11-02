@@ -8,7 +8,7 @@
 //!           stream topics, print about one line a second per topic, then latency stats
 //!   load    --clients N [TOPICS] [--secs N]
 //!           N connections with the same subscriptions; prints totals and latency
-//!   stats   print the server's /stats
+//!   stats   print the server's /stats, sending TR_METRICS_TOKEN as a bearer token when set
 //!
 //! TOPICS: --quotes K,K,..  --book K  --trades K  --bars K:TF (TF: 1m 5m 15m 30m 1h 4h 1d 1w 1M)
 //! ```
@@ -42,7 +42,7 @@ usage: cli [--url ws://localhost:8787] [--json] COMMAND
   watch [TOPICS] [--secs N]           stream topics, then print latency stats
   load --clients N [TOPICS] [--secs N]
                                       N connections with the same subscriptions
-  stats                               print the server's /stats
+  stats                               print the server's /stats (token: TR_METRICS_TOKEN)
 TOPICS: --quotes K,K,..  --book K  --trades K  --bars K:TF (1m 5m 15m 30m 1h 4h 1d 1w 1M)";
 
 fn usage() -> ! {
@@ -269,7 +269,15 @@ fn http_base(ws: &str) -> String {
 }
 
 async fn print_stats(url: &str) -> Result<()> {
-    let body = reqwest::get(format!("{}/stats", http_base(url))).await?.text().await?;
+    let mut req = reqwest::Client::new().get(format!("{}/stats", http_base(url)));
+    if let Ok(token) = std::env::var("TR_METRICS_TOKEN") {
+        req = req.bearer_auth(token.trim());
+    }
+    let resp = req.send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("/stats: 404; the server may want TR_METRICS_TOKEN");
+    }
+    let body = resp.error_for_status()?.text().await?;
     let v: serde_json::Value = serde_json::from_str(&body)?;
     let u = &v["upstream"];
     println!(
