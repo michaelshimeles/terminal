@@ -15,7 +15,9 @@
 # The app gets crypto markets from the Terminal data server at TR_SERVER_URL, which is built
 # in. It defaults to the production server; set it to another ws:// or wss:// URL, or to
 # nothing (TR_SERVER_URL=) for no server. A page can also ask for a server on the same machine
-# with ?server=ws://localhost:8787/ws, or for none with ?server=off.
+# with ?server=ws://localhost:8787/ws, or for none with ?server=off. The deploy workflow passes
+# the repository variable TR_SERVER_URL when it's set, so moving the site to another server
+# needs no code change.
 #
 # Needs the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown),
 # wasm-bindgen-cli at the version pinned in Cargo.lock, and wasm-opt from binaryen.
