@@ -621,9 +621,6 @@ impl ChartState {
             }
             rx = lr.right();
         }
-        if let Some(target) = self.switch_to {
-            clicked |= self.switch_chip(ui, &painter, pos2(rx + 10.0, range_row.center().y), target);
-        }
         let status = match (&self.error, self.loading, self.paging) {
             (Some(e), _, _) => format!("ERR {e}"),
             (_, true, _) => "loading…".into(),
@@ -635,13 +632,17 @@ impl ChartState {
                 if self.magnet { "  MAGNET" } else { "" }
             ),
         };
-        painter.text(
+        let status = painter.text(
             pos2(range_row.right() - 6.0, range_row.center().y),
             Align2::RIGHT_CENTER,
             status,
             mono(10.5),
             muted(),
         );
+        if let Some(target) = self.switch_to {
+            let room = status.left() - 12.0 - (rx + 10.0);
+            clicked |= self.switch_chip(ui, &painter, pos2(rx + 10.0, range_row.center().y), room, target);
+        }
 
         let body = Rect::from_min_max(pos2(rect.left(), header.bottom()), pos2(rect.right(), range_row.top()));
         let plot_all = Rect::from_min_max(body.min, pos2(body.right() - AXIS_W, body.bottom() - TIME_H));
@@ -1101,12 +1102,15 @@ impl ChartState {
         }
     }
 
-    /// The range row's link between a security and its HIP-3 perp. Clicking it (or ⇧P) loads
-    /// the other one here.
-    fn switch_chip(&mut self, ui: &Ui, painter: &egui::Painter, left: Pos2, target: &str) -> bool {
+    /// The range row's link between a security and its HIP-3 perp, drawn when it fits in
+    /// `room`. Clicking it (or ⇧P) loads the other one here.
+    fn switch_chip(&mut self, ui: &Ui, painter: &egui::Painter, left: Pos2, room: f32, target: &str) -> bool {
         let to_perp = tr_core::perps::is_perp(target);
         let label = if to_perp { format!("⇄ {target} PERP") } else { format!("⇄ {target}") };
         let g = painter.layout_no_wrap(label, mono(11.0), theme::perp());
+        if g.size().x + 10.0 > room {
+            return false;
+        }
         let r = Rect::from_min_size(pos2(left.x, left.y - RANGE_H / 2.0 + 2.0), vec2(g.size().x + 10.0, RANGE_H - 4.0));
         let resp = ui.interact(r, ui.id().with((self.id, "perp-switch")), Sense::click());
         let fill = if resp.hovered() { theme::control_hover() } else { theme::control() };

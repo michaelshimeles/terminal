@@ -336,11 +336,7 @@ impl TerminalApp {
     /// Where a pane on `key` can switch to: a perp's linked instrument, or an instrument's live
     /// perp. Links to perps show only once the server has listed them live.
     pub(super) fn switch_target(&self, key: &str) -> Option<&'static str> {
-        use tr_core::perps;
-        match perps::link_for(key) {
-            Some(l) => Some(l.underlying),
-            None => perps::perp_for(key).map(|l| l.coin).filter(|c| self.perp_is_live(c)),
-        }
+        tr_core::perps::switch_target(key, |c| self.perp_is_live(c))
     }
 
     /// `PERP`: from a security to its HIP-3 perp, or from a perp back to its security.
@@ -368,7 +364,7 @@ impl TerminalApp {
         }
         self.open_security(l.coin);
         self.status =
-            format!("{} · {}: the perp references {}, it is not {key}", l.coin, perps::badge(l.coin), l.reference);
+            format!("{} ({}) references {}. It is a perp, not {key}.", l.coin, perps::badge(l.coin), l.reference);
     }
 
     /// The focused security if it has listed options (US equity, ETF, index), else AAPL.

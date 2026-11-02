@@ -72,6 +72,11 @@ pub enum Request {
         symbol: String,
         depth: usize,
     },
+    /// The latest trades, for markets the Terminal server serves.
+    Trades {
+        pane: PaneId,
+        symbol: String,
+    },
     History {
         pane: PaneId,
         generation: u64,
@@ -231,6 +236,11 @@ pub enum Response {
         pane: PaneId,
         symbol: String,
         book: Result<tr_data::OrderBook, String>,
+    },
+    Trades {
+        pane: PaneId,
+        symbol: String,
+        trades: Result<Vec<tr_data::TradePrint>, String>,
     },
     History {
         pane: PaneId,
@@ -789,6 +799,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::News { pane, symbol } => {
             let items = s.provider.news(symbol.as_deref()).await.map_err(|e| format!("{e:#}"));
             s.send(Response::News { pane, symbol, items });
+        }
+        Request::Trades { pane, symbol } => {
+            let trades = s.provider.trades(&symbol, 40).await.map_err(|e| format!("{e:#}"));
+            s.send(Response::Trades { pane, symbol, trades });
         }
         Request::OrderBook { pane, symbol, depth } => {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));

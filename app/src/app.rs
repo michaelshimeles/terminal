@@ -155,11 +155,18 @@ pub struct BookPane {
     pub book: Option<OrderBook>,
     pub error: Option<String>,
     pub fetched: Option<Instant>,
+    /// The latest trades, oldest first, when the book comes from the Terminal server.
+    pub trades: Vec<tr_data::TradePrint>,
 }
 
 impl BookPane {
     pub fn new(symbol: &str, depth: usize, group: f64) -> Self {
-        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None }
+        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None, trades: Vec::new() }
+    }
+
+    /// Whether the book came through the Terminal server, which also has the market's trades.
+    pub fn served_by_server(&self) -> bool {
+        self.book.as_ref().is_some_and(|b| b.source.ends_with("Terminal server"))
     }
 }
 
@@ -1082,6 +1089,15 @@ impl TerminalApp {
                         }
                     }
                 }
+                Response::Trades { pane, symbol, trades } => {
+                    if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
+                        && let PaneKind::OrderBook(b) = &mut p.kind
+                        && b.symbol == symbol
+                    {
+                        // A failed fetch clears the list rather than leave old trades up.
+                        b.trades = trades.unwrap_or_default();
+                    }
+                }
                 Response::Portfolio(result) => {
                     let result = self.keep_simulated_trades(result);
                     self.on_portfolio(result)
@@ -1419,6 +1435,9 @@ impl TerminalApp {
                 PaneKind::OrderBook(b) if b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) => {
                     b.fetched = Some(Instant::now());
                     self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
+                    if b.served_by_server() {
+                        self.worker.send(Request::Trades { pane: p.id, symbol: b.symbol.clone() });
+                    }
                 }
                 _ => {}
             }

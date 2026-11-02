@@ -949,8 +949,8 @@ mod tests {
     }
 
     /// Hyperliquid keeps publishing mids for delisted markets, on the core dex and on HIP-3 dexes
-    /// (all 56 delisted core perps and all 58 delisted HIP-3 perps had one on 2026-11-02). Only the
-    /// instrument list says they're gone, and the gateway must not list, resolve or stream them.
+    /// (all 56 delisted core perps and all 155 delisted HIP-3 perps had one on 2026-11-02). Only
+    /// the instrument list says they're gone, and the gateway must not list, resolve or stream them.
     #[tokio::test]
     async fn delisted_markets_are_not_served() {
         let defs = vec![

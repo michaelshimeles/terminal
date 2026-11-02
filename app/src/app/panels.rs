@@ -386,6 +386,7 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane, perp: Option<&'static str>) 
         b.book = None;
         b.error = None;
         b.fetched = None;
+        b.trades.clear();
         return action;
     }
     ui.horizontal_wrapped(|ui| {
@@ -415,7 +416,20 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane, perp: Option<&'static str>) 
         ui.add(egui::Spinner::new());
         return action;
     };
-    let rect = ui.available_rect_before_wrap();
+    let full = ui.available_rect_before_wrap();
+    // The book's trades go beside the ladder in a wide pane, below it in a tall one.
+    let has_tape = !b.trades.is_empty();
+    let (rect, tape) = if has_tape && full.width() >= dp(560.0) {
+        let split = full.left() + (full.width() * 0.6).floor();
+        let tape = Rect::from_min_max(pos2(split + dp(10.0), full.top()), full.max);
+        (Rect::from_min_max(full.min, pos2(split, full.bottom())), Some(tape))
+    } else if has_tape && full.height() >= dp(280.0) {
+        let split = full.bottom() - (full.height() * 0.36).floor();
+        let tape = Rect::from_min_max(pos2(full.left(), split + dp(4.0)), full.max);
+        (Rect::from_min_max(full.min, pos2(full.right(), split)), Some(tape))
+    } else {
+        (full, None)
+    };
     let d = key.decimals(book.mid().unwrap_or(1.0));
     let row = dp(18.0);
     let rows_each = (((rect.height() - row * 2.0) / row / 2.0).floor() as usize).max(1);
@@ -480,9 +494,47 @@ fn order_book(ui: &mut Ui, b: &mut super::BookPane, perp: Option<&'static str>) 
     for (k, level) in bids.iter().enumerate() {
         draw((y + k as f32 * row) as f64, *level, true);
     }
-    ui.allocate_rect(rect, Sense::hover());
+    if let Some(tape) = tape {
+        trades_tape(&ui.painter_at(tape), tape, &key, &b.symbol, &b.trades, d);
+    }
+    ui.allocate_rect(full, Sense::hover());
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
     action
+}
+
+/// Recent trades next to the book, newest first: time, price coloured by the aggressor's side,
+/// size. A perp's tape is titled with its venue.
+fn trades_tape(
+    p: &egui::Painter,
+    rect: Rect,
+    key: &tr_core::Security,
+    symbol: &str,
+    trades: &[tr_data::TradePrint],
+    d: usize,
+) {
+    let row = dp(18.0);
+    let x_price = rect.left() + (rect.width() * 0.62).clamp(dp(110.0), (rect.width() - dp(60.0)).max(dp(110.0)));
+    let x_size = rect.right() - 6.0;
+    let head = Rect::from_min_size(rect.min, vec2(rect.width(), row));
+    p.rect_filled(head, 3.0, theme::header());
+    let title = match key.class {
+        tr_core::AssetClass::Perp => format!("Trades · {} · {}", key.ticker, tr_core::perps::badge(symbol)),
+        _ => format!("Trades · {}", key.ticker),
+    };
+    let tc = if key.class == tr_core::AssetClass::Perp { theme::perp() } else { muted() };
+    p.text(pos2(rect.left() + 6.0, head.center().y), Align2::LEFT_CENTER, title, ui_font(11.0), tc);
+    let mut y = head.bottom();
+    for t in trades.iter().rev().take(((rect.bottom() - y) / row).floor().max(0.0) as usize) {
+        let c = if t.buy { theme::up() } else { theme::down() };
+        let when = chrono::DateTime::from_timestamp_millis(t.ts_ms)
+            .map(|x| x.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+            .unwrap_or_default();
+        let cy = y + row / 2.0;
+        p.text(pos2(rect.left() + 6.0, cy), Align2::LEFT_CENTER, when, mono(11.5), muted());
+        p.text(pos2(x_price, cy), Align2::RIGHT_CENTER, format!("{:.*}", d, t.px), mono(12.0), c);
+        p.text(pos2(x_size, cy), Align2::RIGHT_CENTER, fmt_size(t.sz), mono(12.0), text());
+        y += row;
+    }
 }
 
 #[cfg(test)]

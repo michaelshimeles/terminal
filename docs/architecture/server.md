@@ -14,10 +14,10 @@ On 2026-10-29 Micky approved starting on Hyperliquid's public API, because a nod
 - `tr-gateway` (`server/`) with `HlPublicProvider`, which implements the `Provider` trait (§3.1) over `wss://api.hyperliquid.xyz/ws` and the public `info` endpoint. Clients speak `tr-proto` (§4) and can't tell providers apart, so `HlNodeProvider` replaces it later with no client or protocol change.
 - One set of upstream connections serves every client. Mids for the core dex and for every HIP-3 dex with listed markets stay subscribed. The gateway subscribes a market's book, trades and candles only while a client watches it, and drops them 20 s after the last one leaves.
 - The gateway keeps its own budgets under Hyperliquid's per-IP limits [doc: RL]: at most 8 of 10 connections, 950 of 1000 subscriptions, 1800 of 2000 sent messages a minute and 1100 of 1200 REST weight a minute (defaults 3, 900, 1000 and 800). It refuses a client subscription past the budget, and it never rotates IPs or uses proxies [doc: TOU §3.1.8].
-- Hyperliquid closes the whole websocket when asked for a coin it doesn't list, with no error message [observed 2026-10-29]. The gateway only subscribes coins that have a live mid, and keeps the permanent mids on a connection of their own.
+- Hyperliquid closes the whole websocket when asked for a coin it doesn't list, with no error message [observed 2026-10-29]. The gateway only subscribes coins that have a live mid, and keeps the permanent mids on a connection of their own. Delisted markets keep their mids, so the gateway also checks `isDelisted` in `meta` and serves none of them (§7.5).
 - History comes from `candleSnapshot`, so it stops at the most recent 5000 bars per interval [doc: INFO]. For 1m bars that is about 3.5 days. Node-built candles (§5.3) lift the cap.
 - It makes read-only public calls only. No `exchange` endpoint, no user subscriptions, no orders.
-- The desktop opts in with `TR_SERVER_URL` (§4.6). Crypto keys such as `BTCUSD Curncy` then come from Hyperliquid core perps, and the order book pane names the source. Everything else is unchanged.
+- The desktop opts in with `TR_SERVER_URL` (§4.6). Crypto keys such as `BTCUSD Curncy` then come from Hyperliquid core perps, and the order book pane names the source. HIP-3 perps such as `xyz:AAPL` come only through the server, as instruments of their own labelled `PERP · HL xyz` (§7). Everything else is unchanged.
 - The web build uses the server for the same crypto markets. `scripts/build-web.sh` builds in `wss://terminal-gateway.style.dev/ws` unless `TR_SERVER_URL` says otherwise. While the server is unreachable, the page falls back to Binance and Coinbase as before.
 - It runs on one Freestyle VM (2 vCPU, 4 GiB) at `wss://terminal-gateway.style.dev/ws`, behind Freestyle's TLS edge. `deploy/freestyle/README.md` covers deploys, health checks and cost, which is about $80 a month above the free allowance.
 
@@ -264,7 +264,7 @@ For comparison, the public `l2Book` feed is pushed "on each block that is at lea
 
 - **`tr-data::remote::RemoteMarkets`** implements `MarketData` over one shared connection. `history` maps to an RPC, `quotes` to a short-lived or shared `Quotes` subscription, and `live` to a `Bars` subscription bridged into the existing `mpsc::Receiver<Bar>`.
 - **Selection:** `TR_SERVER_URL` (or a settings toggle) picks `RemoteMarkets`. The direct providers stay as the offline and dev fallback (`TR_PROVIDER=sample` keeps working).
-- **Web build:** `for_browser()` puts `RemoteMarkets` in front of the browser's own sources when the page was built with a server URL (`TR_SERVER_URL`, read by `scripts/build-web.sh`; production uses `wss://terminal-gateway.style.dev/ws`). The client runs on the page's event loop over the browser's `WebSocket`, with postcard in binary frames like the desktop. `?server=ws://localhost:8787/ws` points a page at a server on the same machine, and `?server=off` turns the server off. Crypto is the only asset class the server serves so far, so the `TODO(web proxy)` stubs in `crates/data/src/web.rs` and `crates/congress/src/db_web.rs` stay until it serves the rest.
+- **Web build:** `for_browser()` puts `RemoteMarkets` in front of the browser's own sources when the page was built with a server URL (`TR_SERVER_URL`, read by `scripts/build-web.sh`; production uses `wss://terminal-gateway.style.dev/ws`). The client runs on the page's event loop over the browser's `WebSocket`, with postcard in binary frames like the desktop. `?server=ws://localhost:8787/ws` points a page at a server on the same machine, and `?server=off` turns the server off. The server serves crypto and HIP-3 perps so far, so the `TODO(web proxy)` stubs in `crates/data/src/web.rs` and `crates/congress/src/db_web.rs` stay until it serves the rest.
 
 ---
 
@@ -364,6 +364,7 @@ Node-built bars cover everything from the first full minute after our node is li
 - Spot coins are `PURR/USDC` or `@{index}` (for example, HYPE is `@107`). "Some assets may be remapped on user interfaces", for example BTC/USDC in the app is UBTC/USDC on HyperCore [doc: INFO].
 - Outcome (HIP-4) markets show up as `#<encoding>` keys [doc: ASSET]. I observed 762 `#` keys and 401 `@` keys among the 1399 keys of the default `allMids` [observed]. **Outcomes are out of scope** and are filtered at ingest. They also carry separate legal restrictions [doc: TOU §1.7].
 - Snapshot on 2026-10-29 [observed]: the core `meta` had 235 entries, 56 flagged `isDelisted`. The `xyz` `meta` had 141 entries, 21 flagged `isDelisted`. `spotMeta` had 347 pairs and 511 tokens. `allPerpMetas` listed per-dex universe sizes of core 235, `xyz` 141, `para` 39, `hyna` 25, `mkts` 24, `km` 23, `cash` 17, `flx` 16, `io` 16, `vntl` 15 and `abcd` 1, for 552 perp entries in total.
+- Snapshot on 2026-11-02 around 17:50 UTC [observed]: the same 10 HIP-3 dexes listed 321 markets, of which 166 were live: `xyz` 120 of 142, `para` 33 of 40, `io` 12 of 18 and `mkts` 1 of 24. `flx`, `vntl`, `hyna`, `km`, `abcd` and `cash` had nothing live. The core dex had 179 live perps of 235.
 - **In our system** the registry comes from the node's local info server, which supports `perpDexs`, `meta` and `spotMeta` [doc: NODE]. The public-API observations above are from research and are only for scale.
 
 ### 5.8 Backpressure
@@ -484,52 +485,66 @@ All three bare-metal providers above are single-tenant with full root, so we ope
 
 ## 7. Symbol mapping to Bloomberg-style keys
 
+Decided with Micky on 2026-11-02, which settles open question 9 (§15). The interim gateway and the clients implement it.
+
 ### 7.1 Principles
 
-1. **A perp is never silently shown as a stock.** If `AAPL US Equity` is backed by `xyz:AAPL`, every surface shows a **`PERP·xyz`** badge, the attribution "trade.xyz perp on Hyperliquid", and the price basis (`mid` or `mark`). Tooltips explain that this is a perpetual futures price, not the exchange-listed share price.
-2. **Venue-native keys always work.** `xyz:AAPL <GO>`, `BTC-PERP`, `@107` and `HYPE/USDC` resolve directly.
-3. **The server owns the mapping table** (a versioned config, not code), so we can fix it without a client release.
+1. **A HIP-3 perp is its own instrument, never the listed one.** `AAPL US Equity` stays the Nasdaq stock, with its Yahoo quote and chart. The perp keeps Hyperliquid's coin name as its market key, `xyz:AAPL` (typed in any case), and its own asset class, `AssetClass::Perp`. Nothing maps `AAPL US Equity` to the perp, on the server or in a client.
+2. **Every surface labels a perp with its venue:** `PERP · HL xyz`, in a colour no listed instrument uses. That covers chart legends and headers, tab titles (`xyz:AAPL PERP`), the order book and its trades, watchlist and sidebar rows, the palette, security search and command-line suggestions.
+3. **Links, not substitutions.** A small reviewed table (`crates/core/src/perps.rs`, §7.3) links an app instrument to the perp on the same underlying. A linked instrument's chart shows a `⇄ xyz:AAPL PERP` chip, the perp's chart shows `⇄ AAPL US Equity`, and `AAPL PERP` opens the perp. `PERP` or ⇧P switches the focused pane back and forth. A link shows only while the server lists the perp as live. Yahoo has no book for a stock, so the stock's simulated book offers the perp's book, which the pane then titles as the perp's.
+4. **Venue keys always work.** Any perp the server lists opens by its key and turns up in search, linked or not (`xyz:SKHX`, `para:10Y`).
+5. **Perps come only from the server.** Nothing else has them. Yahoo, the browser's own sources, sample mode and the `Fallback` wrapper refuse a perp instead of standing in for it. While the server is unreachable, a perp's chart, book and quote show that, never sample data.
 
-### 7.2 Model changes (in `tr-core`)
+### 7.2 Where it lives
 
-```rust
-pub enum InstrumentKind { Spot, Perp, Equity, Etf, Index, Fx, Future, Govt }
-pub struct VenueRef { provider: ProviderId, venue: String /* "hyperliquid", "xyz" */, symbol: String /* "xyz:AAPL" */ }
+- `tr-core` (`perps.rs`): key normalisation (`XYZ:aapl` is `xyz:AAPL`), the badge, the link table and perp search. `Security::parse` gives a perp its class, and its price decimals follow Hyperliquid's five significant figures.
+- `tr-gateway`: lists, resolves and streams live markets only (§7.5). It needs no table. Book, trades and candle subscriptions and `candleSnapshot` take the prefixed coin as is (`l2Book xyz:AAPL`), so HIP-3 markets use the same code and budgets as core ones.
+- `tr-data` (`RemoteMarkets`): sends perps to the server and nowhere else. `MarketData::perp_markets` reads the server's live list through `Rpc::Markets`, and `MarketData::trades` reads a market's tape.
+- No protocol change. The design's `Resolution` struct (basis, venue, kind on every quote) isn't needed while a perp's key says what it is.
+- The table ships with the client, not as server config. Moving it to the server pays off once rows change faster than releases. Until then, the server owns liveness: it can hide a link by not listing the perp, but adding a row needs a release.
 
-pub struct Resolution {
-    pub key: MarketKey,                    // what the user typed / the pane is linked to: "AAPL US Equity"
-    pub source: VenueRef,                  // what actually backs it: hyperliquid / xyz / "xyz:AAPL"
-    pub kind: InstrumentKind,              // Perp
-    pub proxy: bool,                       // true: the source is a different instrument than the key
-    pub basis: PriceBasis,                 // Mid | Mark | Oracle | Last
-    pub session: Option<SessionCalendar>,  // underlying's hours (for "underlying closed" labels)
-}
-```
+### 7.3 The table
 
-`Security { ticker, class }` stays as it is for back-compat. `Resolution` travels alongside it in `Quote`, `Snapshot` and `SearchHit`.
+A row needs all of these: trade.xyz's spec index says the perp references the same underlying the app key means [doc: XYZ-SPEC]; the perp is live in `meta`; the `xyz` dex, unless xyz has no market on that underlying and another dex's match is unambiguous; and its price tracks the app instrument's. All 27 rows were checked on 2026-11-02 around 17:50 UTC, during US market hours. Every one was within 0.6% of its Yahoo instrument, and the oil rows differ by their futures contract month.
 
-### 7.3 Initial mapping table (sketch; every row needs checking against the trade.xyz spec index)
+| App key | Perp | What the perp references |
+|---|---|---|
+| `AAPL`, `MSFT`, `NVDA`, `AMZN`, `GOOGL`, `META`, `TSLA`, `AVGO`, `AMD`, `NFLX`, `COIN`, `MSTR` `US Equity` | `xyz:` same ticker | 1 share of the company's common stock (Nasdaq), "quoted in USD" |
+| `LLY US Equity` | `xyz:LLY` | 1 share of Eli Lilly common stock (NYSE) |
+| `TLT`, `SMH`, `XLE US Equity` | `xyz:TLT`, `xyz:SMH`, `xyz:XLE` | 1 share of the ETF (Nasdaq, Nasdaq, NYSE Arca) |
+| `SPX Index` | `xyz:SP500` | "the S&P 500 Index" |
+| `CL1 Comdty` | `xyz:CL` | 1 barrel of WTI crude, from a futures contract it rolls monthly (the docs call it "WTIOIL (CL)") [doc: XYZ-COMM] |
+| `CO1 Comdty` | `xyz:BRENTOIL` | 1 barrel of Brent crude, rolled monthly |
+| `NG1 Comdty` | `xyz:NATGAS` | 1 MMBtu of Henry Hub natural gas, rolled monthly |
+| `HG1 Comdty` | `xyz:COPPER` | 1 pound of high-grade copper, rolled monthly |
+| `GC1`, `SI1`, `PL1 Comdty` | `xyz:GOLD`, `xyz:SILVER`, `xyz:PLATINUM` | the spot price of 1 troy ounce (XAU, XAG, XPT/USD), not the future. The tooltip says so. |
+| `EURUSD Curncy`, `GBPUSD Curncy` | `xyz:EUR`, `xyz:GBP` | the spot rate, US dollars per euro or pound |
+| `USDJPY Curncy` | `xyz:JPY` | the spot rate, "Japanese yen per 1 U.S. dollar". No inversion. |
 
-| App key | Backed by | Kind | Notes |
-|---|---|---|---|
-| `AAPL US Equity`, `TSLA`, `NVDA`, `MSFT`, … | `xyz:<TICKER>` | Perp (proxy) | Only for tickers present and not `isDelisted` in `meta{dex:"xyz"}` |
-| `SPX Index` | `xyz:SP500` | Perp (proxy) | Whether it references the S&P 500 index exactly is [unverified] |
-| `NDX Index` | `xyz:XYZ100` | Perp (proxy) | XYZ100's exact reference is [unverified] |
-| `NKY Index`, `KOSPI2 Index` | `xyz:JP225`, `xyz:KR200` | Perp (proxy) | [unverified] references |
-| `GC1 Comdty`, `SI1`, `HG1`, `CL1`, `CO1`, `NG1` | `xyz:GOLD`, `SILVER`, `COPPER`, `CL`, `BRENTOIL`, `NATGAS` | Perp (proxy) | The futures roll vs spot reference is [unverified] |
-| `EURUSD Curncy`, `GBPUSD`, `USDJPY` | `xyz:EUR`, `xyz:GBP`, `xyz:JPY` | Perp (proxy) | **The quote direction for JPY is [unverified]**. An inversion could be needed. |
-| `BTCUSD Curncy`, `ETHUSD`, … | core perp `BTC`, `ETH` (mid) | Perp | An alternative is HL spot (`UBTC/USDC`, remapped) [doc: INFO]. Default open question (§15). |
-| Other dexes (`flx:`, `km:`, `para:`, …) | venue keys only | Perp | Not mapped to Bloomberg keys in v1. They overlap with xyz (for example `flx:NVDA`) [observed]. |
+Left unlinked on purpose:
 
-`perpConciseAnnotations` returns categories such as `stocks` and `commodities` for HIP-3 coins [doc: PERP; observed]. We use it to suggest new rows, never to auto-map them.
+| Perp | Why |
+|---|---|
+| `xyz:XYZ100` | It tracked `^NDX` within 0.04%, but the docs only say "a modified market-capitalization-weighted index of 100 of the largest, most actively-traded, non-financial companies that are listed on a U.S. stock exchange". They never name the Nasdaq-100, so `NDX Index` doesn't link to it. |
+| `xyz:JP225` | It tracked `^N225` within 0.06%, but the docs describe "a JPY-denominated, price-weighted index of 225 leading Japanese companies" and never name the Nikkei 225. |
+| `xyz:HO` | It tracked `HO=F` within 0.2%. The docs list New York Harbor ULSD as `DIESEL` and never tie it to the `HO` coin. |
+| `xyz:KR200` | The KOSPI 200. The app has the KOSPI composite (`KOSPI Index`), a different index. |
+| `para:10Y`, `para:2Y`, `para:30Y` | They look like Treasury yields in percent. Nobody has checked their semantics. |
+| Other dexes | The only catalog instruments with a live perp elsewhere were AVGO and SMH on `para` and NVDA on `io`. xyz lists all three, so no row needs another dex. |
+
+`perpConciseAnnotations` returns categories such as `stocks` and `commodities` for HIP-3 coins [doc: PERP; observed]. Use it to suggest new rows, never to add them.
 
 ### 7.4 Off-hours labelling
 
-trade.xyz US stock perps take external prices 24/5, Sunday 8:05 PM ET to Friday 8:00 PM ET. That spans pre-market, regular, post-market and an overnight session from Blue Ocean ATS [doc: XYZ-US]. Outside external coverage, the oracle advances through an internal EMA of order-book impact prices, with τ = 30 min [doc: XYZ-ORACLE; changelog XYZ-TAU]. Mark price is bounded to ±(1/max leverage) around a reference price, which is the last external price over weekends [doc: XYZ-BOUNDS]. So the UI shows the session state (`Regular`, `Extended`, `Overnight`, `Closed: perp-only price discovery`) next to proxy quotes. A snapshot of the gap, from `xyz:AAPL` during US hours: `markPx 349.72` vs `oraclePx 349.8` [observed].
+trade.xyz US stock perps take external prices 24/5, Sunday 8:05 PM ET to Friday 8:00 PM ET. That spans pre-market, regular, post-market and an overnight session from Blue Ocean ATS [doc: XYZ-US]. Outside external coverage, the oracle advances through an internal EMA of order-book impact prices, with τ = 30 min [doc: XYZ-ORACLE; changelog XYZ-TAU]. Mark price is bounded to ±(1/max leverage) around a reference price, which is the last external price over weekends [doc: XYZ-BOUNDS]. The SP500 and XYZ100 perps and the commodities take external prices Sunday 6 PM to Friday 5 PM ET with a daily 5 to 6 PM gap, and the FX perps Sunday 5 PM to Friday 5 PM ET [doc: XYZ-SPEC, XYZ-FX]. A snapshot of the gap, from `xyz:AAPL` during US hours: `markPx 349.72` vs `oraclePx 349.8` [observed].
+
+What ships: a perp counts as trading around the clock (`AssetClass::trades_24_7`), and a perp's price never appears on the listed instrument's own chart or quote, so a weekend oracle can't pass for a Nasdaq price. Still open: a session label next to the perp (`Regular`, `Extended`, `Overnight`, `Closed: perp-only price discovery`).
 
 ### 7.5 Delistings and churn
 
 The registry refreshes `perpDexs`, `meta` (per dex) and `spotMeta` from the node's local info server every minute [target]. These calls are local, so there's no rate limit [doc: NODE]. If an instrument turns `isDelisted`, or disappears, the server marks the topic `Delisted`, stops live streams, keeps its history, and notifies users who have it in watchlists or layouts. HIP-3 deployers can also halt and settle a market with `haltTrading`, which can later resume and "recycle" the asset [doc: HIP3]. That means the *same name may come back as a different contract*. History is therefore keyed by `(dex, coin, listing_epoch)`, and a relisting starts a new epoch [target].
+
+The interim gateway already filters delistings. Hyperliquid keeps publishing a mid for every delisted perp: on 2026-11-02 all 56 delisted core perps and all 155 delisted HIP-3 perps had one [observed]. So mids alone can't say what trades. The registry keeps delisted markets with their flag, and the gateway lists, resolves and streams none of them. A request for one gets `Unavailable { UnknownMarket, "xyz:VIX is delisted" }`. A dex with nothing live (`flx`, `vntl`, `hyna`, `km`, `abcd` and `cash` that day) gets no mids subscription. The registry refreshes every 5 minutes. If one dex's `meta` call fails, its markets keep resolving as before instead of all turning unknown.
 
 ---
 
@@ -708,8 +723,8 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 6. **Mark price:** OK to show the node-read mark (`activeAssetData`) and fall back to a labelled estimate if that doesn't work?
 7. **If HIP-3 books are missing from node output** (the phase 1 test): pause, or allow the public `l2Book` for HIP-3 only, as a stopgap?
 8. **Default crypto source:** core perp mid (`BTC`) or HL spot (`UBTC/USDC`), and how prominently do we label "perp" for crypto?
-9. **Proxy mapping:** should `AAPL US Equity` resolve to `xyz:AAPL` by default (with the `PERP` badge), or only when the user types `xyz:AAPL`? And should other dexes (`flx:`, `km:`, …) be mapped when xyz lacks a ticker?
-10. **Off-hours:** show the perp price over weekends as the "last" price, or freeze the equity quote at the Friday close and show the perp separately?
+9. **Proxy mapping:** *resolved 2026-11-02 (§7).* `AAPL US Equity` never resolves to `xyz:AAPL`. The perp is its own instrument with its own key and a `PERP · HL xyz` label, linked from the stock by a reviewed table. Other dexes get a row only when xyz lacks the underlying and the match is unambiguous; no row needs one yet.
+10. **Off-hours:** *partly resolved 2026-11-02.* The equity quote never shows the perp's price, so it stays at the listed market's last price, and the perp shows separately (§7.1). A session label for the perp is still open (§7.4).
 11. **Auth:** a hosted identity provider (Clerk, WorkOS, Supabase) or self-hosted OAuth in Rust? Which sign-in methods first?
 12. **Anonymous use:** can signed-out users get live data (today's behaviour), or is sign-in required for the web build?
 13. **Demo account:** OK to make it server-authoritative and let it fill off-hours at perp prices?
@@ -742,6 +757,9 @@ Egress estimate (per always-on client): a 50-symbol watchlist at 4 Hz × ~30 byt
 - **XYZ-ORACLE**: trade[XYZ] oracle price. https://docs.trade.xyz/perpetuals/mechanics/oracle-price
 - **XYZ-BOUNDS**: trade[XYZ] discovery bounds. https://docs.trade.xyz/perpetuals/mechanics/discovery-bounds
 - **XYZ-TAU**: trade[XYZ] oracle time constant updates. https://docs.trade.xyz/perpetuals/changelog/oracle-time-constant-updates
+- **XYZ-SPEC**: trade[XYZ] specification index (what each market references, read 2026-11-02). https://docs.trade.xyz/perpetuals/specifications-and-schedules/specification-index
+- **XYZ-COMM**: trade[XYZ] commodities and their contract roll. https://docs.trade.xyz/perpetuals/markets/commodities
+- **XYZ-FX**: trade[XYZ] FX. https://docs.trade.xyz/perpetuals/markets/fx
 - **ORACLE**: Oracle. https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/oracle
 - **MARK**: Robust price indices. https://hyperliquid.gitbook.io/hyperliquid-docs/trading/robust-price-indices
 - **FUNDING**: Funding. https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding

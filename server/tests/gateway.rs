@@ -726,6 +726,26 @@ async fn perps_come_only_from_the_server() {
     let book = book.unwrap();
     assert!(!book.simulated && book.bids[0].0 == 401.0);
     assert_eq!(book.source, "Hyperliquid xyz perp · Terminal server");
+    // Its tape, which no other source has.
+    let tape = |tid: u64| json!({"coin": "xyz:TSLA", "side": "B", "px": "401.5", "sz": "3", "time": tid as i64, "hash": "0x0", "tid": tid, "users": ["0x0", "0x0"]});
+    let push = async {
+        s.mock.until("trades:xyz:TSLA upstream", |mk| mk.subs().contains("trades:xyz:TSLA")).await;
+        s.mock.push("trades:xyz:TSLA", "trades", json!([tape(1), tape(2)]));
+    };
+    let (first, ()) = tokio::join!(m.trades("xyz:TSLA", 10), push);
+    let t0 = tokio::time::Instant::now();
+    let mut got = first.unwrap();
+    while got.len() < 2 {
+        assert!(t0.elapsed() < WAIT, "trades never arrived: {got:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        got = m.trades("xyz:TSLA", 10).await.unwrap();
+    }
+    assert_eq!(
+        got.iter().map(|t| (t.ts_ms, t.px, t.sz, t.buy)).collect::<Vec<_>>(),
+        [(1, 401.5, 3.0, true), (2, 401.5, 3.0, true)]
+    );
+    assert_eq!(m.trades("xyz:TSLA", 1).await.unwrap().len(), 1, "the latest n");
+    assert!(m.trades("AAPL US Equity", 5).await.is_err(), "no tape for the listed stock from the fallback");
     // The server goes away: no stand-in data for the perp, while the stock keeps its source.
     let Setup { mock: _mock, gw } = s;
     tokio::time::timeout(WAIT, gw.shutdown()).await.expect("shutdown finishes");
@@ -735,6 +755,11 @@ async fn perps_come_only_from_the_server() {
     let q = m.quotes(&["xyz:TSLA".into(), "AAPL US Equity".into()]).await.unwrap();
     assert_eq!(q.iter().map(|q| q.symbol.as_str()).collect::<Vec<_>>(), ["AAPL US Equity"]);
     assert!(m.perp_markets().await.is_err(), "the list says the server is unreachable");
+    let t0 = tokio::time::Instant::now();
+    while m.trades("xyz:TSLA", 10).await.is_ok() {
+        assert!(t0.elapsed() < WAIT, "the server's last trades outlived the server");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let t0 = tokio::time::Instant::now();
     while m.order_book("xyz:TSLA", 10).await.is_ok() {
         assert!(t0.elapsed() < WAIT, "the server's last book outlived the server");

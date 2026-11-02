@@ -156,6 +156,17 @@ impl OrderBook {
     }
 }
 
+/// One trade on a venue's tape.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TradePrint {
+    /// The venue's trade time (Unix milliseconds).
+    pub ts_ms: i64,
+    pub px: f64,
+    pub sz: f64,
+    /// The buyer was the aggressor.
+    pub buy: bool,
+}
+
 /// One listed option.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptionContract {
@@ -275,10 +286,15 @@ pub trait MarketData: Send + Sync {
         anyhow::bail!("no public order book for {symbol}")
     }
 
-    /// The HIP-3 perps (`xyz:AAPL`) the Terminal server lists as live right now. Empty when
-    /// there is no server, and an error when it can't be reached.
+    /// The latest `n` trades, oldest first, where a public tape exists.
+    async fn trades(&self, symbol: &str, _n: usize) -> Result<Vec<TradePrint>> {
+        anyhow::bail!("no public trades for {symbol}")
+    }
+
+    /// The HIP-3 perps (`xyz:AAPL`) the Terminal server lists as live right now. An error
+    /// when there is no server or it can't be reached.
     async fn perp_markets(&self) -> Result<Vec<String>> {
-        Ok(Vec::new())
+        anyhow::bail!("no Terminal server")
     }
 
     /// The US Treasury curve. The default assembles it from each tenor's daily history.
@@ -396,6 +412,11 @@ impl<P: MarketData> MarketData for Fallback<P> {
                 self.sample.order_book(symbol, depth).await
             }
         }
+    }
+
+    /// Real trades only: nothing simulates a tape.
+    async fn trades(&self, symbol: &str, n: usize) -> Result<Vec<TradePrint>> {
+        self.primary.trades(symbol, n).await
     }
 
     async fn perp_markets(&self) -> Result<Vec<String>> {

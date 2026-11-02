@@ -229,6 +229,15 @@ pub fn search<'a>(query: &str, keys: impl IntoIterator<Item = &'a str>, limit: u
     scored.into_iter().take(limit).map(|(_, k)| k).collect()
 }
 
+/// Where `PERP` takes a pane on `key`: from a linked perp to its instrument, or from an
+/// instrument to its perp while `live` says the server lists that perp.
+pub fn switch_target(key: &str, live: impl Fn(&str) -> bool) -> Option<&'static str> {
+    match link_for(key) {
+        Some(l) => Some(l.underlying),
+        None => perp_for(key).map(|l| l.coin).filter(|c| live(c)),
+    }
+}
+
 /// The other side of a link: an instrument's perp, or a perp's instrument.
 pub fn counterpart(key: &str) -> Option<&'static str> {
     match link_for(key) {
@@ -271,6 +280,17 @@ mod tests {
         assert_eq!(counterpart("AAPL US Equity"), Some("xyz:AAPL"));
         assert_eq!(counterpart("xyz:aapl"), Some("AAPL US Equity"));
         assert_eq!(counterpart("xyz:SKHX"), None);
+    }
+
+    #[test]
+    fn switching_follows_links_to_live_perps_only() {
+        let live = |c: &str| c == "xyz:AAPL";
+        assert_eq!(switch_target("AAPL US Equity", live), Some("xyz:AAPL"));
+        assert_eq!(switch_target("GC1 Comdty", live), None, "xyz:GOLD isn't listed live here");
+        assert_eq!(switch_target("xyz:GOLD", live), Some("GC1 Comdty"), "back to the instrument always works");
+        assert_eq!(switch_target("XYZ:aapl", |_| false), Some("AAPL US Equity"));
+        assert_eq!(switch_target("xyz:SKHX", |_| true), None, "unlinked");
+        assert_eq!(switch_target("NDX Index", |_| true), None, "no link");
     }
 
     #[test]
