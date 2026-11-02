@@ -3,12 +3,13 @@
 //! `exchange` endpoint, no user-specific subscriptions, no orders. A node-backed provider
 //! replaces it behind the same [`Provider`] trait.
 
+pub mod book;
 pub mod pool;
 pub mod rest;
 pub mod wire;
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -18,7 +19,7 @@ use tr_proto::InstrumentKind;
 use crate::metrics::Metrics;
 use crate::provider::{
     Capabilities, Channel, ChannelKind, DisplayPolicy, InstrumentDef, InstrumentId, Provider, ProviderId,
-    SubscribeError, UpstreamHandle, UpstreamSink, UpstreamStats,
+    SubscribeError, Upstream, UpstreamEvent, UpstreamHandle, UpstreamSink, UpstreamStats,
 };
 use pool::{Pool, PoolConfig};
 use rest::{CANDLE_CAP, Info};
@@ -134,11 +135,33 @@ impl Provider for HlPublicProvider {
         let coin = inst.0.clone();
         let key = match ch {
             Channel::Mids => SubKey::AllMids { dex: coin },
-            Channel::Book => SubKey::L2Book { coin },
+            Channel::Book => return self.subscribe_book(coin, sink),
             Channel::Trades => SubKey::Trades { coin },
             Channel::Bars(tf) => SubKey::Candle { coin, interval: wire::interval(tf) },
         };
         let guard = self.pool.subscribe(key, sink, ch == Channel::Mids)?;
         Ok(UpstreamHandle::new(guard))
+    }
+}
+
+impl HlPublicProvider {
+    /// Both l2Book feeds, merged (see [`book`]): two upstream subscriptions per book. The default
+    /// feed comes first so a full subscription budget still leaves the book its old 5 s feed.
+    fn subscribe_book(&self, coin: String, sink: UpstreamSink) -> Result<UpstreamHandle, SubscribeError> {
+        let (fast_sink, slow_sink) = book::sinks(sink);
+        let slow = self.pool.subscribe(SubKey::L2Book { coin: coin.clone(), fast: false }, slow_sink, false)?;
+        match self.pool.subscribe(SubKey::L2Book { coin: coin.clone(), fast: true }, fast_sink.clone(), false) {
+            Ok(fast) => Ok(UpstreamHandle::new((slow, fast))),
+            Err(e) => {
+                tracing::warn!("{coin}: no fast book feed ({e}); updates every ~5 s");
+                // Lets the slow feed's connection state through.
+                fast_sink.send(Upstream {
+                    recv: Instant::now(),
+                    recv_ms: pool::now_ms(),
+                    event: UpstreamEvent::Rejected(e.to_string()),
+                });
+                Ok(UpstreamHandle::new(slow))
+            }
+        }
     }
 }

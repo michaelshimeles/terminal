@@ -223,7 +223,7 @@ impl Pool {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
@@ -442,6 +442,16 @@ fn handle(text: &str, recv: Instant, subs: &mut BTreeMap<SubKey, Sub>) {
     let recv_ms = now_ms();
     match wire::parse(text) {
         Ok(Incoming::Data(key, event)) => {
+            // A book thin enough to look fast may come from the default feed, and the reverse
+            // can't happen; give it to whichever of the two this connection carries.
+            let key = match key {
+                SubKey::L2Book { coin, fast: true }
+                    if !subs.contains_key(&SubKey::L2Book { coin: coin.clone(), fast: true }) =>
+                {
+                    SubKey::L2Book { coin, fast: false }
+                }
+                key => key,
+            };
             if let Some(s) = subs.get_mut(&key) {
                 if s.stale {
                     s.stale = false;
@@ -475,7 +485,7 @@ mod tests {
     }
 
     fn book(c: &str) -> SubKey {
-        SubKey::L2Book { coin: c.into() }
+        SubKey::L2Book { coin: c.into(), fast: false }
     }
 
     fn pool(max_connections: usize, max_subscriptions: usize) -> Pool {
