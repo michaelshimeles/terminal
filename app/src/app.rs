@@ -534,6 +534,19 @@ pub struct TerminalApp {
 }
 
 /// Resolve a run of words (`BTCUSD CRNCY AAPL US EQUITY MSFT`) into market keys.
+/// Lay fresh quotes over the ones shown, and return the keys that got one. A perp that was
+/// asked for and left out has no other source, so its old quote goes rather than pass for current.
+fn merge_quotes(shown: &mut HashMap<String, Quote>, asked: &[String], quotes: Vec<Quote>) -> Vec<String> {
+    let keys: Vec<String> = quotes.iter().map(|q| q.symbol.clone()).collect();
+    for gone in asked.iter().filter(|k| tr_data::is_perp(k) && !keys.contains(k)) {
+        shown.remove(gone);
+    }
+    for q in quotes {
+        shown.insert(q.symbol.clone(), q);
+    }
+    keys
+}
+
 fn keys_from_words(words: &[String]) -> Vec<String> {
     let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
     let mut out = Vec::new();
@@ -1015,14 +1028,11 @@ impl TerminalApp {
                         c.on_markers(&symbol, trades);
                     }
                 }
-                Response::Quotes(q) => {
-                    if q.len() > 20 {
+                Response::Quotes { asked, quotes } => {
+                    if quotes.len() > 20 {
                         self.wei_updated = Some(format!("updated {}", chrono::Local::now().format("%H:%M:%S")));
                     }
-                    let keys: Vec<String> = q.iter().map(|x| x.symbol.clone()).collect();
-                    for x in q {
-                        self.quotes.insert(x.symbol.clone(), x);
-                    }
+                    let keys = merge_quotes(&mut self.quotes, &asked, quotes);
                     self.demo_on_quotes(&keys);
                 }
                 Response::Latest(t) => self.latest = t,
@@ -1678,6 +1688,25 @@ mod tests {
         let new: Settings = serde_json::from_str(r#"{"watchlist":[],"active_layout":"Desk"}"#).unwrap();
         assert!(migrate_legacy(&new, &prefs::PanelDefaults::default()).is_none());
         assert_eq!(new.active_layout.as_deref(), Some("Desk"));
+    }
+
+    /// When the server can't quote a perp, the watchlist drops its old price instead of showing
+    /// it as current. Listed instruments keep theirs, as before.
+    #[test]
+    fn perps_left_out_of_an_answer_lose_their_old_quote() {
+        let q = |s: &str, last: f64| Quote { symbol: s.into(), last, prev_close: last, ts: 0, spark: vec![] };
+        let mut shown: HashMap<String, Quote> =
+            [q("xyz:AAPL", 336.0), q("xyz:GOLD", 3958.0), q("AAPL US Equity", 336.5)]
+                .map(|x| (x.symbol.clone(), x))
+                .into();
+        let asked: Vec<String> = ["xyz:AAPL", "xyz:GOLD", "AAPL US Equity"].map(String::from).to_vec();
+        let got = merge_quotes(&mut shown, &asked, vec![q("xyz:GOLD", 3960.0)]);
+        assert_eq!(got, ["xyz:GOLD"]);
+        assert!(!shown.contains_key("xyz:AAPL"), "the perp the server didn't quote");
+        assert_eq!(shown["xyz:GOLD"].last, 3960.0);
+        assert_eq!(shown["AAPL US Equity"].last, 336.5, "a listed instrument keeps its last quote");
+        merge_quotes(&mut shown, &["xyz:SP500".into()], vec![]);
+        assert!(shown.contains_key("xyz:GOLD"), "a perp nobody asked about this time stays");
     }
 
     #[test]

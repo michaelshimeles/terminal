@@ -444,6 +444,10 @@ struct BookFeed {
 /// Trades a tape subscription keeps for the pane.
 const TAPE_KEPT: usize = 100;
 
+/// What a book or tape says while the server is up but its own upstream is down. The last
+/// values are old by then, so the pane shows this instead, until fresh data arrives.
+const UPSTREAM_LOST: &str = "the Terminal server lost its Hyperliquid feed";
+
 struct TapeFeed {
     latest: watch::Receiver<Option<Result<Vec<TradePrint>, String>>>,
     used: Arc<Mutex<Instant>>,
@@ -664,6 +668,10 @@ async fn tape_feed(
                         tx.send_replace(Some(Err(detail)));
                         continue;
                     }
+                    Event::Status(TopicStatus::Stale { .. }) => {
+                        tx.send_replace(Some(Err(UPSTREAM_LOST.into())));
+                        continue;
+                    }
                     Event::Reconnecting => {
                         tx.send_replace(Some(Err("the Terminal server is not reachable".into())));
                         continue;
@@ -699,6 +707,10 @@ async fn book_feed(
                     Event::Snapshot(TopicData::Book(b)) | Event::Delta(TopicDelta::Book(b)) => b,
                     Event::Status(TopicStatus::Unavailable { detail, .. }) => {
                         tx.send_replace(Some(Err(detail)));
+                        continue;
+                    }
+                    Event::Status(TopicStatus::Stale { .. }) => {
+                        tx.send_replace(Some(Err(UPSTREAM_LOST.into())));
                         continue;
                     }
                     // The last book goes stale while the connection is down; the next snapshot replaces it.

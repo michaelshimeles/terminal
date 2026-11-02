@@ -559,7 +559,8 @@ async fn hip3_markets_stream_under_their_dex_prefix() {
 #[tokio::test]
 async fn delisted_markets_are_neither_listed_nor_streamed() {
     let s = Setup::new(|_| {}).await;
-    assert!(s.gw.hub().mids.contains("xyz:OLDX"), "the upstream still publishes its mid");
+    // The mock publishes its mid, as Hyperliquid does; the gateway's table leaves it out.
+    assert!(!s.gw.hub().mids.contains("xyz:OLDX") && s.gw.hub().mids.contains("xyz:TSLA"));
     let client = s.client(Encoding::Postcard);
     let Ok(RpcResult::Markets(m)) = client.request(Rpc::Markets).await else { panic!("markets") };
     assert!(m.iter().any(|x| x.key.as_str() == "xyz:TSLA"));
@@ -763,6 +764,57 @@ async fn perps_come_only_from_the_server() {
     let t0 = tokio::time::Instant::now();
     while m.order_book("xyz:TSLA", 10).await.is_ok() {
         assert!(t0.elapsed() < WAIT, "the server's last book outlived the server");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// When the server stays up but loses Hyperliquid, a perp's book and trades stop passing old
+/// values for current ones, and come back with the feed.
+#[tokio::test]
+async fn perp_books_and_tapes_say_when_the_upstream_drops() {
+    let s = Setup::new(|_| {}).await;
+    let m = RemoteMarkets::new(&format!("ws://{}", s.gw.addr), tr_data::sample::SampleProvider::default());
+    let tape = |tid: u64| json!([{"coin": "xyz:TSLA", "side": "A", "px": "401.0", "sz": "1", "time": tid as i64, "hash": "0x0", "tid": tid, "users": ["0x0", "0x0"]}]);
+    let feed = async {
+        s.mock
+            .until("xyz:TSLA book and trades upstream", |mk| {
+                mk.subs().is_superset(&set(&["l2Book:xyz:TSLA", "trades:xyz:TSLA"]))
+            })
+            .await;
+        s.mock.push("l2Book:xyz:TSLA", "l2Book", book_msg("xyz:TSLA", "401.0"));
+        s.mock.push("trades:xyz:TSLA", "trades", tape(1));
+    };
+    let (book, trades, ()) = tokio::join!(m.order_book("xyz:TSLA", 10), m.trades("xyz:TSLA", 10), feed);
+    assert!(book.is_ok() && trades.is_ok());
+    s.mock.drop_all();
+    let t0 = tokio::time::Instant::now();
+    loop {
+        let (b, t) = (m.order_book("xyz:TSLA", 10).await, m.trades("xyz:TSLA", 10).await);
+        if let (Err(b), Err(t)) = (&b, &t) {
+            for e in [format!("{b:#}"), format!("{t:#}")] {
+                assert!(e.contains("lost its Hyperliquid feed"), "{e}");
+            }
+            break;
+        }
+        assert!(t0.elapsed() < WAIT, "still current after the upstream dropped: {b:?} {t:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    s.mock
+        .until("resubscribed", |mk| {
+            mk.count("subscribe trades:xyz:TSLA") == 2 && mk.count("subscribe l2Book:xyz:TSLA") == 2
+        })
+        .await;
+    s.mock.push("l2Book:xyz:TSLA", "l2Book", book_msg("xyz:TSLA", "402.0"));
+    s.mock.push("trades:xyz:TSLA", "trades", tape(2));
+    let t0 = tokio::time::Instant::now();
+    loop {
+        if let (Ok(b), Ok(t)) = (m.order_book("xyz:TSLA", 10).await, m.trades("xyz:TSLA", 10).await)
+            && b.bids[0].0 == 402.0
+            && t.iter().any(|x| x.ts_ms == 2)
+        {
+            break;
+        }
+        assert!(t0.elapsed() < WAIT, "the book and trades didn't come back");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

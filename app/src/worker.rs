@@ -37,6 +37,9 @@ pub const CONGRESS_REFRESH_MIN: u64 = 30;
 /// The least time between a chart's reloads after its provider ended the live feed.
 const RELOAD_AFTER_FEED_ENDS: Duration = Duration::from_secs(5);
 
+/// How often a chart retries a HIP-3 perp's history while the Terminal server can't serve it.
+const PERP_RETRY: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(10) };
+
 pub enum Request {
     /// Load the brokerage portfolio through SnapTrade (`None` = the simulated sample).
     Portfolio(Option<tr_broker::Credentials>),
@@ -280,7 +283,11 @@ pub enum Response {
         symbol: String,
         trades: Vec<Trade>,
     },
-    Quotes(Vec<Quote>),
+    /// Quotes for the keys `asked`, which may leave some out.
+    Quotes {
+        asked: Vec<String>,
+        quotes: Vec<Quote>,
+    },
     Latest(Vec<Trade>),
     TickerTrades {
         pane: PaneId,
@@ -606,31 +613,14 @@ async fn handle(s: &Arc<Shared>, req: Request) {
                 });
             }
             match s.provider.history(&symbol, tf, None, limit).await {
-                Ok(bars) if !bars.is_empty() => {
-                    cache_bars(s, &symbol, tf, &bars);
-                    let exhausted = bars.len() < limit / 2;
-                    let bars = Arc::new(bars);
-                    if !store_series(s, pane, generation, bars.clone()) {
-                        return; // superseded while loading
-                    }
-                    let gpu = build_gpu(bars.clone()).await;
-                    s.send(Response::History {
-                        pane,
-                        generation,
-                        symbol: symbol.clone(),
-                        tf,
-                        bars,
-                        gpu,
-                        prepended: 0,
-                        from_cache: false,
-                        exhausted,
-                        full: true,
-                        live: false,
-                    });
-                    start_live(s.clone(), pane, generation, symbol, tf, limit);
-                }
+                Ok(bars) if !bars.is_empty() => loaded(s, pane, generation, symbol, tf, limit, bars).await,
                 Ok(_) => s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") }),
-                Err(e) => s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") }),
+                Err(e) => {
+                    s.send(Response::HistoryError { pane, generation, error: format!("{e:#}") });
+                    if tr_data::is_perp(&symbol) {
+                        retry_perp(s.clone(), pane, generation, symbol, tf, limit);
+                    }
+                }
             }
         }
         Request::MoreHistory { pane, generation, symbol, tf, existing, limit } => {
@@ -706,8 +696,11 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::Markers { pane, symbol, trades });
         }
         Request::Quotes(symbols) => match s.provider.quotes(&symbols).await {
-            Ok(q) => s.send(Response::Quotes(q)),
-            Err(e) => s.send(Response::Status(format!("quotes: {e:#}"))),
+            Ok(quotes) => s.send(Response::Quotes { asked: symbols, quotes }),
+            Err(e) => {
+                s.send(Response::Status(format!("quotes: {e:#}")));
+                s.send(Response::Quotes { asked: symbols, quotes: Vec::new() });
+            }
         },
         Request::Latest { limit } => {
             let t = s.db.lock().await.latest_trades(limit).unwrap_or_default();
@@ -904,6 +897,61 @@ fn apply_live_bar(bars: &mut Vec<Bar>, bar: Bar) -> Applied {
     let (len, last) = (bars.len(), bars.last().map(|b| b.ts));
     let changed = Series::apply_live(bars, bar);
     Applied { changed, inserted: bars.len() > len && bars.last().map(|b| b.ts) == last }
+}
+
+/// A full load's bars: cache them, show them and start the live feed, unless a newer load for
+/// the pane has taken over.
+async fn loaded(
+    s: &Arc<Shared>,
+    pane: PaneId,
+    generation: u64,
+    symbol: String,
+    tf: Timeframe,
+    limit: usize,
+    bars: Vec<Bar>,
+) {
+    cache_bars(s, &symbol, tf, &bars);
+    let exhausted = bars.len() < limit / 2;
+    let bars = Arc::new(bars);
+    if !store_series(s, pane, generation, bars.clone()) {
+        return; // superseded while loading
+    }
+    let gpu = build_gpu(bars.clone()).await;
+    s.send(Response::History {
+        pane,
+        generation,
+        symbol: symbol.clone(),
+        tf,
+        bars,
+        gpu,
+        prepended: 0,
+        from_cache: false,
+        exhausted,
+        full: true,
+        live: false,
+    });
+    start_live(s.clone(), pane, generation, symbol, tf, limit);
+}
+
+/// A HIP-3 perp has no source but the Terminal server, so nothing else picks up its chart when
+/// the server is away. Ask again every [`PERP_RETRY`] while the pane still shows this load; the
+/// chart keeps showing the first failure (or its cached bars) until one works.
+fn retry_perp(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe, limit: usize) {
+    rt::spawn(async move {
+        loop {
+            rt::sleep(PERP_RETRY).await;
+            if current_series(&s, pane, generation).is_none() {
+                return;
+            }
+            match s.provider.history(&symbol, tf, None, limit).await {
+                Ok(bars) if !bars.is_empty() => return loaded(&s, pane, generation, symbol, tf, limit, bars).await,
+                Ok(_) => {
+                    return s.send(Response::HistoryError { pane, generation, error: format!("no data for {symbol}") });
+                }
+                Err(e) => tracing::debug!("{symbol} history, still failing: {e:#}"),
+            }
+        }
+    });
 }
 
 fn start_live(s: Arc<Shared>, pane: PaneId, generation: u64, symbol: String, tf: Timeframe, limit: usize) {
@@ -1147,6 +1195,75 @@ mod tests {
             }
             Some(rx)
         }
+    }
+
+    /// A server that's down for the first `down` history requests.
+    struct ServerBack {
+        down: usize,
+        loads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl tr_data::MarketData for ServerBack {
+        fn name(&self) -> &str {
+            "server"
+        }
+
+        async fn history(&self, _: &str, _: Timeframe, _: Option<i64>, _: usize) -> anyhow::Result<Vec<Bar>> {
+            let n = self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            anyhow::ensure!(n > self.down, "the Terminal server is not reachable");
+            Ok(vec![Bar::new(0, 1.0, 1.0, 1.0, 7.0, 1.0)])
+        }
+    }
+
+    /// A perp has no other source, so a chart whose first load failed keeps asking while it
+    /// shows the perp, and loads once the server answers. It stops once the pane moves on.
+    fn worker_on(provider: tr_data::Provider) -> (Arc<Shared>, mpsc::Receiver<Response>) {
+        let (out, rx) = mpsc::channel();
+        let s = Shared {
+            provider,
+            series: Default::default(),
+            sources: Default::default(),
+            cache: std::sync::Mutex::new(None),
+            db: Mutex::new(Db::open_in_memory().unwrap()),
+            out,
+            ctx: egui::Context::default(),
+        };
+        (Arc::new(s), rx)
+    }
+
+    #[tokio::test]
+    async fn perp_charts_retry_until_the_server_answers() {
+        let provider = Arc::new(ServerBack { down: 2, loads: Default::default() });
+        let (s, rx) = worker_on(provider.clone());
+        let load = |symbol: &str| Request::History {
+            pane: 1,
+            generation: 1,
+            symbol: symbol.into(),
+            tf: Timeframe::D1,
+            limit: 10,
+        };
+        handle(&s, load("xyz:AAPL")).await;
+        let t0 = std::time::Instant::now();
+        let mut errors = 0;
+        let bars = loop {
+            assert!(t0.elapsed() < Duration::from_secs(10), "no retry after {errors} errors");
+            match rx.try_recv() {
+                Ok(Response::HistoryError { .. }) => errors += 1,
+                Ok(Response::History { bars, full: true, .. }) => break bars,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert_eq!((errors, bars.last().map(|b| b.close)), (1, Some(7.0)), "one error shown, then the bars");
+        assert_eq!(provider.loads.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // A chart the user moved on from isn't retried.
+        let provider = Arc::new(ServerBack { down: usize::MAX, loads: Default::default() });
+        let (s, _rx) = worker_on(provider.clone());
+        handle(&s, load("xyz:AAPL")).await;
+        assert!(claim_series(&s, 1, 2), "the pane loads something else");
+        tokio::time::sleep(PERP_RETRY * 3).await;
+        assert_eq!(provider.loads.load(std::sync::atomic::Ordering::SeqCst), 1, "no retries for an old load");
     }
 
     /// A worker on `SourceChanges` with pane 1 loading `BTCUSD Curncy`, and its responses.
