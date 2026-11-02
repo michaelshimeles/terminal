@@ -120,7 +120,6 @@ struct Tally {
     lat: BTreeMap<&'static str, Vec<i64>>,
     msgs: BTreeMap<String, u64>,
     gaps: BTreeMap<String, Vec<i64>>,
-    last: BTreeMap<String, Instant>,
     resyncs: u64,
     statuses: Vec<String>,
 }
@@ -172,6 +171,8 @@ async fn drain(mut sub: Subscription, name: String, tally: Arc<Mutex<Tally>>, un
     let mut last_print = Instant::now() - Duration::from_secs(5);
     // Hyperliquid opens a trades subscription with recent history; only later trades are live.
     let since = now_ms(SystemTime::now());
+    // Per subscription: in `load`, clients share a topic name but each has its own cadence.
+    let mut last_update = None;
     loop {
         let Ok(Some(u)) = tokio::time::timeout_at(until.into(), sub.next()).await else { return };
         let at = now_ms(u.received);
@@ -181,7 +182,7 @@ async fn drain(mut sub: Subscription, name: String, tally: Arc<Mutex<Tally>>, un
             *t.msgs.entry(name.clone()).or_default() += 1;
             if matches!(u.event, Event::Snapshot(_) | Event::Delta(_)) {
                 let now = Instant::now();
-                if let Some(prev) = t.last.insert(name.clone(), now) {
+                if let Some(prev) = last_update.replace(now) {
                     t.gaps.entry(name.clone()).or_default().push((now - prev).as_millis() as i64);
                 }
             }

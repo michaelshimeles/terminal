@@ -15,6 +15,10 @@ use crate::provider::{Upstream, UpstreamEvent, UpstreamSink};
 /// feed normally refreshes every ~5 s.
 pub const SLOW_MAX_AGE: Duration = Duration::from_secs(15);
 
+/// A fast book older than this has stopped (it normally refreshes every ~0.5 s), so a newer
+/// default book is shown alone rather than under a frozen top of book.
+pub const FAST_MAX_AGE: Duration = Duration::from_secs(3);
+
 struct Snap {
     bids: Vec<Level>,
     asks: Vec<Level>,
@@ -26,6 +30,12 @@ struct Snap {
 struct Part {
     book: Option<Snap>,
     rejected: Option<String>,
+}
+
+impl Part {
+    fn fresh(&self, now: Instant, max_age: Duration) -> Option<&Snap> {
+        self.book.as_ref().filter(|s| now.saturating_duration_since(s.recv) <= max_age)
+    }
 }
 
 #[derive(Default)]
@@ -103,8 +113,8 @@ fn on_event(st: &mut State, fast: bool, up: Upstream, out: &UpstreamSink) {
 }
 
 fn emit(st: &State, recv: Instant, recv_ms: i64, out: &UpstreamSink) {
-    let slow = st.slow.book.as_ref().filter(|s| recv.saturating_duration_since(s.recv) <= SLOW_MAX_AGE);
-    let (bids, asks, time_ms) = match (st.fast.book.as_ref(), slow) {
+    let fresh = (st.fast.fresh(recv, FAST_MAX_AGE), st.slow.fresh(recv, SLOW_MAX_AGE));
+    let (bids, asks, time_ms) = match fresh {
         (None, None) => return,
         (Some(f), None) => (f.bids.clone(), f.asks.clone(), f.time_ms),
         (None, Some(s)) => (s.bids.clone(), s.asks.clone(), s.time_ms),
@@ -214,6 +224,17 @@ mod tests {
         r.book(true, SLOW_MAX_AGE.as_millis() as u64 + 1_000, 100.0);
         let got = r.take();
         assert_eq!(got.iter().map(|e| depth(e).0).collect::<Vec<_>>(), [20, 20, FAST_BOOK_LEVELS]);
+    }
+
+    #[test]
+    fn a_stalled_fast_feed_gives_way_to_newer_default_books() {
+        let r = Rig::new();
+        r.book(true, 0, 100.0);
+        r.book(false, 1_000, 110.0);
+        let stalled = FAST_MAX_AGE.as_millis() as u64 + 1;
+        r.book(false, stalled, 120.0);
+        let tops: Vec<f64> = r.take().iter().map(|e| depth(e).1).collect();
+        assert_eq!(tops, [100.0, 100.0, 120.0], "the fast top while it's fresh, then the default book's own");
     }
 
     #[test]

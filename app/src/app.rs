@@ -161,11 +161,13 @@ pub struct BookPane {
     /// A request is out. A REST book can take longer than [`BOOK_POLL`], and requests run
     /// concurrently, so the pane waits for the answer before it asks again.
     pub pending: bool,
+    /// Numbers the pane's asks; only the answer to the latest one clears `pending`.
+    pub asked: u64,
 }
 
 impl BookPane {
     pub fn new(symbol: &str, depth: usize, group: f64) -> Self {
-        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None, pending: false }
+        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None, pending: false, asked: 0 }
     }
 
     /// Time to ask for the book again: [`BOOK_POLL`] since the last ask, once it was answered (or
@@ -1065,11 +1067,13 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::OrderBook { pane, symbol, book } => {
+                Response::OrderBook { pane, symbol, ask, book } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
                     {
-                        b.pending = false;
+                        if ask == b.asked {
+                            b.pending = false;
+                        }
                         match book {
                             _ if b.symbol != symbol => {}
                             Ok(book) => {
@@ -1398,7 +1402,13 @@ impl TerminalApp {
                 PaneKind::OrderBook(b) if b.due() => {
                     b.fetched = Some(Instant::now());
                     b.pending = true;
-                    self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
+                    b.asked += 1;
+                    self.worker.send(Request::OrderBook {
+                        pane: p.id,
+                        symbol: b.symbol.clone(),
+                        depth: b.depth,
+                        ask: b.asked,
+                    });
                 }
                 _ => {}
             }
