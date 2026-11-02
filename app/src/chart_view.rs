@@ -97,6 +97,8 @@ pub struct ChartState {
     paging: bool,
     exhausted: bool,
     error: Option<String>,
+    /// Why the bars shown, from the disk cache, couldn't be refreshed.
+    stale: Option<String>,
     built: Vec<BuiltIndicator>,
     compare_line: Option<LineRef>,
     compare_scale: f64,
@@ -151,6 +153,7 @@ impl ChartState {
             paging: false,
             exhausted: false,
             error: None,
+            stale: None,
             built: Vec::new(),
             compare_line: None,
             compare_scale: 1.0,
@@ -179,6 +182,7 @@ impl ChartState {
         self.paging = false;
         self.exhausted = false;
         self.error = None;
+        self.stale = None;
         self.viewport = None;
         self.manual_scale = None;
         self.glide = None;
@@ -429,6 +433,7 @@ impl ChartState {
         self.exhausted = end_of_history(self.exhausted, exhausted, prepended, full);
         if !from_cache {
             self.loading = false;
+            self.stale = None;
         }
         self.error = None;
         match self.viewport.as_mut() {
@@ -455,13 +460,33 @@ impl ChartState {
         }
     }
 
+    /// The range row's status: errors, loading, or how many bars are shown and from where.
+    fn status_text(&self) -> String {
+        match (&self.error, self.loading, self.paging) {
+            (Some(e), _, _) => format!("ERR {e}"),
+            (_, true, _) => "loading…".into(),
+            (_, _, true) => "loading history…".into(),
+            _ => format!(
+                "{} {}bars{}{}{}",
+                self.bars.len(),
+                if self.stale.is_some() { "cached " } else { "" },
+                self.stale.as_deref().map(|e| format!(" · {e}")).unwrap_or_default(),
+                if self.log { "  LOG" } else { "" },
+                if self.magnet { "  MAGNET" } else { "" }
+            ),
+        }
+    }
+
     pub fn on_history_error(&mut self, generation: u64, error: String) {
         if generation == self.generation {
+            let paging = std::mem::take(&mut self.paging);
             self.loading = false;
-            self.paging = false;
             self.exhausted = true;
             if self.bars.is_empty() {
                 self.error = Some(error);
+            } else if !paging {
+                // The refresh after painting from the disk cache failed.
+                self.stale = Some(error);
             }
         }
     }
@@ -621,23 +646,13 @@ impl ChartState {
             }
             rx = lr.right();
         }
-        let status = match (&self.error, self.loading, self.paging) {
-            (Some(e), _, _) => format!("ERR {e}"),
-            (_, true, _) => "loading…".into(),
-            (_, _, true) => "loading history…".into(),
-            _ => format!(
-                "{} bars{}{}",
-                self.bars.len(),
-                if self.log { "  LOG" } else { "" },
-                if self.magnet { "  MAGNET" } else { "" }
-            ),
-        };
+        let status_color = if self.error.is_some() || self.stale.is_some() { theme::down() } else { muted() };
         let status = painter.text(
             pos2(range_row.right() - 6.0, range_row.center().y),
             Align2::RIGHT_CENTER,
-            status,
+            self.status_text(),
             mono(10.5),
-            muted(),
+            status_color,
         );
         if let Some(target) = self.switch_to {
             let room = status.left() - 12.0 - (rx + 10.0);
@@ -1495,6 +1510,27 @@ fn end_of_history(was: bool, exhausted: bool, prepended: usize, full: bool) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bars from the disk cache whose refresh failed say so, so a perp whose server is down
+    /// never passes for live. A failed page of older bars leaves the shown ones as they are.
+    #[test]
+    fn cached_bars_that_could_not_refresh_say_why() {
+        let down = "the Terminal server is not reachable";
+        let mut c = ChartState::new(1, "xyz:AAPL", Timeframe::M15);
+        c.on_history_error(c.generation, down.into());
+        assert_eq!(c.status_text(), format!("ERR {down}"), "with nothing to show, the error is the message");
+        c.error = None;
+        c.bars = Arc::new((0..3).map(|i| Bar::new(i * 900, 1.0, 1.0, 1.0, 1.0, 1.0)).collect());
+        c.on_history_error(c.generation, down.into());
+        assert_eq!(c.status_text(), format!("3 cached bars · {down}"));
+        c.on_history_error(c.generation + 1, "another load".into());
+        assert_eq!(c.status_text(), format!("3 cached bars · {down}"), "other generations are ignored");
+        let mut p = ChartState::new(2, "xyz:AAPL", Timeframe::M15);
+        p.bars = c.bars.clone();
+        p.paging = true;
+        p.on_history_error(p.generation, down.into());
+        assert_eq!(p.status_text(), "3 bars", "a failed page doesn't make the shown bars stale");
+    }
 
     #[test]
     fn a_full_load_from_a_new_source_can_page_again() {

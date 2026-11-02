@@ -574,6 +574,9 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
     }
 
     async fn server_book(&self, symbol: &str, depth: usize) -> Result<OrderBook> {
+        if !self.client().wait_up(Duration::from_secs(3)).await {
+            bail!("the Terminal server is not reachable");
+        }
         let mut latest = {
             let mut books = self.books.lock().expect("books lock");
             match books.get(symbol) {
@@ -606,6 +609,9 @@ impl<P: MarketData + 'static> RemoteMarkets<P> {
 
 impl<P: MarketData + 'static> RemoteMarkets<P> {
     async fn server_trades(&self, symbol: &str, n: usize) -> Result<Vec<TradePrint>> {
+        if !self.client().wait_up(Duration::from_secs(3)).await {
+            bail!("the Terminal server is not reachable");
+        }
         let mut latest = {
             let mut tapes = self.tapes.lock().expect("tapes lock");
             match tapes.get(symbol) {
