@@ -293,7 +293,21 @@ The streaming endpoints send a snapshot first with `isSnapshot: true` [doc: WSSU
 - `Account { institution: "Hyperliquid", kind: "Perps" | "Spot", is_paper: network == Testnet, number: masked address }`.
 - `Position { kind: Future | Crypto, units: szi (signed), cost_basis: entryPx, price: mark }`.
 
-So `PORT`/`POS`/`ORD`/`ACTV` render HL with little UI change. Unrealized PnL is repriced from the gateway's live marks on mainnet (or testnet mids on testnet), as the panes already do for SnapTrade [repo]. Realized PnL = Σ `closedPnl` − Σ `fee` over the selected range, with funding shown separately.
+So `PORT`/`POS`/`ORD`/`ACTV` render HL with modest UI change, **but the market link needs real work**:
+
+- Today `tr_broker::market_key()` returns `None` for `InstrumentKind::Future` [repo: `crates/broker/src/model.rs`].
+- For `Crypto` it builds a spot-style pair (`BTC` → `BTCUSD`), not a Hyperliquid perp key [repo].
+- `PortfolioPanes::live_price` looks quotes up only by that key [repo: `app/src/app/broker.rs`].
+- The position-row Buy/Sell/Close controls are limited to `Stock | Etf` [repo: `app/src/app/portfolio_view.rs`].
+
+As modelled above, an HL perp row would have no live repricing, no chart link and no trade buttons. The integration therefore adds:
+
+1. **A venue-native market key on `Position`.** A new optional, serde-defaulted field (`market: Option<String>`) that the HL adapter fills with the exact key the gateway publishes in `MarketInfo.key` (`xyz:AAPL` for HIP-3, the core-perp and spot keys as `tr-proto` names them) [repo]. `Position::market_key()` returns it before falling back to today's kind-based mapping, so SnapTrade and demo rows are unchanged. HIP-3 keys resolve through `Security::perp` (`AssetClass::Perp`) [repo: `crates/core/src/security.rs`], never through the stock path.
+2. **Repricing from that key.** `live_price` then works for HL rows unchanged. On testnet, the HL adapter supplies testnet mids under the same keys, so mainnet gateway quotes never price a testnet position.
+3. **Row actions.** The `tradable` check in `portfolio_view.rs` also allows rows from an enabled HL account that have a `market`. Close sends a reduce-only order (§6.1), through the same confirmation (§6.3). Chart and key menus use `market`.
+4. **Tests.** Unit tests for `market_key()` precedence (an HL row with `market` set, a SnapTrade `Future` row still `None`), and a `live_price` test with a perp quote.
+
+Unrealized PnL is then repriced from the gateway's live marks on mainnet, or testnet mids on testnet, as the panes already do for SnapTrade rows that have a key [repo]. Realized PnL = Σ `closedPnl` − Σ `fee` over the selected range, with funding shown separately.
 
 ---
 
@@ -301,6 +315,7 @@ So `PORT`/`POS`/`ORD`/`ACTV` render HL with little UI change. Unrealized PnL is 
 
 - `crates/hl` (`tr-hl`): `signing` (§3.4), `actions` (order, cancel, cancelByCloid, modify, batchModify, updateLeverage, scheduleCancel, noop, approveAgent, approveBuilderFee, structs with explicit field order), `assets` (the registry, §5.1), `rounding` (§5.2), `client` (`/info` and `/exchange` over `reqwest`, which already compiles for wasm in this workspace [repo]), `stream` (user websocket), `nonce`. No `tokio` "full"; it follows `tr-broker`'s wasm split [repo].
 - `tr-broker`: `secrets` gains a second store for agent keys (Keychain service `terminal.hyperliquid`). The existing SnapTrade item is untouched.
+- `tr-broker` `model`: `Position.market: Option<String>` (serde default) and the `market_key()` precedence change from §9. `app/src/app/portfolio_view.rs`: the HL row actions. `app/src/app/broker.rs` `live_price`: no change beyond using the new key.
 - `app`: `TradingPrefs.hl: HlPrefs { enabled, network, max_order_value, max_leverage, daily_notional_cap, slippage_bps, dead_mans_switch, agent: Option<AgentMeta> }`. `AgentMeta` holds the public address, name, expiry and network, never the key. New `TradeRequest::Hl(HlRequest)` and `TradeResponse::Hl(..)` variants in the worker. The ticket gets an HL variant, and Settings › Trading gets a Hyperliquid section.
 - `tr-proto` / `tr-gateway`: **no change.** Market data keeps flowing as today. User data and orders never touch the server.
 
@@ -361,7 +376,7 @@ So `PORT`/`POS`/`ORD`/`ACTV` render HL with little UI change. Unrealized PnL is 
 | Phase | Scope | Exit evidence |
 |---|---|---|
 | 0 | This doc, reviewed. | Micky's answers to §15 |
-| 1 | `tr-hl` signing, actions, assets and rounding, plus SDK vector tests (native + wasm). Read-only: connect an address, then `POS`/`ORD`/`ACTV`/`ACCT` from the user streams (testnet and mainnet reads). | CI green, screenshots of the read-only panes |
+| 1 | `tr-hl` signing, actions, assets and rounding, plus SDK vector tests (native + wasm). Read-only: connect an address, then `POS`/`ORD`/`ACTV`/`ACCT` from the user streams (testnet and mainnet reads), including the `Position.market` key so perp rows reprice live and link to charts (§9). | CI green, screenshots of the read-only panes |
 | 2 | Agent lifecycle on **testnet**: generate, Keychain/IndexedDB storage, approve (web wallet + desktop handoff), expiry warning, revoke. | testnet `extraAgents` before and after; a revoked key is rejected |
 | 3 | Testnet order entry: limit/market(IOC)/stop/TP, reduce-only, modify, cancel, kill switch, dead man's switch, max-notional and leverage guards, confirm modal, HIP-3 labelling. | §11 drills, before-and-after screenshots, testnet oids |
 | 4 | Mainnet behind `hl-mainnet` + acknowledgement, **only after §12 is resolved**. Tiny-size canary trades by Micky personally. | Legal sign-off recorded in this doc |
