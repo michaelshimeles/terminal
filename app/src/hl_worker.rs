@@ -63,9 +63,8 @@ pub struct Turns {
 
 #[derive(Default)]
 struct Schedule {
-    /// Until when a clear (`[0]`) or a timer (`[1]`) sent without a clear answer may still
-    /// land (ms).
-    may_land: [u64; 2],
+    /// A change sent without a clear answer may still land until then (ms).
+    may_land_until: u64,
 }
 
 impl Default for Turns {
@@ -152,18 +151,15 @@ impl Turns {
         go.await
     }
 
-    /// A dead man's switch change (`scheduleCancel`). `arm` sets the timer, otherwise it is
-    /// cleared, and `seq` is the app's id for the change. Changes go out one at a time, in the
-    /// order the app made them, and never wait for an order. Only the newest matters, so the
-    /// worker drops a change that a newer one has replaced (`None`), even one still waiting
-    /// for its turn. `go` signs when it is called, so a change that waited still gets a fresh
-    /// deadline.
+    /// A dead man's switch change (`scheduleCancel`), where `seq` is the app's id for it.
+    /// Changes go out one at a time, in the order the app made them, and never wait for an
+    /// order. Only the newest matters, so the worker drops a change that a newer one has
+    /// replaced (`None`), even one still waiting for its turn.
     ///
-    /// After a change whose send got no clear answer, a change of the other kind waits until
-    /// that one can no longer land. A late clear then never removes a newer timer, and a late
-    /// timer never comes back after a clear. Refreshes don't wait for each other, because one
-    /// that lands late only moves the timer back by one refresh.
-    pub async fn schedule<GF>(&self, seq: u64, arm: bool, go: impl FnOnce() -> GF) -> Option<Outcome>
+    /// After a change whose send got no clear answer, the next waits until that one can no
+    /// longer land, so an older timer or clear never lands after a newer change. `go` signs
+    /// when it is called, so a change that waited still gets a fresh deadline.
+    pub async fn schedule<GF>(&self, seq: u64, go: impl FnOnce() -> GF) -> Option<Outcome>
     where
         GF: Future<Output = (Outcome, Option<u64>)>,
     {
@@ -173,7 +169,7 @@ impl Turns {
         if replaced() {
             return None;
         }
-        let wait = s.may_land[usize::from(!arm)].saturating_sub(now_ms());
+        let wait = s.may_land_until.saturating_sub(now_ms());
         if wait > 0 {
             rt::sleep(Duration::from_millis(wait).min(FOLLOW_UP_MAX)).await;
             if replaced() {
@@ -182,8 +178,7 @@ impl Turns {
         }
         let (outcome, may_land_until) = go().await;
         if let Some(t) = may_land_until {
-            let until = &mut s.may_land[usize::from(arm)];
-            *until = (*until).max(t);
+            s.may_land_until = s.may_land_until.max(t);
         }
         Some(outcome)
     }
@@ -535,7 +530,7 @@ pub async fn handle(req: HlRequest, send: impl Fn(HlResponse) + Clone + 'static)
                             trader::sign_schedule_cancel(k, n, ahead.map(|a| now + a), now).map(|s| vec![s]),
                         )
                     };
-                    match turns.schedule(id, ahead.is_some(), go).await {
+                    match turns.schedule(id, go).await {
                         Some(outcome) => outcome,
                         None => return, // the app has since made a newer change
                     }
@@ -911,7 +906,7 @@ mod tests {
                     let _ = answered.await; // the answer is slow
                     (ok(), None)
                 };
-                turns.schedule(1, false, go).await
+                turns.schedule(1, go).await
             }
         });
         eventually("the clear went out without waiting for the order", || !sent.lock().unwrap().is_empty()).await;
@@ -922,7 +917,7 @@ mod tests {
                     sent.lock().unwrap().push("set");
                     (ok(), None)
                 };
-                turns.schedule(2, true, go).await
+                turns.schedule(2, go).await
             }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -933,46 +928,22 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), ["clear", "set"]);
     }
 
-    /// A change with no clear answer may still land until its `expiresAfter` passes, so a
-    /// change of the other kind waits until then: a timer after a lost clear, and a clear after
-    /// a lost timer.
+    /// Greptile #37 (73b71b8): a refresh went out without waiting for an earlier timer whose
+    /// reply was lost. That timer could land last (the clocks may differ by seconds) and pull
+    /// the deadline in, so the switch could fire while Terminal was running. Each refresh is
+    /// signed when it goes out, so waiting no longer makes deadlines stale.
     #[tokio::test]
-    async fn a_change_of_the_other_kind_waits_until_a_lost_one_cannot_land() {
+    async fn a_refresh_waits_until_a_lost_earlier_timer_cannot_land() {
         let turns = Turns::default();
         let window = 300;
-        for (seq, lost_arms) in [(1, false), (3, true)] {
-            let until = now_ms() + window;
-            let lost = turns
-                .schedule(seq, lost_arms, || async move {
-                    (Outcome::Failed(SendError::Uncertain("timed out".into())), Some(until))
-                })
-                .await;
-            assert!(matches!(lost, Some(Outcome::Failed(SendError::Uncertain(_)))));
-            let t0 = std::time::Instant::now();
-            assert_eq!(turns.schedule(seq + 1, !lost_arms, || async { (ok(), None) }).await, Some(ok()));
-            assert!(t0.elapsed() >= Duration::from_millis(window - 20), "sent while the lost change could land");
-        }
-    }
-
-    /// Greptile #37 (2f7cab6): every refresh waited out the one before it when that one got no
-    /// clear answer. Refreshes queued every 30 s but went out every 35 s, each with the
-    /// deadline it was given when queued, so the timer could fire while Terminal was running.
-    /// A refresh that lands after a newer one only moves the timer back by one refresh, so a
-    /// refresh never waits for another.
-    #[tokio::test]
-    async fn a_refresh_never_waits_for_an_earlier_refresh() {
-        let turns = Turns::default();
-        let until = now_ms() + 300;
-        let lost =
-            turns
-                .schedule(1, true, || async move {
-                    (Outcome::Failed(SendError::Uncertain("timed out".into())), Some(until))
-                })
-                .await;
+        let until = now_ms() + window;
+        let lost = turns
+            .schedule(1, || async move { (Outcome::Failed(SendError::Uncertain("timed out".into())), Some(until)) })
+            .await;
         assert!(matches!(lost, Some(Outcome::Failed(_))));
         let t0 = std::time::Instant::now();
-        assert_eq!(turns.schedule(2, true, || async { (ok(), None) }).await, Some(ok()));
-        assert!(t0.elapsed() < Duration::from_millis(100), "the refresh waited {:?}", t0.elapsed());
+        assert_eq!(turns.schedule(2, || async { (ok(), None) }).await, Some(ok()));
+        assert!(t0.elapsed() >= Duration::from_millis(window - 20), "sent while the lost timer could land last");
     }
 
     /// Refreshes queued behind a slow one collapse into the newest, which is signed (and gets
@@ -988,7 +959,7 @@ mod tests {
                     let _ = answered.await;
                     (ok(), None)
                 };
-                turns.schedule(1, true, go).await
+                turns.schedule(1, go).await
             }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1001,7 +972,7 @@ mod tests {
                         signed.lock().unwrap().push((seq, std::time::Instant::now()));
                         async { (ok(), None) }
                     };
-                    turns.schedule(seq, true, go).await
+                    turns.schedule(seq, go).await
                 })
             })
             .collect();
@@ -1024,13 +995,13 @@ mod tests {
     #[tokio::test]
     async fn a_dead_mans_switch_change_the_app_has_replaced_is_dropped() {
         let turns = Turns::default();
-        assert_eq!(turns.schedule(5, true, || async { (ok(), None) }).await, Some(ok()));
+        assert_eq!(turns.schedule(5, || async { (ok(), None) }).await, Some(ok()));
         let sent = AtomicBool::new(false);
         let go = || async {
             sent.store(true, Ordering::SeqCst);
             (ok(), None)
         };
-        assert_eq!(turns.schedule(4, true, go).await, None);
+        assert_eq!(turns.schedule(4, go).await, None);
         assert!(!sent.load(Ordering::SeqCst));
     }
 
