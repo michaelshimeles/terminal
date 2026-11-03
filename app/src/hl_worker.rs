@@ -57,14 +57,15 @@ pub struct Turns {
     may_land_until: AtomicU64,
     /// Dead man's switch changes go out one at a time.
     schedule: tokio::sync::Mutex<Schedule>,
+    /// The app's id for the newest dead man's switch change that reached the worker.
+    schedule_wanted: AtomicU64,
 }
 
 #[derive(Default)]
 struct Schedule {
-    /// The app's id for the newest change sent.
-    newest: u64,
-    /// A change sent without a clear answer may still land until then (ms).
-    may_land_until: u64,
+    /// Until when a clear (`[0]`) or a timer (`[1]`) sent without a clear answer may still
+    /// land (ms).
+    may_land: [u64; 2],
 }
 
 impl Default for Turns {
@@ -75,6 +76,7 @@ impl Default for Turns {
             sending: Default::default(),
             may_land_until: AtomicU64::new(0),
             schedule: Default::default(),
+            schedule_wanted: AtomicU64::new(0),
         }
     }
 }
@@ -150,27 +152,38 @@ impl Turns {
         go.await
     }
 
-    /// A dead man's switch change (`scheduleCancel`), where `seq` is the app's id for it.
-    /// Changes go out one at a time, in the order the app made them, and never wait for an
-    /// order. The worker drops one that reaches it after a newer one went out (`None`).
-    /// After a change whose send got no clear answer, the next waits until that one can no
-    /// longer land, so an old clear never removes a newer schedule.
-    pub async fn schedule<GF>(&self, seq: u64, go: impl FnOnce() -> GF) -> Option<Outcome>
+    /// A dead man's switch change (`scheduleCancel`). `arm` sets the timer, otherwise it is
+    /// cleared, and `seq` is the app's id for the change. Changes go out one at a time, in the
+    /// order the app made them, and never wait for an order. Only the newest matters, so the
+    /// worker drops a change that a newer one has replaced (`None`), even one still waiting
+    /// for its turn. `go` signs when it is called, so a change that waited still gets a fresh
+    /// deadline.
+    ///
+    /// After a change whose send got no clear answer, a change of the other kind waits until
+    /// that one can no longer land. A late clear then never removes a newer timer, and a late
+    /// timer never comes back after a clear. Refreshes don't wait for each other, because one
+    /// that lands late only moves the timer back by one refresh.
+    pub async fn schedule<GF>(&self, seq: u64, arm: bool, go: impl FnOnce() -> GF) -> Option<Outcome>
     where
         GF: Future<Output = (Outcome, Option<u64>)>,
     {
+        self.schedule_wanted.fetch_max(seq, Ordering::SeqCst);
+        let replaced = || seq < self.schedule_wanted.load(Ordering::SeqCst);
         let mut s = self.schedule.lock().await;
-        if seq <= s.newest {
+        if replaced() {
             return None;
         }
-        s.newest = seq;
-        let wait = s.may_land_until.saturating_sub(now_ms());
+        let wait = s.may_land[usize::from(!arm)].saturating_sub(now_ms());
         if wait > 0 {
             rt::sleep(Duration::from_millis(wait).min(FOLLOW_UP_MAX)).await;
+            if replaced() {
+                return None;
+            }
         }
         let (outcome, may_land_until) = go().await;
         if let Some(t) = may_land_until {
-            s.may_land_until = s.may_land_until.max(t);
+            let until = &mut s.may_land[usize::from(arm)];
+            *until = (*until).max(t);
         }
         Some(outcome)
     }
@@ -289,6 +302,8 @@ pub enum HlAct {
         cross: bool,
         leverage: u32,
     },
+    /// The dead man's switch: cancel every order this many ms after it is signed, or clear
+    /// it (`None`).
     ScheduleCancel(Option<u64>),
 }
 
@@ -511,9 +526,16 @@ pub async fn handle(req: HlRequest, send: impl Fn(HlResponse) + Clone + 'static)
                         })
                         .await
                 }
-                HlAct::ScheduleCancel(at) => {
-                    let go = || send_signed(c, k, trader::sign_schedule_cancel(k, n, at, now_ms()).map(|s| vec![s]));
-                    match turns.schedule(id, go).await {
+                HlAct::ScheduleCancel(ahead) => {
+                    let go = || {
+                        let now = now_ms();
+                        send_signed(
+                            c,
+                            k,
+                            trader::sign_schedule_cancel(k, n, ahead.map(|a| now + a), now).map(|s| vec![s]),
+                        )
+                    };
+                    match turns.schedule(id, ahead.is_some(), go).await {
                         Some(outcome) => outcome,
                         None => return, // the app has since made a newer change
                     }
@@ -889,7 +911,7 @@ mod tests {
                     let _ = answered.await; // the answer is slow
                     (ok(), None)
                 };
-                turns.schedule(1, go).await
+                turns.schedule(1, false, go).await
             }
         });
         eventually("the clear went out without waiting for the order", || !sent.lock().unwrap().is_empty()).await;
@@ -900,7 +922,7 @@ mod tests {
                     sent.lock().unwrap().push("set");
                     (ok(), None)
                 };
-                turns.schedule(2, go).await
+                turns.schedule(2, true, go).await
             }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -911,20 +933,90 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), ["clear", "set"]);
     }
 
-    /// A change with no clear answer may still land until its `expiresAfter` passes, so the
-    /// next one waits until then.
+    /// A change with no clear answer may still land until its `expiresAfter` passes, so a
+    /// change of the other kind waits until then: a timer after a lost clear, and a clear after
+    /// a lost timer.
     #[tokio::test]
-    async fn after_a_change_with_no_clear_answer_the_next_waits_until_it_cannot_land() {
+    async fn a_change_of_the_other_kind_waits_until_a_lost_one_cannot_land() {
         let turns = Turns::default();
         let window = 300;
-        let until = now_ms() + window;
-        let clear = turns
-            .schedule(1, || async move { (Outcome::Failed(SendError::Uncertain("timed out".into())), Some(until)) })
-            .await;
-        assert!(matches!(clear, Some(Outcome::Failed(SendError::Uncertain(_)))));
+        for (seq, lost_arms) in [(1, false), (3, true)] {
+            let until = now_ms() + window;
+            let lost = turns
+                .schedule(seq, lost_arms, || async move {
+                    (Outcome::Failed(SendError::Uncertain("timed out".into())), Some(until))
+                })
+                .await;
+            assert!(matches!(lost, Some(Outcome::Failed(SendError::Uncertain(_)))));
+            let t0 = std::time::Instant::now();
+            assert_eq!(turns.schedule(seq + 1, !lost_arms, || async { (ok(), None) }).await, Some(ok()));
+            assert!(t0.elapsed() >= Duration::from_millis(window - 20), "sent while the lost change could land");
+        }
+    }
+
+    /// Greptile #37 (2f7cab6): every refresh waited out the one before it when that one got no
+    /// clear answer. Refreshes queued every 30 s but went out every 35 s, each with the
+    /// deadline it was given when queued, so the timer could fire while Terminal was running.
+    /// A refresh that lands after a newer one only moves the timer back by one refresh, so a
+    /// refresh never waits for another.
+    #[tokio::test]
+    async fn a_refresh_never_waits_for_an_earlier_refresh() {
+        let turns = Turns::default();
+        let until = now_ms() + 300;
+        let lost =
+            turns
+                .schedule(1, true, || async move {
+                    (Outcome::Failed(SendError::Uncertain("timed out".into())), Some(until))
+                })
+                .await;
+        assert!(matches!(lost, Some(Outcome::Failed(_))));
         let t0 = std::time::Instant::now();
-        assert_eq!(turns.schedule(2, || async { (ok(), None) }).await, Some(ok()));
-        assert!(t0.elapsed() >= Duration::from_millis(window - 20), "sent while the clear could still land");
+        assert_eq!(turns.schedule(2, true, || async { (ok(), None) }).await, Some(ok()));
+        assert!(t0.elapsed() < Duration::from_millis(100), "the refresh waited {:?}", t0.elapsed());
+    }
+
+    /// Refreshes queued behind a slow one collapse into the newest, which is signed (and gets
+    /// its deadline) only when it goes out.
+    #[tokio::test]
+    async fn queued_refreshes_collapse_into_the_newest_signed_when_it_goes_out() {
+        let turns = Arc::new(Turns::default());
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+        let slow = tokio::spawn({
+            let turns = turns.clone();
+            async move {
+                let go = || async move {
+                    let _ = answered.await;
+                    (ok(), None)
+                };
+                turns.schedule(1, true, go).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let signed = Arc::new(Mutex::new(Vec::new()));
+        let queued: Vec<_> = (2..=4)
+            .map(|seq| {
+                let (turns, signed) = (turns.clone(), signed.clone());
+                tokio::spawn(async move {
+                    let go = move || {
+                        signed.lock().unwrap().push((seq, std::time::Instant::now()));
+                        async { (ok(), None) }
+                    };
+                    turns.schedule(seq, true, go).await
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let answered_at = std::time::Instant::now();
+        answer.send(()).unwrap();
+        assert_eq!(slow.await.unwrap(), Some(ok()));
+        let mut results = Vec::new();
+        for q in queued {
+            results.push(tokio::time::timeout(QUICK, q).await.unwrap().unwrap());
+        }
+        assert_eq!(results, [None, None, Some(ok())], "only the newest went out");
+        let signed = signed.lock().unwrap().clone();
+        assert_eq!(signed.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [4]);
+        assert!(signed[0].1 >= answered_at, "signed when it went out, not when it was queued");
     }
 
     /// The worker runs requests side by side, so an older change can reach it after a newer
@@ -932,13 +1024,13 @@ mod tests {
     #[tokio::test]
     async fn a_dead_mans_switch_change_the_app_has_replaced_is_dropped() {
         let turns = Turns::default();
-        assert_eq!(turns.schedule(5, || async { (ok(), None) }).await, Some(ok()));
+        assert_eq!(turns.schedule(5, true, || async { (ok(), None) }).await, Some(ok()));
         let sent = AtomicBool::new(false);
         let go = || async {
             sent.store(true, Ordering::SeqCst);
             (ok(), None)
         };
-        assert_eq!(turns.schedule(4, go).await, None);
+        assert_eq!(turns.schedule(4, true, go).await, None);
         assert!(!sent.load(Ordering::SeqCst));
     }
 

@@ -882,7 +882,7 @@ impl TerminalApp {
         if want && self.hl.deadman_at.is_none_or(|t| t.elapsed() > Duration::from_millis(DEADMAN_AHEAD_MS / 2)) {
             self.hl.deadman_at = Some(Instant::now());
             self.hl.deadman_armed = true;
-            self.hl_act(HlAct::ScheduleCancel(Some(now_ms() + DEADMAN_AHEAD_MS)));
+            self.hl_act(HlAct::ScheduleCancel(Some(DEADMAN_AHEAD_MS)));
         } else if !want && std::mem::take(&mut self.hl.deadman_armed) {
             self.hl.deadman_at = None;
             if self.hl.key.is_some() {
