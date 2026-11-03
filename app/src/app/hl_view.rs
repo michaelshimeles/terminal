@@ -648,7 +648,7 @@ impl TerminalApp {
         });
         ui.separator();
         let h = self.prefs.trading.hl.clone();
-        let on = h.enabled && self.hl_blocker().is_none();
+        let on = h.enabled && self.hl_signing_blocker().is_none();
         ui.label(
             RichText::new(match (h.master.is_some(), h.agent.is_some(), on) {
                 (false, _, _) => {

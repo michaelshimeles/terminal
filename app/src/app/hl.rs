@@ -468,6 +468,62 @@ pub fn intent(t: &super::trading::Ticket, reg: &AssetRegistry) -> Result<OrderIn
     Ok(OrderIntent { coin, is_buy: t.side == tr_broker::trading::Side::Buy, size, kind, reduce_only })
 }
 
+/// Why this device can't sign for the account (`None`: it can).
+fn signing_blocker(h: &crate::prefs::HlPrefs, hl: &HlState, now: u64) -> Option<String> {
+    if h.master.is_none() {
+        return Some("Connect a Hyperliquid testnet account in Settings › Trading.".into());
+    }
+    if let Some(e) = &hl.store_error {
+        return Some(format!("Hyperliquid trading is off on this device: {e}"));
+    }
+    let Some(agent) = &h.agent else {
+        return Some("Read-only: approve an agent in Settings › Trading › Hyperliquid to trade.".into());
+    };
+    if agent.valid_until <= now {
+        return Some("The agent expired: approve a new one in Settings › Trading › Hyperliquid.".into());
+    }
+    if hl.key.is_none() {
+        return Some(if hl.key_loading {
+            "Loading the agent key…".into()
+        } else {
+            "This device has no key for the approved agent: approve a new one in Settings › Trading.".into()
+        });
+    }
+    if !h.enabled {
+        return Some("Hyperliquid orders are off. Enable them in Settings › Trading › Hyperliquid.".into());
+    }
+    None
+}
+
+/// Why a new order (or other confirmed action) can't be sent: [`signing_blocker`], or an
+/// earlier order whose fate is still unknown.
+fn placement_blocker(h: &crate::prefs::HlPrefs, hl: &HlState, now: u64) -> Option<String> {
+    signing_blocker(h, hl, now).or_else(|| {
+        hl.uncertain.as_ref().map(|u| {
+            format!(
+                "The last {} order got no clear answer; checking whether it reached Hyperliquid (client id {}) before sending anything else.",
+                u.coin, u.cloid
+            )
+        })
+    })
+}
+
+/// What stops a confirmed action: new orders wait for an uncertain one to be resolved;
+/// cancels and leverage only need signing; the kill switch always goes ahead.
+fn confirm_blocker(c: &HlConfirm, h: &crate::prefs::HlPrefs, hl: &HlState, now: u64) -> Option<String> {
+    match c {
+        HlConfirm::Order { .. } => placement_blocker(h, hl, now),
+        HlConfirm::Cancel { .. } | HlConfirm::Leverage { .. } => signing_blocker(h, hl, now),
+        HlConfirm::Kill { .. } => None,
+    }
+}
+
+/// Keep the dead man's switch armed? Only whether this device can sign matters: an order
+/// whose fate is unknown is exactly when the timed cancel must stay in place.
+fn deadman_wanted(h: &crate::prefs::HlPrefs, hl: &HlState, now: u64) -> bool {
+    h.dead_mans_switch && signing_blocker(h, hl, now).is_none()
+}
+
 /// Read the agent key from the store? Once per account: a store that has none for an
 /// approved agent is not asked again every frame.
 fn should_load_key(agent: bool, h: &HlState, account: &str) -> bool {
@@ -505,36 +561,12 @@ impl TerminalApp {
 
     /// Why Hyperliquid orders can't be sent right now (`None`: they can).
     pub(super) fn hl_blocker(&self) -> Option<String> {
-        let h = &self.prefs.trading.hl;
-        if h.master.is_none() {
-            return Some("Connect a Hyperliquid testnet account in Settings › Trading.".into());
-        }
-        if let Some(e) = &self.hl.store_error {
-            return Some(format!("Hyperliquid trading is off on this device: {e}"));
-        }
-        let Some(agent) = &h.agent else {
-            return Some("Read-only: approve an agent in Settings › Trading › Hyperliquid to trade.".into());
-        };
-        if agent.valid_until <= now_ms() {
-            return Some("The agent expired: approve a new one in Settings › Trading › Hyperliquid.".into());
-        }
-        if self.hl.key.is_none() {
-            return Some(if self.hl.key_loading {
-                "Loading the agent key…".into()
-            } else {
-                "This device has no key for the approved agent: approve a new one in Settings › Trading.".into()
-            });
-        }
-        if !h.enabled {
-            return Some("Hyperliquid orders are off. Enable them in Settings › Trading › Hyperliquid.".into());
-        }
-        if let Some(u) = &self.hl.uncertain {
-            return Some(format!(
-                "The last {} order got no clear answer; checking whether it reached Hyperliquid (client id {}) before sending anything else.",
-                u.coin, u.cloid
-            ));
-        }
-        None
+        placement_blocker(&self.prefs.trading.hl, &self.hl, now_ms())
+    }
+
+    /// Why nothing can be signed at all (cancels and leverage only need this).
+    pub(super) fn hl_signing_blocker(&self) -> Option<String> {
+        signing_blocker(&self.prefs.trading.hl, &self.hl, now_ms())
     }
 
     /// Start everything for the saved account (at launch, or after connecting).
@@ -786,7 +818,7 @@ impl TerminalApp {
     }
 
     fn hl_deadman(&mut self) {
-        let want = self.prefs.trading.hl.dead_mans_switch && self.hl_blocker().is_none();
+        let want = deadman_wanted(&self.prefs.trading.hl, &self.hl, now_ms());
         if want && self.hl.deadman_at.is_none_or(|t| t.elapsed() > Duration::from_millis(DEADMAN_AHEAD_MS / 2)) {
             self.hl.deadman_at = Some(Instant::now());
             self.hl.deadman_armed = true;
@@ -863,7 +895,7 @@ impl TerminalApp {
             .and_then(|pf| pf.orders.iter().find(|o| is_hl_account(&o.account_id) && o.id == order_id))
             .cloned();
         let Some(o) = order else { return self.status = "Order not found".into() };
-        if let Some(b) = self.hl_blocker() {
+        if let Some(b) = self.hl_signing_blocker() {
             return self.status = b;
         }
         let Ok(oid) = o.id.parse::<u64>() else { return };
@@ -921,7 +953,7 @@ impl TerminalApp {
     /// The user confirmed.
     pub(super) fn hl_confirmed(&mut self) {
         let Some(c) = self.hl.confirm.take() else { return };
-        if let Some(b) = self.hl_blocker().filter(|_| !matches!(c, HlConfirm::Kill { .. })) {
+        if let Some(b) = confirm_blocker(&c, &self.prefs.trading.hl, &self.hl, now_ms()) {
             return self.trade_toast(format!("Hyperliquid: {b}"), false);
         }
         let reg = self.hl.registry.clone();
@@ -1238,6 +1270,50 @@ mod tests {
         let u = Uncertain { cloid: tr_hl::actions::cloid(1), coin: "BTC".into(), sent: 1_000_000, asked: None };
         assert!(!u.expired(1_000_000 + trader::EXPIRES_AFTER_MS), "it could still land");
         assert!(u.expired(1_000_000 + trader::EXPIRES_AFTER_MS + 5_001), "now it never can");
+    }
+
+    /// Greptile #37: an order with no clear answer blocked new sends and also cleared the dead
+    /// man's switch, so the possibly accepted order lost its timed cancel.
+    #[test]
+    fn an_uncertain_order_keeps_the_dead_mans_switch_armed() {
+        let now = 1_793_667_000_000;
+        let agent = AgentKey::generate();
+        let prefs = crate::prefs::HlPrefs {
+            enabled: true,
+            master: Some(MASTER.into()),
+            agent: Some(HlAgent {
+                address: tr_hl::key::address_hex(&agent.address()),
+                name: trader::agent_name("t", now + 86_400_000),
+                valid_until: now + 86_400_000,
+                network: tr_hl::Network::Testnet,
+            }),
+            dead_mans_switch: true,
+            ..Default::default()
+        };
+        let mut hl = HlState::new(AgentKeyStore::memory());
+        hl.key = Some(Arc::new(agent));
+        assert!(deadman_wanted(&prefs, &hl, now) && placement_blocker(&prefs, &hl, now).is_none());
+        hl.uncertain = Some(Uncertain { cloid: tr_hl::actions::cloid(1), coin: "BTC".into(), sent: now, asked: None });
+        assert!(placement_blocker(&prefs, &hl, now).is_some(), "no new order while one is unresolved");
+        assert!(deadman_wanted(&prefs, &hl, now), "but the timed cancel stays armed");
+        let off = crate::prefs::HlPrefs { enabled: false, ..prefs.clone() };
+        assert!(!deadman_wanted(&off, &hl, now), "KILL (orders off) disarms it");
+        // Cancels still go through while the order is unresolved; new orders don't.
+        let cancel = HlConfirm::Cancel { coin: "BTC".into(), oid: 1, line: String::new() };
+        assert_eq!(confirm_blocker(&cancel, &prefs, &hl, now), None);
+        assert!(confirm_blocker(&HlConfirm::Kill { orders: Vec::new() }, &off, &hl, now).is_none(), "KILL always");
+        let reg = registry();
+        let intent = OrderIntent {
+            coin: "BTC".into(),
+            is_buy: true,
+            size: 0.0002,
+            kind: OrderKind::Limit { px: 50_000.0, tif: Tif::Gtc },
+            reduce_only: false,
+        };
+        let ctx = MarketCtx { mid: Some(76_000.0), leverage: Some(trader::Leverage { value: 3, cross: true }) };
+        let plan = trader::plan_order(&reg, &intent, &ctx, &tr_hl::actions::cloid(2)).unwrap();
+        let order = HlConfirm::Order { ticket: 1, plan: Box::new(plan), modify: None };
+        assert!(confirm_blocker(&order, &prefs, &hl, now).is_some());
     }
 
     #[test]

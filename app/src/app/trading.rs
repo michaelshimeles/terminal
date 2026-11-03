@@ -317,7 +317,7 @@ impl TerminalApp {
         }
         if super::hl::is_hl_account(account) {
             return Some(Capability {
-                connection_trading: self.hl_blocker().is_none(),
+                connection_trading: self.hl_signing_blocker().is_none(),
                 ..everything("Hyperliquid testnet".into())
             });
         }
