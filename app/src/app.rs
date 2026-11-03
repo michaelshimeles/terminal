@@ -50,6 +50,9 @@ use crate::worker::{Profile, Request, Response, Worker, data_dir};
 use chrome::{SIDEBAR_W, STATUS_H, SidebarCmd};
 use settings_view::SettingsTab;
 
+/// How often a visible order book pane asks for its book.
+const BOOK_POLL: Duration = Duration::from_millis(400);
+
 pub enum PaneKind {
     Chart(Box<ChartState>),
     Feed {
@@ -160,13 +163,34 @@ pub struct BookPane {
     pub book: Option<OrderBook>,
     pub error: Option<String>,
     pub fetched: Option<Instant>,
+    /// A request is out. A REST book can take longer than [`BOOK_POLL`], and requests run
+    /// concurrently, so the pane waits for the answer before it asks again.
+    pub pending: bool,
+    /// Numbers the pane's asks; only the answer to the latest one clears `pending`.
+    pub asked: u64,
     /// The latest trades, oldest first, when the book comes from the Terminal server.
     pub trades: Vec<tr_data::TradePrint>,
 }
 
 impl BookPane {
     pub fn new(symbol: &str, depth: usize, group: f64) -> Self {
-        Self { symbol: symbol.into(), depth, group, book: None, error: None, fetched: None, trades: Vec::new() }
+        Self {
+            symbol: symbol.into(),
+            depth,
+            group,
+            book: None,
+            error: None,
+            fetched: None,
+            pending: false,
+            asked: 0,
+            trades: Vec::new(),
+        }
+    }
+
+    /// Time to ask for the book again: [`BOOK_POLL`] since the last ask, once it was answered (or
+    /// went unanswered for 10 s).
+    fn due(&self) -> bool {
+        self.fetched.is_none_or(|t| t.elapsed() > BOOK_POLL && (!self.pending || t.elapsed() > Duration::from_secs(10)))
     }
 
     /// Whether the book came through the Terminal server, which also has the market's trades.
@@ -1099,12 +1123,15 @@ impl TerminalApp {
                         }
                     }
                 }
-                Response::OrderBook { pane, symbol, book } => {
+                Response::OrderBook { pane, symbol, ask, book } => {
                     if let Some(p) = self.panes.iter_mut().find(|p| p.id == pane)
                         && let PaneKind::OrderBook(b) = &mut p.kind
-                        && b.symbol == symbol
                     {
+                        if ask == b.asked {
+                            b.pending = false;
+                        }
                         match book {
+                            _ if b.symbol != symbol => {}
                             Ok(book) => {
                                 b.book = Some(book);
                                 b.error = None;
@@ -1441,7 +1468,8 @@ impl TerminalApp {
             self.worker.send(Request::YieldCurves);
             self.last_curve = Some(Instant::now());
         }
-        // News every 5 minutes and order books every second, while visible.
+        // News every 5 minutes and order books about twice a second, while visible. The Terminal
+        // server's books change about every 0.5 s; 400 ms puts a poll on every 500 ms repaint tick.
         for &i in &visible {
             let p = &mut self.panes[i];
             match &mut p.kind {
@@ -1457,9 +1485,16 @@ impl TerminalApp {
                         expiration: o.expiration,
                     });
                 }
-                PaneKind::OrderBook(b) if b.fetched.is_none_or(|t| t.elapsed() > Duration::from_millis(1000)) => {
+                PaneKind::OrderBook(b) if b.due() => {
                     b.fetched = Some(Instant::now());
-                    self.worker.send(Request::OrderBook { pane: p.id, symbol: b.symbol.clone(), depth: b.depth });
+                    b.pending = true;
+                    b.asked += 1;
+                    self.worker.send(Request::OrderBook {
+                        pane: p.id,
+                        symbol: b.symbol.clone(),
+                        depth: b.depth,
+                        ask: b.asked,
+                    });
                     if b.served_by_server() {
                         self.worker.send(Request::Trades { pane: p.id, symbol: b.symbol.clone() });
                     }
@@ -1687,6 +1722,17 @@ impl eframe::App for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_book_pane_asks_again_once_answered() {
+        let ago = |ms| Instant::now().checked_sub(Duration::from_millis(ms));
+        let pane = |fetched, pending| BookPane { fetched, pending, ..BookPane::new("BTCUSD Curncy", 20, 0.0) };
+        assert!(pane(None, false).due());
+        assert!(!pane(ago(0), false).due());
+        assert!(pane(ago(450), false).due(), "a poll on every 500 ms repaint tick");
+        assert!(!pane(ago(450), true).due(), "one request out at a time");
+        assert!(pane(ago(11_000), true).due(), "a lost answer doesn't stop the pane");
+    }
 
     #[test]
     fn legacy_settings_migrate_to_a_layout() {

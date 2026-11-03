@@ -74,6 +74,8 @@ pub enum Request {
         pane: PaneId,
         symbol: String,
         depth: usize,
+        /// Echoed in the response, so the pane knows which of its asks was answered.
+        ask: u64,
     },
     /// The latest trades, for markets the Terminal server serves.
     Trades {
@@ -240,6 +242,7 @@ pub enum Response {
     OrderBook {
         pane: PaneId,
         symbol: String,
+        ask: u64,
         book: Result<tr_data::OrderBook, String>,
     },
     Trades {
@@ -800,9 +803,9 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             let trades = s.provider.trades(&symbol, 40).await.map_err(|e| format!("{e:#}"));
             s.send(Response::Trades { pane, symbol, trades });
         }
-        Request::OrderBook { pane, symbol, depth } => {
+        Request::OrderBook { pane, symbol, depth, ask } => {
             let book = s.provider.order_book(&symbol, depth).await.map_err(|e| format!("{e:#}"));
-            s.send(Response::OrderBook { pane, symbol, book });
+            s.send(Response::OrderBook { pane, symbol, ask, book });
         }
         Request::Search(query) => {
             let hits = s.provider.search(&query).await.unwrap_or_default();

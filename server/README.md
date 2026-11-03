@@ -66,6 +66,7 @@ Per IP, Hyperliquid allows 10 websocket connections, 30 new connections a minute
 
 - The gateway subscribes every dex's mids for good, on a connection of their own.
 - It subscribes a market's book, trades and candles only while some client watches it, and drops them `TR_LINGER_SECS` after the last one leaves.
+- A book uses two upstream subscriptions: Hyperliquid's default `l2Book` (20 levels a side, every ~5 s) and `fast: true` (5 levels a side, every ~0.5 s). The gateway merges them, so a book refreshes about every 0.5 s and keeps 20 levels. If the budget only has room for the default one, that book refreshes every ~5 s.
 - Hyperliquid closes the whole connection when asked for a coin it doesn't list, so the gateway only subscribes coins that have a live mid.
 - Hyperliquid keeps publishing mids for delisted markets. The gateway reads `isDelisted` from each dex's `meta` and doesn't list, resolve or stream them; asking for one gets `Unavailable { UnknownMarket, "xyz:VIX is delisted" }`. A dex with nothing live gets no mids subscription.
 - HIP-3 markets go by their prefixed coin everywhere (`l2Book xyz:AAPL`, `candleSnapshot xyz:AAPL`) and share the budgets above. `cli markets xyz:` lists the live ones.

@@ -113,11 +113,13 @@ fn topic_name(t: &TopicReq) -> String {
     }
 }
 
-/// Latency samples (ms) by measure, plus message counts by topic.
+/// Latency samples (ms) by measure, message counts by topic, and the time between a topic's
+/// updates (ms), which shows how often a topic refreshes.
 #[derive(Default)]
 struct Tally {
     lat: BTreeMap<&'static str, Vec<i64>>,
     msgs: BTreeMap<String, u64>,
+    gaps: BTreeMap<String, Vec<i64>>,
     resyncs: u64,
     statuses: Vec<String>,
 }
@@ -126,6 +128,20 @@ impl Tally {
     fn report(&self) {
         for (name, n) in &self.msgs {
             println!("  {name}: {n} messages");
+        }
+        for (name, v) in &self.gaps {
+            let mut v = v.clone();
+            v.sort_unstable();
+            let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+            if !v.is_empty() {
+                println!(
+                    "  {name}: updates n={} apart p50={}ms p95={}ms max={}ms",
+                    v.len(),
+                    q(0.5),
+                    q(0.95),
+                    v[v.len() - 1]
+                );
+            }
         }
         for (what, v) in &self.lat {
             let mut v = v.clone();
@@ -155,6 +171,8 @@ async fn drain(mut sub: Subscription, name: String, tally: Arc<Mutex<Tally>>, un
     let mut last_print = Instant::now() - Duration::from_secs(5);
     // Hyperliquid opens a trades subscription with recent history; only later trades are live.
     let since = now_ms(SystemTime::now());
+    // Per subscription: in `load`, clients share a topic name but each has its own cadence.
+    let mut last_update = None;
     loop {
         let Ok(Some(u)) = tokio::time::timeout_at(until.into(), sub.next()).await else { return };
         let at = now_ms(u.received);
@@ -162,6 +180,12 @@ async fn drain(mut sub: Subscription, name: String, tally: Arc<Mutex<Tally>>, un
         {
             let mut t = tally.lock().unwrap();
             *t.msgs.entry(name.clone()).or_default() += 1;
+            if matches!(u.event, Event::Snapshot(_) | Event::Delta(_)) {
+                let now = Instant::now();
+                if let Some(prev) = last_update.replace(now) {
+                    t.gaps.entry(name.clone()).or_default().push((now - prev).as_millis() as i64);
+                }
+            }
             match &u.event {
                 Event::Snapshot(TopicData::Quotes(q)) | Event::Delta(TopicDelta::Quotes(q)) => {
                     // A snapshot's `ts_ms` is the price's age; a delta's is when it changed.
