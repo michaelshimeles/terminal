@@ -86,8 +86,12 @@ impl ExchangeResponse {
         })
     }
 
-    /// One line for a toast or a log: `ok: resting oid 123`, `err: …`.
+    /// One line for a toast or a log, addresses masked: `ok (order): resting oid 123`, `err: …`.
     pub fn summary(&self) -> String {
+        crate::key::mask_addresses(&self.summary_raw())
+    }
+
+    fn summary_raw(&self) -> String {
         if let Some(e) = &self.error {
             return format!("err: {e}");
         }
@@ -229,7 +233,12 @@ impl Client {
             Ok(resp) => {
                 tracing::info!(kind = signed.kind, nonce = signed.nonce, "hyperliquid testnet: {}", resp.summary())
             }
-            Err(e) => tracing::warn!(kind = signed.kind, nonce = signed.nonce, "hyperliquid testnet: {e}"),
+            Err(e) => tracing::warn!(
+                kind = signed.kind,
+                nonce = signed.nonce,
+                "hyperliquid testnet: {}",
+                crate::key::mask_addresses(&e.to_string())
+            ),
         }
         r
     }

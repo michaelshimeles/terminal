@@ -909,7 +909,7 @@ impl TerminalApp {
             }
             HlResponse::Roles(r) => {
                 self.hl.roles_busy = false;
-                self.hl.roles = Some(r);
+                self.hl.roles = Some(r.map_err(|e| tr_hl::mask_addresses(&e)));
             }
             HlResponse::KeyLoaded { account, result } => {
                 self.hl.key_loading = false;
@@ -942,6 +942,7 @@ impl TerminalApp {
                         self.hl_web_remember_key();
                     }
                     Err(e) => {
+                        let e = tr_hl::mask_addresses(&e);
                         self.hl.message = Some((format!("Hyperliquid testnet refused the approval: {e}"), true));
                     }
                 }
@@ -950,8 +951,8 @@ impl TerminalApp {
             HlResponse::Revoked(result) => {
                 self.hl.busy = None;
                 self.hl.message = Some(match result {
-                    Ok(m) => (m, false),
-                    Err(e) => (e, true),
+                    Ok(m) => (tr_hl::mask_addresses(&m), false),
+                    Err(e) => (tr_hl::mask_addresses(&e), true),
                 });
                 #[cfg(target_arch = "wasm32")]
                 self.hl_web_forget_key();
@@ -1000,6 +1001,10 @@ impl TerminalApp {
 
 /// One line for a toast.
 pub fn outcome_text(o: &Outcome) -> String {
+    tr_hl::mask_addresses(&outcome_raw(o))
+}
+
+fn outcome_raw(o: &Outcome) -> String {
     match o {
         Outcome::Answered(r) => match r.first_error() {
             Some(e) => format!("rejected: {e}"),

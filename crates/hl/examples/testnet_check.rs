@@ -26,24 +26,7 @@ use tr_hl::trader::*;
 
 /// Replace every `0x` + 40 hex digits with its masked form.
 fn mask(text: &str) -> String {
-    let b = text.as_bytes();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i..].starts_with(b"0x") && b.len() >= i + 42 && b[i + 2..i + 42].iter().all(u8::is_ascii_hexdigit) {
-            let after = b.get(i + 42).is_none_or(|c| !c.is_ascii_hexdigit());
-            if after && let Ok(a) = tr_hl::key::parse_address(&text[i..i + 42]) {
-                out.push_str(&mask_address(&a));
-                i += 42;
-                continue;
-            }
-        }
-        // Copy one whole character (the text has `…` and `×`).
-        let ch = text[i..].chars().next().expect("on a char boundary");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
+    tr_hl::mask_addresses(text)
 }
 
 fn generate(path: &Path) -> anyhow::Result<()> {

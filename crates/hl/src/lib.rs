@@ -28,5 +28,5 @@ mod logs_test;
 #[cfg(test)]
 mod vectors;
 
-pub use key::{AgentKey, MainKey, SigningKey, mask_address};
+pub use key::{AgentKey, MainKey, SigningKey, mask_address, mask_addresses};
 pub use network::Network;

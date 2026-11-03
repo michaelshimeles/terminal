@@ -113,6 +113,30 @@ pub fn mask_address(a: &Address) -> String {
     format!("{}…{}", &s[..6], &s[s.len() - 4..])
 }
 
+/// `text` with every `0x` + 40 hex digits masked (`0x1234…abcd`), for anything shown or
+/// logged: Hyperliquid's errors name full addresses.
+pub fn mask_addresses(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i..].starts_with(b"0x")
+            && b.len() >= i + 42
+            && b[i + 2..i + 42].iter().all(u8::is_ascii_hexdigit)
+            && b.get(i + 42).is_none_or(|c| !c.is_ascii_hexdigit())
+            && let Ok(a) = parse_address(&text[i..i + 42])
+        {
+            out.push_str(&mask_address(&a));
+            i += 42;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Lower-case `0x…` hex, as Hyperliquid wants addresses.
 pub fn address_hex(a: &Address) -> String {
     format!("{a:#x}")
@@ -181,6 +205,18 @@ mod tests {
         }
         let zero = AgentKey::from_hex(&format!("0x{}", "0".repeat(64))).unwrap_err().to_string();
         assert_eq!(zero, "not a valid secp256k1 private key");
+    }
+
+    #[test]
+    fn errors_are_masked_for_display() {
+        let e = "User or API Wallet 0x5E9EE1089755C3435139848E47E6635505D5A13A does not exist. Must deposit… User: 0x5e9ee1089755c3435139848e47e6635505d5a13a";
+        assert_eq!(mask_addresses(e), "User or API Wallet 0x5e9e…a13a does not exist. Must deposit… User: 0x5e9e…a13a");
+        let hash = format!("0x{}", "ab".repeat(32));
+        assert_eq!(mask_addresses(&hash), hash, "64-digit hashes are not addresses");
+        assert_eq!(
+            mask_addresses("cloid 0x0000000000000000000000000000002a ×3"),
+            "cloid 0x0000000000000000000000000000002a ×3"
+        );
     }
 
     #[test]
