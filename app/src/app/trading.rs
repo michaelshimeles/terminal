@@ -1902,7 +1902,13 @@ impl TerminalApp {
             }
         });
         note(ui, "Live orders whose estimated value is above the limit are refused before they are sent.");
-        let accounts: Vec<Account> = self.broker.portfolio.as_ref().map(|p| p.accounts.clone()).unwrap_or_default();
+        // SnapTrade's accounts only: Hyperliquid has its own section above.
+        let accounts: Vec<Account> = self
+            .broker
+            .portfolio
+            .as_ref()
+            .map(|p| p.accounts.iter().filter(|a| !super::hl::is_hl_account(&a.id)).cloned().collect())
+            .unwrap_or_default();
         if !accounts.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Default live account").font(ui_font(12.5)));
