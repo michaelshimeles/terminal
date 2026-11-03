@@ -392,9 +392,16 @@ impl Portfolio {
             t.cash += a.cash.unwrap_or(0.0);
             t.buying_power += a.buying_power.unwrap_or(0.0);
         }
+        // Futures (Hyperliquid perps) are margined: the account's cash backs them, so their value
+        // is their profit or loss, never their notional.
+        let mut futures_pnl = 0.0;
         for p in self.positions.iter().filter(|p| selected(&p.account_id) && !p.cash_equivalent) {
             let live = price_of(p);
-            t.invested += p.market_value_at(live).unwrap_or(0.0);
+            if p.kind == InstrumentKind::Future {
+                futures_pnl += p.pnl_at(live).unwrap_or(0.0);
+            } else {
+                t.invested += p.market_value_at(live).unwrap_or(0.0);
+            }
             if let (Some(cost), Some(pnl)) = (p.cost(), p.pnl_at(live)) {
                 t.cost += cost;
                 t.pnl += pnl;
@@ -412,7 +419,7 @@ impl Portfolio {
         t.value = if reported.len() == n && n > 0 && price_of_is_trivial(&self.positions, &price_of) {
             reported.iter().sum()
         } else {
-            t.cash + t.invested + cash_like
+            t.cash + t.invested + futures_pnl + cash_like
         };
         t
     }
@@ -764,6 +771,40 @@ mod tests {
         pf.accounts[0].total = None;
         assert_eq!(pf.totals(Some("a"), |_| None).value, 2500.0);
         assert_eq!(pf.totals(Some("other"), |_| None), Totals::default());
+    }
+
+    /// Greptile #37: a perp is margined, so repricing it moves equity by its P&L, never by its
+    /// notional. 10 long at 190 marked 200 (P&L 100) in an account worth 1,000.
+    #[test]
+    fn futures_reprice_by_pnl_not_notional() {
+        let account = |cash: f64| Account {
+            id: "hl".into(),
+            name: "Hyperliquid".into(),
+            number: String::new(),
+            institution: "Hyperliquid".into(),
+            currency: "USD".into(),
+            total: Some(1000.0),
+            cash: Some(cash),
+            buying_power: Some(200.0),
+            kind: "Perps".into(),
+            status: String::new(),
+            is_paper: true,
+            synced: None,
+            connection_id: String::new(),
+        };
+        let mut long = pos(InstrumentKind::Future, "BTC", 10.0, 200.0, 190.0);
+        long.account_id = "hl".into();
+        // Cash is the collateral: equity less unrealised P&L.
+        let pf = Portfolio { accounts: vec![account(900.0)], positions: vec![long.clone()], ..Default::default() };
+        assert_eq!(pf.totals(None, |_| None).value, 1000.0, "reported equity");
+        assert_eq!(pf.totals(None, |_| Some(200.0)).value, 1000.0, "the same price leaves equity alone");
+        assert_eq!(pf.totals(None, |_| Some(210.0)).value, 1100.0, "+10 × 10");
+        assert_eq!(pf.totals(None, |_| Some(200.0)).invested, 0.0, "perp notional is not invested cash");
+        let mut short = pos(InstrumentKind::Future, "BTC", -10.0, 200.0, 210.0);
+        short.account_id = "hl".into();
+        let pf = Portfolio { accounts: vec![account(900.0)], positions: vec![short], ..Default::default() };
+        assert_eq!(pf.totals(None, |_| Some(200.0)).value, 1000.0);
+        assert_eq!(pf.totals(None, |_| Some(190.0)).value, 1100.0, "a short gains as the price falls");
     }
 
     #[test]

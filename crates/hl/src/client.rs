@@ -114,6 +114,14 @@ impl ExchangeResponse {
     }
 }
 
+/// `orderStatus`: the order's status, or `None` for `unknownOid`.
+pub fn parse_order_status(v: &Value) -> Option<String> {
+    match v["status"].as_str() {
+        Some("order") => Some(v["order"]["status"].as_str().unwrap_or("unknown").to_string()),
+        _ => None,
+    }
+}
+
 /// The address Hyperliquid recovered from a signature it doesn't recognise: "User or API
 /// Wallet 0x… does not exist." A match with the signer means the signature is right and the
 /// account is just unknown (never funded); a mismatch means the signing is wrong.
@@ -213,6 +221,13 @@ impl Client {
     pub async fn mids(&self, dex: &str) -> Result<std::collections::HashMap<String, f64>> {
         let v = self.info(json!({"type": "allMids", "dex": dex})).await?;
         Ok(v.as_object().into_iter().flatten().filter_map(|(k, p)| Some((k.clone(), num(p)?))).collect())
+    }
+
+    /// An order's status by client order id: `Some("open" | "filled" | "canceled" | …)`, or
+    /// `None` when Hyperliquid has never seen it (`unknownOid`).
+    pub async fn order_status(&self, user: &Address, cloid: &str) -> Result<Option<String>> {
+        let v = self.info(json!({"type": "orderStatus", "user": address_hex(user), "oid": cloid})).await?;
+        Ok(parse_order_status(&v))
     }
 
     /// `missing`, `user`, `agent`, `vault` or `subAccount`.
@@ -316,5 +331,8 @@ mod tests {
             "ok (default)"
         );
         assert_eq!(recovered_address("Insufficient margin"), None);
+        let found = json!({"status": "order", "order": {"order": {"coin": "BTC", "oid": 1}, "status": "filled", "statusTimestamp": 1}});
+        assert_eq!(parse_order_status(&found).as_deref(), Some("filled"));
+        assert_eq!(parse_order_status(&json!({"status": "unknownOid"})), None);
     }
 }

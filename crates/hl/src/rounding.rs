@@ -29,6 +29,10 @@ fn round_to(x: f64, decimals: i32, dir: Round) -> f64 {
 /// The most decimals a perp price may have at this level.
 pub fn price_decimals(px: f64, sz_decimals: u32) -> i32 {
     let max = 6 - sz_decimals.min(6) as i32;
+    // log10 of zero (or of nothing) is not a number of digits.
+    if !px.is_finite() || px == 0.0 {
+        return max;
+    }
     if px.abs() >= 100_000.0 {
         return 0;
     }
@@ -43,6 +47,10 @@ pub fn round_price(px: f64, sz_decimals: u32, dir: Round) -> f64 {
     }
     let d = price_decimals(px, sz_decimals);
     let r = round_to(px, d, dir);
+    if r <= 0.0 {
+        // Smaller than the smallest tick: the caller refuses a zero price.
+        return 0.0;
+    }
     // Rounding up can add a digit (99999.5 → 100000); one more pass settles it.
     round_to(r, price_decimals(r, sz_decimals), dir)
 }
@@ -97,6 +105,14 @@ mod tests {
         assert_eq!(round_price(99999.6, 0, Round::Up), 100000.0);
         assert_eq!(round_price(226.4, 3, Round::Down), 226.4, "on-grid values stay put");
         assert_eq!(round_price(226.4, 3, Round::Up), 226.4);
+    }
+
+    #[test]
+    fn zero_and_tiny_prices_never_panic() {
+        assert_eq!(price_decimals(0.0, 5), 1);
+        assert_eq!(round_price(0.00000001, 5, Round::Nearest), 0.0);
+        assert_eq!(round_price(0.00000001, 5, Round::Up), 0.0, "within the grid's tolerance of zero");
+        assert!(round_price(f64::NAN, 5, Round::Nearest).is_nan());
     }
 
     #[test]

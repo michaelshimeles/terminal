@@ -34,6 +34,10 @@ pub(super) fn masked(addr: &str) -> String {
     tr_hl::key::parse_address(addr).map(|a| tr_hl::mask_address(&a)).unwrap_or_else(|_| addr.to_string())
 }
 
+/// The pasted main key's field (its state is wiped once the key has signed).
+#[cfg(not(target_arch = "wasm32"))]
+const MAIN_KEY_FIELD: &str = "hl-main-key";
+
 const HIP3_RISK: &str = "A leveraged perpetual future with funding, priced by the deployer's oracle. It can diverge from the \
 listed stock (off-hours, opens, earnings, corporate actions), and the deployer can halt the market and settle it at mark.";
 
@@ -441,15 +445,9 @@ impl TerminalApp {
                 HlConfirm::Cancel { .. } => {
                     ("Cancel order?".to_string(), "Cancel order — Sign & send".to_string(), theme::down())
                 }
-                HlConfirm::Kill { orders } => (
-                    "Kill switch".to_string(),
-                    if orders.is_empty() {
-                        "Turn Hyperliquid orders off".into()
-                    } else {
-                        format!("Cancel {} and turn off", orders.len())
-                    },
-                    theme::down(),
-                ),
+                HlConfirm::Kill { .. } => {
+                    ("Kill switch".to_string(), "Cancel all and turn orders off".to_string(), theme::down())
+                }
                 HlConfirm::Leverage { coin, leverage, .. } => {
                     (format!("Set {coin} leverage?"), format!("Set {leverage}× — Sign & send"), theme::accent())
                 }
@@ -531,7 +529,7 @@ impl TerminalApp {
                         grid_row(
                             ui,
                             "Cancels",
-                            plain(format!("{} open order{}", orders.len(), if orders.len() == 1 { "" } else { "s" })),
+                            plain(format!("every open order ({} seen; read again before cancelling)", orders.len())),
                         );
                         grid_row(ui, "Then", plain("Hyperliquid orders turn off until you enable them again".into()));
                     }
@@ -563,7 +561,7 @@ impl TerminalApp {
             if let HlConfirm::Kill { orders } = &c
                 && orders.is_empty()
             {
-                ui.label(RichText::new("No open orders right now.").font(ui_font(11.5)).color(muted()));
+                ui.label(RichText::new("No open orders seen right now.").font(ui_font(11.5)).color(muted()));
             }
             ui.add_space(dp(6.0));
             ui.horizontal(|ui| {
@@ -692,8 +690,9 @@ impl TerminalApp {
                     if let Some(v) = value {
                         note(ui, &format!("· value {v}"));
                     }
+                    // Not while an approval is in flight: its answer belongs to this account.
                     if ui
-                        .small_button("Remove")
+                        .add_enabled(self.hl.busy.is_none(), egui::Button::new("Remove").small())
                         .on_hover_text("Stop showing this account (the agent key stays unless revoked)")
                         .clicked()
                     {
@@ -893,27 +892,36 @@ impl TerminalApp {
             );
             ui.horizontal(|ui| {
                 let field = egui::TextEdit::singleline(&mut *self.hl.main_key_form)
+                    .id(egui::Id::new(MAIN_KEY_FIELD))
                     .password(true)
                     .hint_text("testnet main key (0x…)")
                     .font(mono(12.0))
                     .desired_width(dp(300.0));
                 ui.add_enabled(!busy, field);
                 let pasted = !self.hl.main_key_form.trim().is_empty();
-                if h.agent.is_none() {
-                    if ui
+                let used = if h.agent.is_none() {
+                    let go = ui
                         .add_enabled(pasted && !busy, egui::Button::new(RichText::new("Approve Agent").strong()))
-                        .clicked()
-                    {
+                        .clicked();
+                    if go {
                         self.hl_approve_with_pasted_key();
                     }
-                } else if ui
-                    .add_enabled(pasted && !busy, egui::Button::new("Revoke on Hyperliquid"))
-                    .on_hover_text(
-                        "Deletes the key here and replaces the agent on Hyperliquid with an address nobody holds",
-                    )
-                    .clicked()
-                {
-                    self.hl_revoke(true);
+                    go
+                } else {
+                    let go = ui
+                        .add_enabled(pasted && !busy, egui::Button::new("Revoke on Hyperliquid"))
+                        .on_hover_text(
+                            "Deletes the key here and replaces the agent on Hyperliquid with an address nobody holds",
+                        )
+                        .clicked();
+                    if go {
+                        self.hl_revoke(true);
+                    }
+                    go
+                };
+                // The field's undo history holds copies of what was typed: drop it with the key.
+                if used {
+                    egui::text_edit::TextEditState::default().store(ui.ctx(), egui::Id::new(MAIN_KEY_FIELD));
                 }
             });
         }

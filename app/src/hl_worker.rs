@@ -25,6 +25,15 @@ use crate::prefs::HlAgent;
 
 /// The stream generation that may run; a new `Stream` or `StopStream` ends older ones.
 static STREAM: AtomicU64 = AtomicU64::new(0);
+/// The newest kill switch seen. An order confirmed before it, not yet signed, is refused.
+static LATEST_KILL: AtomicU64 = AtomicU64::new(0);
+
+/// Signed actions run one at a time, in the order they were sent, so a kill switch waits for
+/// an order already being signed and then reads the open orders after it.
+fn act_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 pub enum HlRequest {
     /// Asset ids and rules, read fresh from `perpDexs` and `meta`.
@@ -51,10 +60,11 @@ pub enum HlRequest {
         store: AgentKeyStore,
         account: String,
     },
-    /// Post a signed `approveAgent`; keep the agent key only if Hyperliquid accepts it.
+    /// Check the key store, post a signed `approveAgent` for `master`, and keep the agent key
+    /// only if Hyperliquid accepts it.
     Approve {
         store: AgentKeyStore,
-        account: String,
+        master: String,
         key: Arc<AgentKey>,
         body: Value,
         agent: HlAgent,
@@ -65,22 +75,41 @@ pub enum HlRequest {
         account: String,
         body: Option<Value>,
     },
-    /// Sign and send.
+    /// Sign and send. `kill_epoch` is the kill switch count when the user confirmed.
     Act {
         id: u64,
         key: Arc<AgentKey>,
         nonces: Arc<NonceManager>,
         user: String,
         act: HlAct,
+        kill_epoch: u64,
+    },
+    /// Whether an order whose send was uncertain reached Hyperliquid.
+    OrderStatus {
+        user: String,
+        cloid: String,
     },
 }
 
 pub enum HlAct {
     Order(Box<OrderPlan>),
-    Modify { oid: u64, plan: Box<OrderPlan> },
-    Cancel { asset: Asset, oid: u64 },
-    CancelAll { registry: Arc<AssetRegistry>, orders: Vec<(String, u64)> },
-    Leverage { asset: Asset, cross: bool, leverage: u32 },
+    Modify {
+        oid: u64,
+        plan: Box<OrderPlan>,
+    },
+    Cancel {
+        asset: Asset,
+        oid: u64,
+    },
+    /// The kill switch: read every open order on every dex now, then cancel them.
+    CancelAll {
+        registry: Arc<AssetRegistry>,
+    },
+    Leverage {
+        asset: Asset,
+        cross: bool,
+        leverage: u32,
+    },
     ScheduleCancel(Option<u64>),
 }
 
@@ -95,7 +124,7 @@ impl HlAct {
             ),
             HlAct::Modify { oid, plan } => format!("modify #{oid} {}", plan.asset().coin),
             HlAct::Cancel { asset, oid } => format!("cancel {} #{oid}", asset.coin),
-            HlAct::CancelAll { orders, .. } => format!("cancel all ({} orders)", orders.len()),
+            HlAct::CancelAll { .. } => "cancel all".into(),
             HlAct::Leverage { asset, cross, leverage } => {
                 format!("{} leverage {leverage}× {}", asset.coin, if *cross { "cross" } else { "isolated" })
             }
@@ -144,7 +173,9 @@ pub enum HlResponse {
         account: String,
         result: Result<Option<Arc<AgentKey>>, String>,
     },
+    /// `master` is the account the approval was for.
     Approved {
+        master: String,
         agent: HlAgent,
         key: Arc<AgentKey>,
         result: Result<String, String>,
@@ -155,6 +186,11 @@ pub enum HlResponse {
         id: u64,
         label: String,
         outcome: Outcome,
+    },
+    /// `Ok(None)`: Hyperliquid has never seen this client order id.
+    OrderStatus {
+        cloid: String,
+        result: Result<Option<String>, String>,
     },
 }
 
@@ -215,7 +251,16 @@ pub async fn handle(req: HlRequest, send: impl Fn(HlResponse) + Clone + 'static)
                 Err(e) => send(HlResponse::KeyLoaded { account: String::new(), result: Err(e) }),
             }
         }
-        HlRequest::Approve { store, account, key, body, agent } => {
+        HlRequest::Approve { store, master, key, body, agent } => {
+            // The keyring may be slow or locked: never ask it from the UI thread.
+            let checked = {
+                let store = store.clone();
+                rt::blocking(move || store.check()).await.unwrap_or_else(|| Err("the key store task failed".into()))
+            };
+            if let Err(e) = checked {
+                let result = Err(format!("this device can't keep an agent key: {e}"));
+                return send(HlResponse::Approved { master, agent, key, result, saved: Ok(()) });
+            }
             let r = client.send_user_signed(&body).await;
             let result = match &r {
                 Ok(resp) if resp.ok && resp.first_error().is_none() => Ok(resp.summary()),
@@ -224,14 +269,14 @@ pub async fn handle(req: HlRequest, send: impl Fn(HlResponse) + Clone + 'static)
             };
             // Keep the key only for an agent Hyperliquid accepted.
             let saved = if result.is_ok() {
-                let k = key.clone();
+                let (k, account) = (key.clone(), crate::app::hl_store_account(&master));
                 rt::blocking(move || store.save(&account, &k.to_hex()).map_err(|e| format!("{e:#}")))
                     .await
                     .unwrap_or_else(|| Err("the key store task failed".into()))
             } else {
                 Ok(())
             };
-            send(HlResponse::Approved { agent, key, result, saved });
+            send(HlResponse::Approved { master, agent, key, result, saved });
         }
         HlRequest::Revoke { store, account, body } => {
             let deleted = rt::blocking(move || store.delete(&account).map_err(|e| format!("{e:#}")))
@@ -253,10 +298,26 @@ pub async fn handle(req: HlRequest, send: impl Fn(HlResponse) + Clone + 'static)
             };
             send(HlResponse::Revoked(result));
         }
-        HlRequest::Act { id, key, nonces, user, act } => {
-            let label = act.label();
-            let outcome = act_now(&client, &key, &nonces, &user, act).await;
+        HlRequest::Act { id, key, nonces, user, act, kill_epoch } => {
+            let mut label = act.label();
+            if matches!(act, HlAct::CancelAll { .. }) {
+                LATEST_KILL.fetch_max(kill_epoch, Ordering::SeqCst);
+            }
+            let _turn = act_lock().lock().await;
+            let placing = matches!(act, HlAct::Order(_) | HlAct::Modify { .. });
+            let outcome = if placing && LATEST_KILL.load(Ordering::SeqCst) > kill_epoch {
+                Outcome::Refused("KILL was pressed after this was confirmed, so it was not sent.".into())
+            } else {
+                act_now(&client, &key, &nonces, &user, act, &mut label).await
+            };
             send(HlResponse::Done { id, label, outcome });
+        }
+        HlRequest::OrderStatus { user, cloid } => {
+            let result = match tr_hl::key::parse_address(&user) {
+                Ok(u) => client.order_status(&u, &cloid).await.map_err(|e| format!("{e:#}")),
+                Err(e) => Err(e.to_string()),
+            };
+            send(HlResponse::OrderStatus { cloid, result });
         }
     }
 }
@@ -270,7 +331,25 @@ async fn market_now(client: &Client, user: &str, asset: &Asset) -> Result<Market
     Ok(MarketCtx { mid, leverage })
 }
 
-async fn act_now(client: &Client, key: &AgentKey, nonces: &NonceManager, user: &str, act: HlAct) -> Outcome {
+/// Every open order on the loaded dexes, read now (the kill switch never trusts a stale list).
+async fn open_orders_now(client: &Client, user: &str, reg: &AssetRegistry) -> Result<Vec<(String, u64)>, String> {
+    let u = tr_hl::key::parse_address(user).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for dex in reg.dexes() {
+        let orders = client.open_orders(&u, dex).await.map_err(|e| format!("{e:#}"))?;
+        out.extend(orders.into_iter().map(|o| (o.coin, o.oid)));
+    }
+    Ok(out)
+}
+
+async fn act_now(
+    client: &Client,
+    key: &AgentKey,
+    nonces: &NonceManager,
+    user: &str,
+    act: HlAct,
+    label: &mut String,
+) -> Outcome {
     let signed = match act {
         HlAct::Order(plan) => match market_now(client, user, plan.asset()).await {
             Ok(ctx) => trader::sign_order(key, nonces, &plan, &ctx, now_ms()).map(|s| vec![s]),
@@ -281,7 +360,7 @@ async fn act_now(client: &Client, key: &AgentKey, nonces: &NonceManager, user: &
             Err(e) => return Outcome::Refused(format!("Could not read the market before signing: {e}")),
         },
         HlAct::Cancel { asset, oid } => trader::sign_cancel(key, nonces, &asset, oid, now_ms()).map(|s| vec![s]),
-        HlAct::CancelAll { registry, orders } => trader::sign_cancel_all(key, nonces, &registry, &orders, now_ms()),
+        HlAct::CancelAll { registry } => return kill_all(client, key, nonces, user, &registry, label).await,
         HlAct::Leverage { asset, cross, leverage } => {
             trader::sign_update_leverage(key, nonces, &asset, cross, leverage, now_ms()).map(|s| vec![s])
         }
@@ -305,6 +384,60 @@ async fn act_now(client: &Client, key: &AgentKey, nonces: &NonceManager, user: &
         }
     }
     last.unwrap_or_else(|| Outcome::Refused("Nothing to send.".into()))
+}
+
+/// The kill switch: read every open order now, cancel them, and read again, up to three
+/// rounds (an order placed elsewhere meanwhile is caught too). Reports what is left.
+async fn kill_all(
+    client: &Client,
+    key: &AgentKey,
+    nonces: &NonceManager,
+    user: &str,
+    registry: &AssetRegistry,
+    label: &mut String,
+) -> Outcome {
+    let mut cancelled = 0;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut last = None;
+    for _ in 0..3 {
+        let orders = match open_orders_now(client, user, registry).await {
+            Ok(o) => o,
+            Err(e) => return Outcome::Refused(format!("Could not read the open orders: {e}")),
+        };
+        let open: Vec<(String, u64)> = orders.into_iter().filter(|(c, _)| !skipped.contains(c)).collect();
+        if open.is_empty() {
+            break;
+        }
+        let (signed, unknown) = match trader::sign_cancel_all(key, nonces, registry, &open, now_ms()) {
+            Ok(s) => s,
+            Err(e) => return Outcome::Refused(e.to_string()),
+        };
+        cancelled += open.iter().filter(|(c, _)| !unknown.contains(c)).count();
+        skipped.extend(unknown);
+        if signed.is_empty() {
+            break;
+        }
+        for s in &signed {
+            match client.send(s).await {
+                Ok(r) if r.ok && r.first_error().is_none() => last = Some(Outcome::Answered(r)),
+                Ok(r) => return Outcome::Answered(r),
+                Err(e) => return Outcome::Failed(e),
+            }
+        }
+    }
+    let left = open_orders_now(client, user, registry).await.map(|o| o.len());
+    *label = match (cancelled, &left) {
+        (0, Ok(0)) => "cancel all (no open orders)".into(),
+        (n, Ok(0)) => format!("cancel all ({n} cancelled, none left)"),
+        (n, Ok(k)) => format!("cancel all ({n} cancelled, {k} STILL OPEN: check ORD)"),
+        (n, Err(_)) => format!("cancel all ({n} cancelled; couldn't read what's left)"),
+    };
+    if !skipped.is_empty() {
+        *label += &format!("; not cancelled, unknown market: {}", skipped.join(", "));
+    }
+    last.unwrap_or_else(|| {
+        Outcome::Answered(ExchangeResponse { ok: true, kind: Some("cancel".into()), statuses: Vec::new(), error: None })
+    })
 }
 
 /// The user stream: subscribe, ping, and hand the UI a fresh [`UserState`] at most four

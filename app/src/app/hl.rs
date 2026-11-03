@@ -101,6 +101,24 @@ impl HlKind {
     }
 }
 
+/// An order whose send got no clear answer: it may have reached Hyperliquid. Nothing else is
+/// sent until `orderStatus` finds it, or its `expiresAfter` window passes without it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Uncertain {
+    pub cloid: String,
+    pub coin: String,
+    /// When it was sent (ms).
+    pub sent: u64,
+    asked: Option<Instant>,
+}
+
+impl Uncertain {
+    /// Hyperliquid hasn't seen it and can no longer accept it.
+    pub fn expired(&self, now: u64) -> bool {
+        now > self.sent + trader::EXPIRES_AFTER_MS + 5_000
+    }
+}
+
 /// An action waiting for its confirmation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HlConfirm {
@@ -164,6 +182,13 @@ pub struct HlState {
     pub confirm: Option<HlConfirm>,
     /// Ticket feedback for Hyperliquid accounts: the last refusal, result and pending action.
     pub sending: Option<u64>,
+    /// The order in flight: `(request id, cloid, coin, sent ms)`.
+    inflight: Option<(u64, String, String, u64)>,
+    pub uncertain: Option<Uncertain>,
+    /// Kill switches pressed; every signed action carries the count when it was confirmed.
+    kill_epoch: u64,
+    /// The account an approval in flight is for. A late answer for any other is ignored.
+    pending_approval: Option<String>,
     next_id: u64,
     deadman_at: Option<Instant>,
     deadman_armed: bool,
@@ -207,6 +232,10 @@ impl HlState {
             message: None,
             confirm: None,
             sending: None,
+            inflight: None,
+            uncertain: None,
+            kill_epoch: 0,
+            pending_approval: None,
             next_id: 0,
             deadman_at: None,
             deadman_armed: false,
@@ -262,7 +291,9 @@ pub fn rows(master: &str, user: &UserState) -> Portfolio {
         institution: "Hyperliquid".into(),
         currency: "USD".into(),
         total: Some(user.account_value()),
-        cash: Some(user.withdrawable()),
+        // Collateral: equity less unrealised P&L, so repricing the perps (valued by their P&L in
+        // `Portfolio::totals`) moves equity only by how much their P&L moves.
+        cash: Some(user.account_value() - user.positions().map(|p| p.unrealized_pnl).sum::<f64>()),
         buying_power: Some(user.withdrawable()),
         kind: "Perps · TESTNET".into(),
         status: "testnet".into(),
@@ -497,6 +528,12 @@ impl TerminalApp {
         if !h.enabled {
             return Some("Hyperliquid orders are off. Enable them in Settings › Trading › Hyperliquid.".into());
         }
+        if let Some(u) = &self.hl.uncertain {
+            return Some(format!(
+                "The last {} order got no clear answer; checking whether it reached Hyperliquid (client id {}) before sending anything else.",
+                u.coin, u.cloid
+            ));
+        }
         None
     }
 
@@ -542,6 +579,7 @@ impl TerminalApp {
         self.prefs.trading.hl.master = Some(addr.clone());
         self.save_hl_prefs();
         self.hl.key_tried = None;
+        self.hl.pending_approval = None;
         self.hl.message = Some((
             format!(
                 "Showing Hyperliquid testnet account {} (read-only).",
@@ -554,6 +592,8 @@ impl TerminalApp {
 
     /// Stop showing the account. The agent key stays in the store unless revoked.
     pub(super) fn hl_disconnect(&mut self) {
+        self.hl.pending_approval = None;
+        self.hl.uncertain = None;
         self.prefs.trading.hl.master = None;
         self.prefs.trading.hl.enabled = false;
         self.save_hl_prefs();
@@ -602,9 +642,6 @@ impl TerminalApp {
         action: &tr_hl::actions::ApproveAgentAction,
         body: serde_json::Value,
     ) {
-        if let Err(e) = self.hl.store.check() {
-            return self.hl.message = Some((format!("Can't keep an agent key on this device: {e}"), true));
-        }
         if self.hl_master().as_deref() != Some(&master) {
             self.prefs.trading.hl.master = Some(master.clone());
             self.prefs.trading.hl.enabled = false;
@@ -618,9 +655,10 @@ impl TerminalApp {
         };
         self.hl.busy = Some("Approving the agent on Hyperliquid testnet…");
         self.hl.message = None;
+        self.hl.pending_approval = Some(master.clone());
         self.hl_send(HlRequest::Approve {
             store: self.hl.store.clone(),
-            account: store_account(&master),
+            master,
             key: Arc::new(agent),
             body,
             agent: meta,
@@ -695,6 +733,20 @@ impl TerminalApp {
         self.hl_sync_portfolio();
         self.hl_ticket_market();
         self.hl_deadman();
+        self.hl_resolve_uncertain();
+    }
+
+    /// Ask Hyperliquid about an uncertain order every few seconds until it is found, or its
+    /// `expiresAfter` window has passed without it.
+    fn hl_resolve_uncertain(&mut self) {
+        let Some(master) = self.hl_master() else { return };
+        let Some(u) = self.hl.uncertain.as_mut() else { return };
+        if u.asked.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        u.asked = Some(Instant::now());
+        let cloid = u.cloid.clone();
+        self.hl_send(HlRequest::OrderStatus { user: master, cloid });
     }
 
     /// Put the Hyperliquid rows into the live portfolio (after a stream update, or after a
@@ -752,13 +804,23 @@ impl TerminalApp {
         let (Some(key), Some(master)) = (self.hl.key.clone(), self.hl_master()) else {
             return self.trade_toast("Hyperliquid: no agent key on this device", false);
         };
+        // An agent key that isn't this account's approved agent never signs.
+        if self.prefs.trading.hl.agent.as_ref().map(|a| a.address.as_str())
+            != Some(tr_hl::key::address_hex(&key.address()).as_str())
+        {
+            return self.trade_toast("Hyperliquid: the agent key here isn't this account's approved agent", false);
+        }
         self.hl.next_id += 1;
         let id = self.hl.next_id;
         if !matches!(act, HlAct::ScheduleCancel(_)) {
             self.hl.sending = Some(id);
             self.status = format!("Hyperliquid TESTNET: signing {}…", act.label());
         }
-        self.hl_send(HlRequest::Act { id, key, nonces: self.hl.nonces.clone(), user: master, act });
+        if let HlAct::Order(p) | HlAct::Modify { plan: p, .. } = &act {
+            self.hl.inflight = Some((id, p.cloid().to_string(), p.asset().coin.clone(), now_ms()));
+        }
+        let kill_epoch = self.hl.kill_epoch;
+        self.hl_send(HlRequest::Act { id, key, nonces: self.hl.nonces.clone(), user: master, act, kill_epoch });
     }
 
     // ---- confirmations ------------------------------------------------------------------
@@ -874,15 +936,20 @@ impl TerminalApp {
                 // Trading goes off first, whatever happens to the cancels.
                 self.prefs.trading.hl.enabled = false;
                 self.save_hl_prefs();
-                if orders.is_empty() {
-                    self.trade_toast("KILL: no open Hyperliquid orders; Hyperliquid trading is off", true);
-                } else if let (Some(reg), true) = (reg, self.hl.key.is_some()) {
-                    self.hl_act(HlAct::CancelAll { registry: reg, orders });
-                } else {
-                    self.trade_toast(
+                // The worker reads the open orders again before cancelling, so a stream that
+                // hasn't caught up never makes KILL skip an order.
+                match (reg, self.hl.key.is_some()) {
+                    (Some(reg), true) => {
+                        // Orders confirmed before this, not yet signed, are refused in the worker.
+                        self.hl.kill_epoch += 1;
+                        self.hl_act(HlAct::CancelAll { registry: reg });
+                    }
+                    _ if orders.is_empty() => self
+                        .trade_toast("KILL: Hyperliquid trading is off (no agent key here, no open orders seen)", true),
+                    _ => self.trade_toast(
                         "KILL: Hyperliquid trading is off, but there's no agent key here to cancel with",
                         false,
-                    );
+                    ),
                 }
             }
             HlConfirm::Leverage { coin, leverage, cross, .. } => match reg.as_ref().and_then(|r| r.get(&coin)) {
@@ -938,8 +1005,20 @@ impl TerminalApp {
                 #[cfg(target_arch = "wasm32")]
                 self.hl_web_restore_key();
             }
-            HlResponse::Approved { agent, key, result, saved } => {
+            HlResponse::Approved { master, agent, key, result, saved } => {
                 self.hl.busy = None;
+                // Only the account that asked, and only while it is still the one shown.
+                let current = self.hl.pending_approval.take();
+                if current.as_deref() != Some(master.as_str()) || self.hl_master().as_deref() != Some(master.as_str()) {
+                    self.hl.message = Some((
+                        format!(
+                            "An approval for {} finished after the account changed; it was not applied here.",
+                            tr_hl::mask_addresses(&master)
+                        ),
+                        true,
+                    ));
+                    return;
+                }
                 match result {
                     Ok(summary) => {
                         self.prefs.trading.hl.agent = Some(agent.clone());
@@ -973,6 +1052,33 @@ impl TerminalApp {
                 self.hl_check_roles();
             }
             HlResponse::Done { id, label, outcome } => self.on_hl_done(id, label, outcome),
+            HlResponse::OrderStatus { cloid, result } => {
+                let Some(u) = self.hl.uncertain.clone().filter(|u| u.cloid == cloid) else { return };
+                match result {
+                    Ok(Some(status)) => {
+                        self.hl.uncertain = None;
+                        self.trade_toast(
+                            format!(
+                                "Hyperliquid TESTNET: the {} order did reach Hyperliquid ({status}); see ORD",
+                                u.coin
+                            ),
+                            true,
+                        );
+                    }
+                    Ok(None) if u.expired(now_ms()) => {
+                        self.hl.uncertain = None;
+                        self.trade_toast(
+                            format!(
+                                "Hyperliquid TESTNET: the {} order never reached Hyperliquid; it can be sent again",
+                                u.coin
+                            ),
+                            true,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::debug!("hyperliquid order status: {e}"),
+                }
+            }
         }
     }
 
@@ -986,6 +1092,13 @@ impl TerminalApp {
         let mine = self.hl.sending == Some(id);
         if mine {
             self.hl.sending = None;
+        }
+        if let Some((inflight, cloid, coin, sent)) = self.hl.inflight.take_if(|f| f.0 == id) {
+            let _ = inflight;
+            // No clear answer: the order may exist. Find it before anything else is sent.
+            if matches!(&outcome, Outcome::Failed(tr_hl::client::SendError::Uncertain(_))) {
+                self.hl.uncertain = Some(Uncertain { cloid, coin, sent, asked: None });
+            }
         }
         if label.starts_with("dead man") {
             if let Outcome::Answered(r) = &outcome
@@ -1066,6 +1179,12 @@ mod tests {
         let a = &pf.accounts[0];
         assert_eq!(a.id, account_id(MASTER));
         assert!(a.is_paper && a.kind.contains("TESTNET") && a.masked_number().ends_with("107e"));
+        let upnl: f64 = recorded().positions().map(|p| p.unrealized_pnl).sum();
+        assert!((a.cash.unwrap() + upnl - a.total.unwrap()).abs() < 1e-9, "cash is equity less unrealised P&L");
+        // Repriced at each position's own mark, the account is worth what Hyperliquid reports
+        // (within a cent: Hyperliquid rounds the entry price to five significant figures).
+        let at_mark = pf.totals(None, |p| p.price);
+        assert!((at_mark.value - a.total.unwrap()).abs() < 0.01, "{} vs {:?}", at_mark.value, a.total);
         assert_eq!(pf.positions.len(), 3);
         let tsla = pf.positions.iter().find(|p| p.symbol == "xyz:TSLA").unwrap();
         assert_eq!(tsla.kind, InstrumentKind::Future, "a perp, never a stock");
@@ -1112,6 +1231,13 @@ mod tests {
         assert!(matches!(i.kind, OrderKind::Trigger { trigger_px: 300.0, .. }));
         t.hl.kind = HlKind::Limit;
         assert!(intent(&t, &reg).unwrap_err().contains("limit price"));
+    }
+
+    #[test]
+    fn an_uncertain_order_blocks_until_its_window_passes() {
+        let u = Uncertain { cloid: tr_hl::actions::cloid(1), coin: "BTC".into(), sent: 1_000_000, asked: None };
+        assert!(!u.expired(1_000_000 + trader::EXPIRES_AFTER_MS), "it could still land");
+        assert!(u.expired(1_000_000 + trader::EXPIRES_AFTER_MS + 5_001), "now it never can");
     }
 
     #[test]

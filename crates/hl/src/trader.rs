@@ -205,6 +205,13 @@ pub fn plan_order(
             Err(Refusal::Invalid(format!("The {what} price must be greater than zero.")))
         }
     };
+    let small = |what: &str| {
+        Refusal::Invalid(format!(
+            "The {what} price is too small for {} (it rounds to zero at {} decimals).",
+            asset.coin,
+            crate::rounding::price_decimals(0.0, asset.sz_decimals)
+        ))
+    };
     let (price, trigger, t) = match intent.kind {
         OrderKind::Limit { px, tif } => {
             (round_price(positive(px, "limit")?, asset.sz_decimals, Round::Nearest), None, OrderTypeWire::limit(tif))
@@ -215,9 +222,15 @@ pub fn plan_order(
         }
         OrderKind::Trigger { trigger_px, tpsl } => {
             let trig = round_price(positive(trigger_px, "trigger")?, asset.sz_decimals, Round::Nearest);
+            if trig <= 0.0 {
+                return Err(small("trigger"));
+            }
             (through(trig), Some(trig), OrderTypeWire::trigger(true, wire(trig)?, tpsl))
         }
     };
+    if price <= 0.0 {
+        return Err(small("limit"));
+    }
     let order = OrderWire {
         a: asset.id,
         b: intent.is_buy,
@@ -236,21 +249,24 @@ fn wire(x: f64) -> Result<String, Refusal> {
     to_wire(x).map_err(|e| Refusal::Invalid(e.to_string()))
 }
 
-/// The caps, against the market in `ctx`. Returns the notional.
+/// The caps, against the market in `ctx`. Returns the notional. Every order needs a current
+/// mid: a limit through the market fills at the market, so its limit alone can't value it.
 fn check(plan: &OrderPlan, ctx: &MarketCtx) -> Result<f64, Refusal> {
-    let mid = ctx.mid.filter(|m| m.is_finite() && *m > 0.0);
+    let mid = ctx
+        .mid
+        .filter(|m| m.is_finite() && *m > 0.0)
+        .ok_or_else(|| Refusal::NoMid { coin: plan.asset.coin.clone() })?;
     // Reducing a position is never blocked by its leverage; anything else needs 3× or less.
     if !plan.intent.reduce_only {
         let lev = ctx.leverage.ok_or_else(|| Refusal::LeverageUnknown { coin: plan.asset.coin.clone() })?;
         caps::check_leverage(lev.value)?;
     }
-    // A limit through the market fills at the market, so value at the higher of the two.
-    let reference = [Some(plan.price), plan.trigger, mid].into_iter().flatten().fold(0.0, f64::max);
+    // Value at the highest of the order's price, its trigger and the mid.
+    let reference = [Some(plan.price), plan.trigger, Some(mid)].into_iter().flatten().fold(0.0, f64::max);
     let notional = plan.size * reference;
     caps::check_notional(notional)?;
     if plan.intent.kind == OrderKind::Market {
-        let m = mid.ok_or_else(|| Refusal::NoMid { coin: plan.asset.coin.clone() })?;
-        caps::check_slippage((plan.price / m - 1.0).abs())?;
+        caps::check_slippage((plan.price / mid - 1.0).abs())?;
     }
     Ok(notional)
 }
@@ -321,28 +337,28 @@ pub fn sign_cancel_by_cloid(
 }
 
 /// The kill switch: cancel every order in `orders` (`(coin, oid)`), one action per dex.
+/// A coin the registry doesn't know (listed after it loaded) is skipped and returned, so one
+/// stale entry never stops the other cancels.
 pub fn sign_cancel_all(
     key: &impl SigningKey,
     nonces: &NonceManager,
     reg: &AssetRegistry,
     orders: &[(String, u64)],
     now: u64,
-) -> Result<Vec<Signed>, Refusal> {
+) -> Result<(Vec<Signed>, Vec<String>), Refusal> {
+    // Delisted markets stay in the registry, so their orders still cancel.
+    let skipped: Vec<String> = orders.iter().filter(|(c, _)| reg.get(c).is_none()).map(|(c, _)| c.clone()).collect();
     let mut out = Vec::new();
     for dex in reg.dexes() {
-        let mut cancels = Vec::new();
-        for (coin, oid) in orders {
-            // Delisted markets stay in the registry, so their orders still cancel.
-            let asset = reg.get(coin).ok_or_else(|| Refusal::Invalid(format!("{coin} is not a known market")))?;
-            if asset.dex == dex {
-                cancels.push(CancelWire { a: asset.id, o: *oid });
-            }
-        }
+        let cancels: Vec<CancelWire> = orders
+            .iter()
+            .filter_map(|(coin, oid)| reg.get(coin).filter(|a| a.dex == dex).map(|a| CancelWire { a: a.id, o: *oid }))
+            .collect();
         if !cancels.is_empty() {
             out.push(signed("cancel", key, nonces, &CancelAction::new(cancels), now)?);
         }
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 /// Set leverage on one market: 1× to 3× (and no more than the market allows).
@@ -601,17 +617,29 @@ mod tests {
         let c2 = sign_cancel_by_cloid(&k, &n, aapl, CLOID, NOW).unwrap();
         assert_eq!(c2.body()["action"]["cancels"][0]["cloid"], CLOID);
         assert!(c2.nonce > c.nonce, "nonces increase");
-        let all = sign_cancel_all(
+        let (all, skipped) = sign_cancel_all(
             &k,
             &n,
             &reg,
-            &[("BTC".into(), 1), ("xyz:AAPL".into(), 2), ("ETH".into(), 3), ("xyz:TSLA".into(), 4)],
+            &[
+                ("BTC".into(), 1),
+                ("xyz:AAPL".into(), 2),
+                ("ETH".into(), 3),
+                ("xyz:NEWLY".into(), 9),
+                ("xyz:TSLA".into(), 4),
+            ],
             NOW,
         )
         .unwrap();
         assert_eq!(all.len(), 2, "one cancel per dex");
         assert_eq!(all[0].body()["action"]["cancels"].as_array().unwrap().len(), 2);
-        assert!(sign_cancel_all(&k, &n, &reg, &[], NOW).unwrap().is_empty());
+        assert_eq!(
+            all[1].body()["action"]["cancels"].as_array().unwrap().len(),
+            2,
+            "the unknown coin doesn't stop the rest"
+        );
+        assert_eq!(skipped, ["xyz:NEWLY"]);
+        assert!(sign_cancel_all(&k, &n, &reg, &[], NOW).unwrap().0.is_empty());
         assert!(sign_schedule_cancel(&k, &n, Some(NOW + 1_000), NOW).is_err(), "at least 5 s ahead");
         let sc = sign_schedule_cancel(&k, &n, Some(NOW + 60_000), NOW).unwrap();
         assert_eq!(sc.body()["action"], json!({"type": "scheduleCancel", "time": NOW + 60_000}));
@@ -623,6 +651,32 @@ mod tests {
         assert_eq!(noop.body()["action"], json!({"type": "noop"}));
         assert_eq!(noop.body()["expiresAfter"], NOW + EXPIRES_AFTER_MS);
         assert_eq!(noop.body()["vaultAddress"], Value::Null);
+    }
+
+    /// Greptile #37: without a mid, a sell limit below the market was valued at its limit.
+    #[test]
+    fn orders_need_a_current_mid_to_be_valued() {
+        let reg = registry();
+        let no_mid = MarketCtx { mid: None, leverage: lev(3) };
+        let sell = limit("xyz:AAPL", false, 0.32, 300.0);
+        assert!(matches!(plan_order(&reg, &sell, &no_mid, CLOID).unwrap_err(), Refusal::NoMid { .. }));
+        let plan = plan_order(&reg, &limit("xyz:AAPL", true, 0.1, 250.0), &ctx(322.15), CLOID).unwrap();
+        let e = sign_order(&AgentKey::generate(), &NonceManager::new(), &plan, &no_mid, NOW).unwrap_err();
+        assert!(matches!(e, Refusal::NoMid { .. }), "checked again at signing: {e}");
+    }
+
+    /// Greptile #37: a price that rounds to zero was signed as "p":"0" (and panicked in debug).
+    #[test]
+    fn prices_that_round_to_zero_are_refused() {
+        let reg = registry();
+        let e = plan_order(&reg, &limit("BTC", true, 0.001, 0.00000001), &ctx(76_662.5), CLOID).unwrap_err();
+        assert!(e.to_string().contains("too small"), "{e}");
+        let stop = OrderIntent {
+            kind: OrderKind::Trigger { trigger_px: 0.00000001, tpsl: Tpsl::Sl },
+            reduce_only: true,
+            ..limit("BTC", false, 0.001, 0.0)
+        };
+        assert!(plan_order(&reg, &stop, &ctx(76_662.5), CLOID).unwrap_err().to_string().contains("too small"));
     }
 
     #[test]
