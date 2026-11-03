@@ -11,7 +11,7 @@ use tr_hl::rounding::to_wire;
 use tr_hl::trader::{EXPIRES_AFTER_MS, OrderKind};
 
 use super::TerminalApp;
-use super::hl::{HlConfirm, HlKind, intent, is_hl_account, resolve_coin};
+use super::hl::{HlConfirm, HlKind, intent, is_hl_account, resolve_coin, settle_size};
 use super::portfolio_view::{money, price, qty};
 use super::settings_view::SettingsCmd;
 use super::trading::TicketAct;
@@ -129,6 +129,11 @@ impl TerminalApp {
             );
             if r.changed() {
                 t.error = None;
+                // If the size came from dollars, size the amount again for the new market.
+                if let Some(d) = t.hl.from_dollars.take() {
+                    t.dollars = true;
+                    t.qty = to_wire(d).unwrap_or_default();
+                }
             }
             match ctx.mid {
                 Some(m) => {
@@ -157,23 +162,38 @@ impl TerminalApp {
             }
             _ => {}
         }
+        let mut unsized_note = None;
         ui.horizontal(|ui| {
-            label(ui, "Size");
+            label(ui, if t.dollars { "Amount" } else { "Size" });
             let r = ui.add_enabled(
                 !sending,
-                egui::TextEdit::singleline(&mut t.qty).hint_text("units").font(mono(13.0)).desired_width(dp(84.0)),
+                egui::TextEdit::singleline(&mut t.qty)
+                    .hint_text(if t.dollars { "$" } else { "units" })
+                    .font(mono(13.0))
+                    .desired_width(dp(84.0)),
             );
+            if r.changed() {
+                t.hl.from_dollars = None;
+            }
             if t.focus_qty > 0 {
                 t.focus_qty -= 1;
                 if !r.has_focus() {
                     r.request_focus();
                 }
             }
-            t.dollars = false;
-            if let (Some(m), Ok(q)) = (ctx.mid, t.qty.trim().parse::<f64>()) {
-                ui.label(RichText::new(format!("≈ {}", money(q * m, "USD"))).font(mono(11.5)).color(muted()));
+            // `BUY xyz:AAPL $50` gets its size from the testnet mid. It is never 50 contracts.
+            unsized_note = settle_size(t, ctx.mid, asset.as_ref());
+            if let (false, Some(m), Ok(q)) = (t.dollars, ctx.mid, t.qty.trim().parse::<f64>()) {
+                let from = t.hl.from_dollars.map_or(String::new(), |d| format!(" (from ${d}, at the testnet mid)"));
+                ui.label(RichText::new(format!("≈ {}{from}", money(q * m, "USD"))).font(mono(11.5)).color(muted()));
             }
         });
+        if let Some(n) = unsized_note {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(dp(70.0));
+                ui.label(RichText::new(n).font(ui_font(11.5)).color(amber()));
+            });
+        }
         ui.horizontal(|ui| {
             label(ui, "Type");
             let labels: Vec<&str> = HlKind::ALL.iter().map(|k| k.label()).collect();

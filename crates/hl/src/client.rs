@@ -153,11 +153,15 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+/// The longest any one request may take, on the desktop and in the browser.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     info_url: String,
     exchange_url: String,
+    timeout: std::time::Duration,
 }
 
 impl Client {
@@ -174,15 +178,20 @@ impl Client {
     fn with_urls(info_url: String, exchange_url: String) -> Result<Self> {
         let b = reqwest::Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
-        let b =
-            b.timeout(std::time::Duration::from_secs(15)).user_agent(concat!("terminal/", env!("CARGO_PKG_VERSION")));
-        Ok(Self { http: b.build()?, info_url, exchange_url })
+        let b = b.user_agent(concat!("terminal/", env!("CARGO_PKG_VERSION")));
+        Ok(Self { http: b.build()?, info_url, exchange_url, timeout: REQUEST_TIMEOUT })
+    }
+
+    /// Every request has its own deadline. The browser's `fetch` has no client-wide timeout,
+    /// so a request that never got an answer would otherwise wait forever.
+    fn post(&self, url: &str) -> reqwest::RequestBuilder {
+        self.http.post(url).timeout(self.timeout)
     }
 
     /// Any `/info` query.
     pub async fn info(&self, body: Value) -> Result<Value> {
         let kind = body["type"].as_str().unwrap_or("?").to_string();
-        let r = self.http.post(&self.info_url).json(&body).send().await.with_context(|| format!("info {kind}"))?;
+        let r = self.post(&self.info_url).json(&body).send().await.with_context(|| format!("info {kind}"))?;
         let status = r.status();
         let text = r.text().await.with_context(|| format!("info {kind}"))?;
         if !status.is_success() {
@@ -270,7 +279,7 @@ impl Client {
     }
 
     async fn post_exchange(&self, body: &Value) -> Result<ExchangeResponse, SendError> {
-        let r = self.http.post(&self.exchange_url).json(body).send().await.map_err(classify)?;
+        let r = self.post(&self.exchange_url).json(body).send().await.map_err(classify)?;
         let status = r.status().as_u16();
         let text = r.text().await.map_err(|e| SendError::Uncertain(e.to_string()))?;
         if (400..500).contains(&status) {
@@ -298,6 +307,39 @@ fn classify(e: reqwest::Error) -> SendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Greptile #37 (f636b7c): the browser's `fetch` has no client-wide timeout, so a request
+    /// that never got an answer held the worker's turn and KILL waited behind it. Each request
+    /// now carries its own deadline, which reqwest honours on both targets.
+    #[test]
+    fn every_request_carries_its_own_deadline() {
+        let c = Client::new().unwrap();
+        for url in [&c.info_url, &c.exchange_url] {
+            let req = c.post(url).build().unwrap();
+            assert_eq!(req.timeout(), Some(&REQUEST_TIMEOUT), "{url}");
+        }
+    }
+
+    /// Against a server that takes the request and never answers, the send ends at the deadline
+    /// as uncertain, since it may have arrived, and a read ends with an error.
+    #[tokio::test]
+    async fn a_request_that_gets_no_answer_ends_at_its_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // read nothing, answer nothing
+            }
+        });
+        let c = Client { timeout: std::time::Duration::from_millis(300), ..Client::mock(&base).unwrap() };
+        let t0 = std::time::Instant::now();
+        let sent = c.post_exchange(&json!({"action": {"type": "noop"}})).await;
+        assert!(matches!(sent, Err(SendError::Uncertain(_))), "{sent:?}");
+        assert!(c.user_role(&Address::ZERO).await.is_err());
+        let took = t0.elapsed();
+        assert!(took >= std::time::Duration::from_millis(600) && took < std::time::Duration::from_secs(3), "{took:?}");
+    }
 
     #[test]
     fn responses_parse() {

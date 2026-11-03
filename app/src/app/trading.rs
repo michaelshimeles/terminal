@@ -130,6 +130,9 @@ impl Ticket {
         if let Some(k) = &args.symbol {
             self.symbol = broker_symbol(k);
         }
+        if args.symbol.is_some() || args.units.is_some() || args.notional.is_some() {
+            self.hl.from_dollars = None;
+        }
         if let Some(u) = args.units {
             self.dollars = false;
             self.qty = fmt_input(u);

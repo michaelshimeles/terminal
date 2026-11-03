@@ -24,7 +24,7 @@ use std::time::Duration;
 use tr_broker::secrets::AgentKeyStore;
 use tr_broker::{Account, Activity, InstrumentKind, Order, Portfolio, Position};
 use tr_hl::actions::Tif;
-use tr_hl::assets::{AssetRegistry, app_key};
+use tr_hl::assets::{Asset, AssetRegistry, app_key};
 use tr_hl::model::AssetData;
 use tr_hl::nonce::{NonceManager, now_ms};
 use tr_hl::stream::UserState;
@@ -72,11 +72,13 @@ pub struct HlTicket {
     pub tif: Tif,
     pub reduce_only: bool,
     pub trigger: String,
+    /// The dollar amount the size came from, as in `BUY xyz:AAPL $50`. Editing the size clears it.
+    pub from_dollars: Option<f64>,
 }
 
 impl Default for HlTicket {
     fn default() -> Self {
-        Self { kind: HlKind::Limit, tif: Tif::Gtc, reduce_only: false, trigger: String::new() }
+        Self { kind: HlKind::Limit, tif: Tif::Gtc, reduce_only: false, trigger: String::new(), from_dollars: None }
     }
 }
 
@@ -447,9 +449,48 @@ fn parse_num(s: &str) -> Option<f64> {
     s.trim().trim_start_matches('$').replace(',', "").parse::<f64>().ok()
 }
 
+/// A dollar amount on a Hyperliquid ticket, as in `BUY xyz:AAPL $50`, becomes a size at the
+/// testnet mid, rounded down to the market's size step so the order is never worth more than
+/// the amount. Until there is a mid, or when the amount is under one step, it stays a dollar
+/// amount, which [`intent`] refuses. Returns why it isn't a size yet.
+pub fn settle_size(t: &mut super::trading::Ticket, mid: Option<f64>, asset: Option<&Asset>) -> Option<String> {
+    if !t.dollars {
+        return None;
+    }
+    let amount = parse_num(&t.qty).filter(|a| a.is_finite() && *a > 0.0)?;
+    let dollars = tr_hl::rounding::to_wire(amount).unwrap_or_else(|_| format!("{amount:.2}"));
+    let (Some(a), Some(mid)) = (asset, mid.filter(|m| m.is_finite() && *m > 0.0)) else {
+        return Some(format!("Waiting for the testnet mid to size ${dollars}…"));
+    };
+    let units = tr_hl::rounding::round_size(amount / mid, a.sz_decimals);
+    let Some(size) = tr_hl::rounding::to_wire(units).ok().filter(|_| units > 0.0) else {
+        let step = 10f64.powi(-(a.sz_decimals as i32));
+        return Some(format!(
+            "${dollars} is less than the smallest {} size, {}, which is about ${:.2} at the testnet mid.",
+            a.coin,
+            tr_hl::rounding::to_wire(step).unwrap_or_default(),
+            step * mid
+        ));
+    };
+    t.qty = size;
+    t.dollars = false;
+    t.hl.from_dollars = Some(amount);
+    None
+}
+
 /// The order a Hyperliquid ticket describes.
 pub fn intent(t: &super::trading::Ticket, reg: &AssetRegistry) -> Result<OrderIntent, String> {
     let coin = resolve_coin(&t.symbol, reg)?;
+    // Never read a dollar figure as a number of coins or contracts.
+    if t.dollars {
+        return Err(match parse_num(&t.qty) {
+            Some(a) => format!(
+                "${} is a dollar amount, not a size. The ticket sizes it at the testnet mid first.",
+                tr_hl::rounding::to_wire(a).unwrap_or_else(|_| t.qty.trim().to_string())
+            ),
+            None => "Enter an amount in dollars.".into(),
+        });
+    }
     let size =
         parse_num(&t.qty).filter(|s| s.is_finite() && *s > 0.0).ok_or("Enter a size (in coins or contracts).")?;
     let price = |s: &str, what: &str| parse_num(s).filter(|p| *p > 0.0).ok_or(format!("Enter a {what} price."));
@@ -1263,6 +1304,57 @@ mod tests {
         assert!(matches!(i.kind, OrderKind::Trigger { trigger_px: 300.0, .. }));
         t.hl.kind = HlKind::Limit;
         assert!(intent(&t, &reg).unwrap_err().contains("limit price"));
+    }
+
+    /// Greptile #37 (f636b7c): `BUY xyz:INTC $10` put 10 in the size, and the Hyperliquid
+    /// ticket read it as 10 contracts. At a $2 mid that is $20, which the $100 cap lets through.
+    #[test]
+    fn a_dollar_amount_becomes_units_at_the_testnet_mid() {
+        use super::super::trading::Ticket;
+        let reg = registry();
+        let intc = reg.get("xyz:INTC").unwrap().clone();
+        let dollars = |coin: &str, amount: f64| {
+            let mut t = Ticket::new(1);
+            t.apply(&crate::command::TradeArgs {
+                buy: Some(true),
+                symbol: Some(coin.into()),
+                notional: Some(amount),
+                ..Default::default()
+            });
+            t
+        };
+        // With no testnet mid yet, the amount stays in dollars and intent() refuses it.
+        let mut t = dollars("xyz:INTC", 10.0);
+        let note = settle_size(&mut t, None, Some(&intc));
+        let e = intent(&t, &reg).expect_err("$10 is never read as 10 contracts");
+        assert!(e.contains("$10") && e.contains("dollar"), "{e}");
+        assert!(t.dollars);
+        assert_eq!(note.as_deref(), Some("Waiting for the testnet mid to size $10…"));
+        // At a $2 mid, $10 is 5 contracts.
+        assert_eq!(settle_size(&mut t, Some(2.0), Some(&intc)), None);
+        assert!(!t.dollars);
+        assert_eq!((t.qty.as_str(), t.hl.from_dollars), ("5", Some(10.0)));
+        assert_eq!(intent(&t, &reg).unwrap().size, 5.0);
+        // Rounded down to the size step (2 decimals), so it is never worth more than $10.
+        let mut t = dollars("xyz:INTC", 10.0);
+        settle_size(&mut t, Some(3.0), Some(&intc));
+        assert_eq!(intent(&t, &reg).unwrap().size, 3.33);
+        // BTC has five size decimals, so $10 at $76,000 is 0.00013 BTC.
+        let btc = reg.get("BTC").unwrap().clone();
+        let mut t = dollars("BTC", 10.0);
+        settle_size(&mut t, Some(76_000.0), Some(&btc));
+        assert_eq!(intent(&t, &reg).unwrap().size, 0.00013);
+        // An amount under one step stays in dollars. It never rounds to zero or turns into units.
+        let mut t = dollars("BTC", 0.5);
+        let why = settle_size(&mut t, Some(76_000.0), Some(&btc)).expect("too small");
+        assert!(why.contains("smallest BTC size") && t.dollars, "{why}");
+        assert!(intent(&t, &reg).is_err());
+        // A size typed in units is left alone.
+        let mut t = Ticket::new(2);
+        t.symbol = "BTC".into();
+        t.qty = "0.001".into();
+        assert_eq!(settle_size(&mut t, Some(76_000.0), Some(&btc)), None);
+        assert_eq!((t.qty.as_str(), t.hl.from_dollars), ("0.001", None));
     }
 
     #[test]
