@@ -7,6 +7,11 @@
 mod broker;
 mod chrome;
 mod demo;
+mod hl;
+pub(crate) use hl::store_account as hl_store_account;
+mod hl_view;
+#[cfg(target_arch = "wasm32")]
+mod hl_web;
 mod hotkeys_view;
 mod options_view;
 mod palette_view;
@@ -553,6 +558,8 @@ pub struct TerminalApp {
     trading: trading::TradingState,
     /// The paper-trading demo account (selected by default).
     demo: demo::DemoState,
+    /// Hyperliquid (testnet): the account, the agent key and its confirmations.
+    hl: hl::HlState,
     /// ⌘K command palette.
     palette: crate::palette::Palette,
 }
@@ -628,6 +635,7 @@ impl TerminalApp {
             broker,
             trading: Default::default(),
             demo,
+            hl: hl::HlState::platform(),
             worker,
             provider,
             panes: Vec::new(),
@@ -727,6 +735,11 @@ impl TerminalApp {
             app.save_layout();
         }
         app.refresh_layout_names();
+        #[cfg(target_arch = "wasm32")]
+        {
+            app.hl.ctx = Some(ctx.clone());
+        }
+        app.hl_start();
         app.worker.send(Request::Latest { limit: 2_000 });
         app.worker.send(Request::SearchPoliticians(String::new()));
         app.worker.send(Request::Alerts);
@@ -987,6 +1000,7 @@ impl TerminalApp {
                 }
                 self.set_account_mode(mode, false);
             }
+            Function::Kill => self.hl_kill(),
             Function::Perp => {
                 let key = symbol.or_else(|| self.focused_symbol());
                 self.open_perp(key);
@@ -1166,6 +1180,7 @@ impl TerminalApp {
                     }
                 }
                 Response::Trade(r) => self.on_trade(*r),
+                Response::Hl(r) => self.on_hl(*r),
                 Response::CongressRefreshed(summary) => {
                     self.congress_status = summary.to_string();
                     self.congress_checked = Some(chrono::Local::now());
@@ -1487,6 +1502,7 @@ impl TerminalApp {
                 _ => {}
             }
         }
+        self.hl_periodic();
         self.broker_periodic(&visible);
         if let Some((q, at)) = &self.search_pending
             && at.elapsed() > Duration::from_millis(300)

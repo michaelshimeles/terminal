@@ -46,6 +46,7 @@ fn position(
         currency: "USD".into(),
         cash_equivalent: false,
         underlying: None,
+        market: None,
     }
 }
 
@@ -120,6 +121,7 @@ pub fn portfolio() -> Portfolio {
         placed: Some(at(days, 14)),
         updated: Some(at(days, 15)),
         underlying: None,
+        market: None,
     };
     let orders = vec![
         order("sim-brokerage", "sim-o-1", "NVDA", K::Stock, "BUY", "PENDING", "Limit", 10.0, Some(205.00), None, 0),
@@ -162,6 +164,7 @@ pub fn portfolio() -> Portfolio {
         currency: "USD".into(),
         trade_date: Some(at(days, 14)),
         settlement_date: Some(at(days - 1, 0)),
+        market: None,
     };
     let activities = vec![
         act(

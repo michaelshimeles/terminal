@@ -7,6 +7,7 @@ mod chart_view;
 mod command;
 mod congress_view;
 mod dock;
+mod hl_worker;
 mod layout;
 mod layouts;
 mod markets_view;

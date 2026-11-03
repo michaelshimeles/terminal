@@ -90,7 +90,7 @@ impl TerminalApp {
             PaneKind::Portfolio(pp) => {
                 let demo =
                     (self.prefs.trading.account_mode == crate::prefs::AccountMode::Demo).then_some(&*self.demo.pf);
-                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes) {
+                for a in super::portfolio_view::portfolio(ui, pp, &self.broker, demo, &self.quotes, &self.hl.mids) {
                     use super::portfolio_view::PortAction as P;
                     match a {
                         P::Core(a) => actions.push(a),
@@ -110,6 +110,7 @@ impl TerminalApp {
                         ),
                         P::CancelOrder { account, id } => self.request_cancel(&account, &id),
                         P::ClosePosition { account, key } => self.close_position(&account, &key),
+                        P::Kill => self.hl_kill(),
                         P::TradingSettings => {
                             self.settings_tab = super::settings_view::SettingsTab::Trading;
                             self.open_panel(PaneKind::Settings);

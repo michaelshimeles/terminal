@@ -35,7 +35,8 @@ pub mod sample;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod treasury;
 pub mod web;
-mod ws;
+/// The websocket client the providers use (the app's Hyperliquid user stream uses it too).
+pub mod ws;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod yahoo;
 

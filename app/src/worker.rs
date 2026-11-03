@@ -146,6 +146,8 @@ pub enum Request {
     PerpMarkets,
     /// Order entry (see `app::trading`); only sent once trading is enabled.
     Trade(TradeRequest),
+    /// Hyperliquid testnet: the user stream, reads, the agent key and signed actions.
+    Hl(crate::hl_worker::HlRequest),
 }
 
 /// A trading call through SnapTrade. Previews never place anything; placing takes a preview
@@ -318,6 +320,7 @@ pub enum Response {
     /// Live HIP-3 perps (`xyz:AAPL`), or why the server couldn't say.
     PerpMarkets(Result<Vec<String>, String>),
     Trade(Box<TradeResponse>),
+    Hl(Box<crate::hl_worker::HlResponse>),
 }
 
 pub struct Worker {
@@ -809,6 +812,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
             s.send(Response::SearchHits { query, hits });
         }
         Request::Trade(t) => s.send(Response::Trade(Box::new(trade(t).await))),
+        Request::Hl(r) => {
+            let out = s.clone();
+            crate::hl_worker::handle(r, move |resp| out.send(Response::Hl(Box::new(resp)))).await
+        }
     }
 }
 

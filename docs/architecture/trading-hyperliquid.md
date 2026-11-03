@@ -1,11 +1,11 @@
 # Trading on Hyperliquid: design
 
-Status: **draft for review. No feature code yet.** This PR adds only this document.
-Author: Grok Bot, for Micky. Research date: 2026-11-02 (read-only calls about 23:30 UTC). Times are UTC unless marked.
+Status: **v1 built for testnet** (decisions in §15, as built in §16). Mainnet is not reachable from this build; it waits on §12.
+Author: Grok Bot, for Micky; v1 by Claude. Research date: 2026-11-02 (read-only calls about 23:30 UTC). Times are UTC unless marked.
 
 Micky asked: *"i wanna enable crypto trading and stocks (via hyperliquid)"*. This doc designs order entry on Hyperliquid from Terminal's desktop app and the WASM web build. That covers crypto (core perps such as `BTC`, and spot such as `HYPE/USDC`) and the HIP-3 equity perps the terminal already shows (`xyz:AAPL`, labelled `PERP · HL xyz`). It fits the order entry that exists today: the demo account, the SnapTrade opt-in, the `PORT`/`POS`/`ORD`/`ACTV` panes and the order ticket.
 
-**Read §12 (legal) first.** Hyperliquid's Terms of Use name Ontario, Canada as a restricted region. This needs a decision from Micky before any phase touches mainnet, and it affects how testnet can be funded too.
+**Read §12 (legal) first.** Hyperliquid's Terms of Use name Ontario, Canada as a restricted region. This needs a decision from Micky before any phase touches mainnet, and it affects how testnet can be funded too. Micky's answer for now (§15): build and demo on testnet; legal review before mainnet.
 
 Evidence tags used below:
 
@@ -68,7 +68,7 @@ So a stolen agent key can trade, and lose money by trading, but per the docs it 
 **Option A: client-side signing with a local API wallet (recommended).**
 
 - Terminal generates a fresh secp256k1 key on the device. Its address is approved as a **named** agent by the user's main wallet, with an expiry. The private key never leaves the device. Every order is signed locally and posted straight to Hyperliquid.
-- **Desktop:** the agent key lives in the OS secret store. That is the macOS Keychain, through the existing `SecretStore` pattern, under its own service (`terminal.hyperliquid`, account = network and master address). On Linux, today's fallback is an owner-only file; for a trading key I'd want the Secret Service (libsecret) instead (Q6). The main wallet signs `approveAgent` in the browser (§4.2), so desktop never handles the main key.
+- **Desktop:** the agent key lives in the OS secret store. That is the macOS Keychain, under its own service (`terminal.hyperliquid`, account `testnet:<master address>`). On Linux it is the Secret Service (GNOME Keyring, KWallet) through the `keyring` crate, with **no file fallback**: without a keyring, Hyperliquid trading stays off and Settings says why (Q6). Other platforms have no store, so trading is off there. In this testnet build the desktop approves the agent with a pasted throwaway testnet main key that is wiped after one signature (§4.2); the browser handoff comes before mainnet.
 - **Web:** the browser wallet (EIP-1193 `window.ethereum`: MetaMask, Rabby…) signs only the rare user-signed actions: approve agent, approve builder fee, revoke. Orders are signed by the agent key in WASM. The agent key is either **session-only** (memory; lost on reload, re-approve next time) or an **encrypted local key** (wrapped with a non-extractable WebCrypto AES-GCM key and stored in IndexedDB) [inferred design]. Default: session-only, with "Remember on this browser" as an explicit choice.
 - Why not have the browser wallet sign each order? L1 actions are signed over an EIP-712 domain with `chainId: 1337` ("phantom agent") [doc: SDK-SIGN]. Wallets generally won't sign typed data for a chain they aren't on, and a popup per order is unusable anyway [inferred]. Hyperliquid's own SDK and docs steer trading processes to API wallets [doc: NONCE].
 
@@ -116,11 +116,11 @@ Hyperliquid warns that hand-rolled signatures fail silently: a wrong signature r
 
 ### 4.1 Turning it on
 
-1. Settings › Trading › **Hyperliquid** (new section; off by default). The network selector defaults to **Testnet**. Mainnet is unavailable until phase 4, and even then only in builds with the `hl-mainnet` cargo feature (§8).
+1. Settings › Trading › **Hyperliquid** (new section; off by default). This build has **testnet only**: no network selector, no mainnet URL, no switch. Mainnet comes in phase 4, after §12, in a build made for it (§8).
 2. A first-run acknowledgement like the SnapTrade `enable_dialog` [repo], with Hyperliquid-specific lines: orders are irreversible on-chain transactions; perps are leveraged and can be liquidated; HIP-3 stock markets are perpetual futures, not shares; Hyperliquid's Terms restrict some regions, including Ontario (§12), and you are responsible for whether you may use it.
 3. **Connect wallet**: the master address, used for reads and display.
    - Web: EIP-1193 `eth_requestAccounts`.
-   - Desktop: a browser handoff (§4.2), or paste a read-only address. A read-only address alone already lights up `PORT`/`POS`/`ORD` with live data and no trading.
+   - Desktop: paste a read-only address (v1), or approve with a pasted testnet throwaway key (§4.2). A read-only address alone already lights up `PORT`/`POS`/`ORD` with live data and no trading.
 
 ### 4.2 Approving the agent (one main-wallet signature)
 
@@ -130,7 +130,8 @@ Hyperliquid warns that hand-rolled signatures fail silently: a wrong signature r
    - **Expiry:** `valid_until`, at most 180 days ahead [doc: EXCH]. Default: 30 days (Q5).
 3. Signing:
    - Web: `eth_signTypedData_v4` with the connected wallet. `signatureChainId` = the wallet's current chain id, because wallets reject typed data for another chain [inferred; verify in phase 1].
-   - Desktop: Terminal opens `https://terminal.rasmic.xyz/app/#hl-approve?agent=0x…&name=…&net=testnet`. Only the **public** agent address is in the URL fragment, which never reaches a server. The web page has the main wallet sign `approveAgent` and posts it to `/exchange`. Desktop then polls `{"type": "extraAgents", "user": master}` [doc: SDK-INFO] and `userRole` [doc: INFO] until the agent appears.
+   - Desktop, **v1 (testnet only):** the user pastes a throwaway testnet main key into a masked field. Terminal signs `approveAgent` with it once, wipes the buffer and never stores it. The Settings copy says, in amber, never to paste a key that holds real funds.
+   - Desktop, later (before mainnet): Terminal opens `https://terminal.rasmic.xyz/app/#hl-approve?agent=0x…&name=…&net=testnet`. Only the **public** agent address is in the URL fragment, which never reaches a server. The web page has the main wallet sign `approveAgent` and posts it to `/exchange`. Desktop then polls `{"type": "extraAgents", "user": master}` [doc: SDK-INFO] and `userRole` [doc: INFO] until the agent appears.
 4. Terminal shows: agent address (masked), name, network, expiry, and "Revoke".
 
 ### 4.3 Revoking and rotating
@@ -259,13 +260,13 @@ The rules from `server.md` §7 carry over to trading [repo]:
 | Rail | Design |
 |---|---|
 | Off by default | `prefs.trading.hl.enabled = false`, separate from SnapTrade's `enabled`. The Hyperliquid account is read-only until enabled with its acknowledgement (§4.1). |
-| Testnet first | `network` defaults to `Testnet`. Mainnet requires (a) a build with the `hl-mainnet` cargo feature, off in release builds until phase 4; (b) a separate mainnet acknowledgement; (c) Micky's answer to §12. The badge, title bar and confirm always name the network, and the phantom-agent `source` (`a`/`b`) and `hyperliquidChain` come from that same enum, so a testnet ticket cannot sign a mainnet action. |
+| Testnet only (v1) | `Network` has one variant, `Testnet`. The endpoints are the testnet hosts, the phantom agent's `source` is always `"b"` and `hyperliquidChain` always `"Testnet"`; a stored `"network": "mainnet"` reads as testnet. Tests grep `tr-hl` for mainnet hosts. Mainnet needs a later build after §12, with its own acknowledgement. The amber TESTNET badge is on the toolbar, the account, the ticket and every confirmation. |
 | Confirmation | One per order, cancel-all and leverage change (§6.3). Enter confirms; Escape or a click outside cancels, as today [repo]. |
-| Max-notional guard | `max_order_value` (USD notional = size × reference price) defaults to **$100 on testnet** and stays mandatory on mainnet. It is checked when the confirm opens and again right before signing. Also a max leverage (default 3×) and a daily notional cap per session. A breach refuses locally, before signing. |
-| Kill switch | `KILL` / ⌘⇧K / a red button in `ORD`: fetch `openOrders` for every dex the account has used, then send batched `cancel` per dex (cancels have a higher rate-limit allowance [doc: RL]). An optional "and flatten" sends reduce-only IOC closes for all positions after a second confirmation. The kill switch also disables HL trading in prefs until re-enabled. |
-| Dead man's switch | While trading is enabled and the app is open, Terminal keeps a `scheduleCancel` about 60 s ahead and refreshes it [doc: EXCH]. If the app crashes or loses network, open orders are cancelled. Constraints: at least 5 s ahead, and at most 10 triggers per day, reset 00:00 UTC [doc: EXCH]. Opt-in (Q7), because it also cancels orders placed elsewhere. |
+| Hard caps | Constants in `tr-hl`, not settings: **$100** per order (size × the higher of the order price and the mid), **3×** leverage, **1%** market slippage. `tr-hl` checks them when the confirm opens, and the worker reads the testnet mid and leverage again and re-checks right before signing. An order is refused while the account's leverage on that market is over 3× (Hyperliquid's default is 20×), so a confirmed "Set 3×" comes first; reduce-only orders are not blocked by leverage. A breach refuses before anything is signed. |
+| Kill switch | `KILL` or the red KILL button in `ORD` (and in Settings): one confirmation, then Hyperliquid orders turn off in prefs and every open order is cancelled, one `cancel` action per dex (cancels have a higher rate-limit allowance [doc: RL]). KILL never waits for another request. It cancels at once and refuses any order confirmed before it that hasn't been signed, even one still reading the market. If an order was already being sent, KILL cancels again once that order can no longer land. That is when its answer comes, or when its `expiresAfter` has passed if the send got no clear answer. Single cancels and the dead man's switch never wait for orders either. "And flatten" is not in v1. |
+| Dead man's switch | **Opt-in, off by default** (Q7). While on and trading is enabled, Terminal keeps a `scheduleCancel` about 60 s ahead and refreshes it every 30 s [doc: EXCH]; turning it off clears the schedule. These changes go out one at a time, in the order Terminal made them, and never wait for an order. A newer change replaces one still waiting, and each is signed with a fresh deadline when it goes out. After a change whose send got no clear answer, the next waits until that one can no longer land, so an older timer or clear never lands after a newer change. Constraints: at least 5 s ahead, and at most 10 triggers per day, reset 00:00 UTC [doc: EXCH]. |
 | Nonces | One agent per device and network (nonces are tracked per signer; "use a separate private key" per session [doc: NONCE]). The nonce is an atomic `max(last + 1, now_ms)`, within (T − 2 days, T + 1 day) [doc: NONCE]. A noop (`{"type": "noop"}`) can invalidate an in-flight nonce [doc: EXCH]. |
-| Uncertain results | A network error after send means "uncertain", never "failed". Reconcile by `cloid` via `orderStatus` and `orderUpdates` before allowing a resend (same idea as `PlaceError::uncertain` [repo]). |
+| Uncertain results | A network error after send means "uncertain", never "failed". Reconcile by `cloid` via `orderStatus` and `orderUpdates` before allowing a resend (same idea as `PlaceError::uncertain` [repo]). Every `/info` and `/exchange` request has its own 10 s deadline, in the browser too (`fetch` has no default timeout); an `/exchange` request that runs out of time is uncertain. |
 | Never log keys | `AgentKey` is a newtype with redacted `Debug`/`Display` (like `Credentials` and `mask()` [repo]) and is zeroized on drop. It is never serialized into prefs, layouts or the demo JSON. Signed request bodies are not logged; logs carry `cloid`, `oid`, asset and status only. Unit test: a `tracing` capture of a full place/cancel cycle contains no 64-hex-digit secrets. |
 | Rate limits | Address-based limit: 1 request per 1 USDC traded since inception, plus an initial buffer of 10,000; when limited, 1 request every 10 s [doc: RL]. A human-driven terminal stays far below this. Terminal reads `userRateLimit` [doc: INFO] and surfaces it in Settings, and backs off quietly on 429s, as the SnapTrade capabilities code does [repo]. |
 
@@ -316,7 +317,7 @@ Unrealized PnL is then repriced from the gateway's live marks on mainnet, or tes
 
 ---
 
-## 10. Code layout (for later PRs; none in this one)
+## 10. Code layout (as built in v1; see §16)
 
 - `crates/hl` (`tr-hl`): `signing` (§3.4), `actions` (order, cancel, cancelByCloid, modify, batchModify, updateLeverage, scheduleCancel, noop, approveAgent, approveBuilderFee, structs with explicit field order), `assets` (the registry, §5.1), `rounding` (§5.2), `client` (`/info` and `/exchange` over `reqwest`, which already compiles for wasm in this workspace [repo]), `stream` (user websocket), `nonce`. No `tokio` "full"; it follows `tr-broker`'s wasm split [repo].
 - `tr-broker`: `secrets` gains a second store for agent keys (Keychain service `terminal.hyperliquid`). The existing SnapTrade item is untouched.
@@ -391,6 +392,23 @@ Unrealized PnL is then repriced from the gateway's live marks on mainnet, or tes
 
 ## 15. Open questions for Micky
 
+**Decided (2026-11-02).** Micky: "Build it on testnet now, we'll sort the legal review before mainnet." Defaults for v1:
+
+1. Signing on the device only (Option A). `tr-gateway` stays data-only; no server change.
+2. A named API wallet, `terminal-<device> valid_until <ms>`, valid 30 days by default (180 at most). Never the unnamed slot, never a reused agent address.
+3. Desktop keys in the macOS Keychain; on Linux the Secret Service with no file fallback (no keyring means no trading, and Settings says why). Windows: no store in this build, so trading stays off there.
+4. Web keys for the session only (memory), with an opt-in "remember on this browser" that encrypts with a non-extractable WebCrypto AES-GCM key kept in IndexedDB.
+5. Perps only: the core dex and the HIP-3 `xyz` dex. No spot; `para`, `io` and `mkts` are refused at the ticket with a reason.
+6. Hard caps enforced in `tr-hl` before signing, not raisable in this build: $100 per order, 3× leverage, 1% market slippage.
+7. The dead man's switch is opt-in, off by default.
+8. One confirmation for every order, modify, cancel-all and leverage change, plus the kill switch (`KILL` and a button in `ORD`).
+9. No builder fee: the `builder` field is never sent.
+10. Hyperliquid sits inside LIVE next to the SnapTrade accounts, with an amber TESTNET badge on the account, the ticket, the confirmation and the toolbar.
+11. Asset ids come from the API per network (`perpDexs` and `meta` per dex), never hard-coded.
+12. A separate testnet quote map: testnet rows and tickets never read the gateway's mainnet quotes, and the reverse.
+
+The questions as first asked:
+
 1. **Legal / ToS (blocking for mainnet):** Hyperliquid's Terms restrict persons in Ontario (§12). Who reviews (a) you personally trading, and (b) Goshen Labs shipping HL order entry to users in Ontario and the US? Until then, is a testnet-only build OK to develop and demo?
 2. **Testnet funds:** the faucet requires a prior mainnet deposit from the same address. Do you already have a mainnet-funded address you're comfortable using for testnet, or should we find another source of testnet USDC (e.g. a teammate outside restricted regions sending testnet USDC) [unverified that this works]?
 3. **Custody:** OK with Option A (local API wallet, main wallet signs once, server never signs)? Or do you want Option B for a future hosted or mobile product?
@@ -439,3 +457,13 @@ Unrealized PnL is then repriced from the gateway's live marks on mainnet, or tes
 - `OPTIONS /exchange` with `Origin: https://terminal.rasmic.xyz`: mainnet and testnet both return `access-control-allow-origin: *`.
 - Signing spike: alloy-signer-local 1.8.3 + alloy-sol-types + rmp-serde. Matches SDK vector r/s/v on mainnet and testnet; `cargo build --target wasm32-unknown-unknown` OK.
 - `hypersdk` 0.3.0 with `default-features = false` on wasm32: 5 compile errors in `hypersdk` itself.
+
+---
+
+## 16. v1 as built (testnet)
+
+- **`crates/hl` (`tr-hl`):** `network` (testnet only), `key` (`AgentKey`, `MainKey`: redacted, zeroized on drop), `signing` (k256 directly, with `alloy-primitives` and `alloy-sol-types`; no alloy signer crates, which pull in the RPC stack), `actions`, `assets`, `rounding`, `caps`, `nonce`, `trader` (the only way to an L1 signature), `client` (reqwest, native and wasm), `model`, `stream` (subscriptions and a reducer; the socket is the app's). It builds for wasm32.
+- **`tr-broker`:** `AgentKeyStore` (Keychain, Secret Service or memory; never a file), and `market: Option<String>` on `Position`, `Order` and `Activity`, which `market_key()` prefers.
+- **App:** `app/src/hl_worker.rs` (the user stream, reads, signing after the re-check, the key store off the UI thread), `app/src/app/hl.rs` (state, flows, rows, testnet quotes), `hl_view.rs` (ticket body, confirmations, Settings), `hl_web.rs` (EIP-1193 wallet, IndexedDB key). The ticket's Hyperliquid variant covers market (IOC, 1% cap), limit (GTC, IOC, post-only), stop loss and take profit (reduce-only market triggers), reduce-only and "Set 3×". A dollar amount (`BUY xyz:AAPL $50`) becomes a size at the testnet mid, rounded down to the market's size step. Until the mid is in, or when the amount is under one step, the ticket can't send it.
+- **Checked on testnet** with throwaway keys and no funds: every signature recovers its signer, and a corrupted one recovers someone else. `approveAgent` needs a deposit first ("Must deposit before performing actions"). The PR that added this build lists the responses.
+- **Not done in v1:** modify is in `tr-hl` and the worker but has no `ORD` control yet; brackets (`normalTpsl`), "and flatten" on KILL, the desktop browser handoff, spot, other HIP-3 dexes, the daily notional cap, and the expiry warning's one-click renew. Resting orders, fills, positions and P&L can only be checked once the testnet account has test USDC.

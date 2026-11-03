@@ -1,0 +1,29 @@
+[package]
+name = "tr-hl"
+description = "Hyperliquid order entry on testnet: L1 and user-signed signing, actions, asset ids, rounding, hard caps, info/exchange clients and the user stream"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+alloy-primitives = { version = "1", default-features = false, features = ["std", "k256"] }
+alloy-sol-types = { version = "1", default-features = false, features = ["std", "eip712-serde"] }
+k256 = { version = "0.13", default-features = false, features = ["std", "ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rmp-serde = "1"
+zeroize = "1"
+web-time = "1"
+futures = "0.3"
+
+# Key generation on the web reads the browser's crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }
+tracing-subscriber.workspace = true

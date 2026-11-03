@@ -342,6 +342,7 @@ impl DemoBook {
             placed: Some(now),
             updated: Some(now),
             underlying: None,
+            market: None,
         };
         let id = order.id.clone();
         self.orders.insert(0, order);
@@ -522,6 +523,7 @@ impl DemoBook {
                     currency: "USD".into(),
                     cash_equivalent: false,
                     underlying: None,
+                    market: None,
                 }),
             }
         } else {
@@ -561,6 +563,7 @@ impl DemoBook {
                 currency: "USD".into(),
                 trade_date: Some(now),
                 settlement_date: Some(now),
+                market: None,
             },
         );
         Ok(())

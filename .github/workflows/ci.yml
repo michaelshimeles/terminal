@@ -93,6 +93,8 @@ jobs:
       - run: cargo clippy --release --workspace --all-targets -- -D warnings
       - name: The protocol crate builds for the browser
         run: cargo build -p tr-proto --target wasm32-unknown-unknown
+      - name: The Hyperliquid crate builds for the browser
+        run: cargo build -p tr-hl --target wasm32-unknown-unknown && cargo clippy -p tr-hl --target wasm32-unknown-unknown -- -D warnings
       - name: Run the app (smoke test)
         env:
           TR_PROVIDER: sample

@@ -81,6 +81,8 @@ pub struct Ticket {
     pub error: Option<String>,
     /// Result of the last placement.
     pub done: Option<String>,
+    /// Hyperliquid's own fields, used when a Hyperliquid account is chosen.
+    pub hl: super::hl::HlTicket,
 }
 
 fn parse_num(s: &str) -> Option<f64> {
@@ -116,6 +118,7 @@ impl Ticket {
             placing: false,
             error: None,
             done: None,
+            hl: Default::default(),
         }
     }
 
@@ -126,6 +129,9 @@ impl Ticket {
         }
         if let Some(k) = &args.symbol {
             self.symbol = broker_symbol(k);
+        }
+        if args.symbol.is_some() || args.units.is_some() || args.notional.is_some() {
+            self.hl.from_dollars = None;
         }
         if let Some(u) = args.units {
             self.dollars = false;
@@ -151,6 +157,15 @@ impl Ticket {
         };
         if self.order_type.needs_stop() {
             self.advanced = true;
+        }
+        self.hl.kind = match (args.stop, args.limit) {
+            (Some(_), _) => super::hl::HlKind::StopLoss,
+            (None, Some(_)) => super::hl::HlKind::Limit,
+            (None, None) if args.symbol.is_some() => super::hl::HlKind::Market,
+            _ => self.hl.kind,
+        };
+        if let Some(s) = args.stop {
+            self.hl.trigger = fmt_input(s);
         }
         self.preview = None;
         self.review = false;
@@ -302,6 +317,12 @@ impl TerminalApp {
         };
         if account == demo::ACCOUNT_ID {
             return Some(everything("Demo account".into()));
+        }
+        if super::hl::is_hl_account(account) {
+            return Some(Capability {
+                connection_trading: self.hl_signing_blocker().is_none(),
+                ..everything("Hyperliquid testnet".into())
+            });
         }
         match self.broker.mode() {
             BrokerMode::Simulated => Some(everything(
@@ -464,8 +485,14 @@ impl TerminalApp {
         ticket.apply(&args);
         let accounts = self.trade_accounts();
         let known = |id: &str| accounts.iter().any(|a| a.id == id);
+        // A Hyperliquid perp only trades on Hyperliquid.
+        let hl_account = self
+            .hl_master()
+            .map(|m| super::hl::account_id(&m))
+            .filter(|id| known(id) && args.symbol.as_deref().is_some_and(tr_data::is_perp));
         ticket.account = account
             .filter(|a| known(a))
+            .or(hl_account)
             .or(ticket.account.filter(|a| known(a)))
             .or(self.prefs.trading.default_account.clone().filter(|a| known(a)))
             .or((accounts.len() == 1).then(|| accounts[0].id.clone()));
@@ -541,6 +568,9 @@ impl TerminalApp {
         if account == demo::ACCOUNT_ID {
             return self.demo_close(&symbol);
         }
+        if super::hl::is_hl_account(account) {
+            return self.hl_close_position(account, key);
+        }
         self.open_ticket(
             TradeArgs { buy: Some(false), symbol: Some(key.into()), all: true, ..Default::default() },
             Some(account.into()),
@@ -592,6 +622,9 @@ impl TerminalApp {
         }
         self.trading.last_submit = Some(Instant::now());
         let Some(t) = self.trading.ticket.as_ref() else { return };
+        if t.account.as_deref().is_some_and(super::hl::is_hl_account) {
+            return self.hl_review();
+        }
         let quote = self.ticket_quote(t);
         let req = match t.request() {
             Ok(r) => r,
@@ -746,6 +779,9 @@ impl TerminalApp {
     pub(super) fn request_cancel(&mut self, account: &str, order_id: &str) {
         if account == demo::ACCOUNT_ID {
             return self.demo_cancel(order_id);
+        }
+        if super::hl::is_hl_account(account) {
+            return self.hl_request_cancel(order_id);
         }
         if !self.trading_enabled() {
             self.status = "Live orders are off: enable them in Settings › Trading to cancel orders here".into();
@@ -926,18 +962,33 @@ impl TerminalApp {
         if self.trading.live_prompt {
             self.live_dialog(ctx);
         }
+        if self.hl.confirm.is_some() {
+            self.hl_confirm_dialog(ctx);
+        }
+        if self.hl.enable_prompt {
+            self.hl_enable_dialog(ctx);
+        }
     }
 
     fn ticket_window(&mut self, ctx: &egui::Context) {
         let mut open = true;
         let live = !self.demo_mode();
-        let title = if live { "Order Ticket · LIVE" } else { "Order Ticket · Demo" };
+        let hl = live
+            && self.trading.ticket.as_ref().and_then(|t| t.account.as_deref()).is_some_and(super::hl::is_hl_account);
+        let title = match (live, hl) {
+            (true, true) => "Order Ticket · Hyperliquid TESTNET",
+            (true, false) => "Order Ticket · LIVE",
+            _ => "Order Ticket · Demo",
+        };
+        let color = match (live, hl) {
+            (true, true) => amber(),
+            (true, false) => theme::down(),
+            _ => theme::border(),
+        };
         let mut act = None;
-        let frame = egui::Frame::window(&ctx.global_style()).stroke(egui::Stroke::new(
-            if live { 2.0 } else { 1.0 },
-            if live { theme::down() } else { theme::border() },
-        ));
-        egui::Window::new(RichText::new(title).font(ui_font(13.0)).color(if live { theme::down() } else { text() }))
+        let frame =
+            egui::Frame::window(&ctx.global_style()).stroke(egui::Stroke::new(if live { 2.0 } else { 1.0 }, color));
+        egui::Window::new(RichText::new(title).font(ui_font(13.0)).color(if live { color } else { text() }))
             .id(egui::Id::new("order-ticket"))
             .frame(frame)
             .open(&mut open)
@@ -945,11 +996,12 @@ impl TerminalApp {
             .resizable(false)
             .default_width(dp(320.0))
             .default_pos(ctx.content_rect().center() - egui::vec2(dp(160.0), dp(220.0)))
-            .show(ctx, |ui| act = self.ticket_ui(ui));
+            .show(ctx, |ui| act = if hl { self.hl_ticket_ui(ui) } else { self.ticket_ui(ui) });
         self.sync_sell_all();
         if !open
             || (ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                && !self.trading.ticket.as_ref().is_some_and(|t| t.confirming))
+                && !self.trading.ticket.as_ref().is_some_and(|t| t.confirming)
+                && self.hl.confirm.is_none())
         {
             self.trading.ticket = None;
             return;
@@ -1836,7 +1888,9 @@ impl TerminalApp {
             }
         });
 
-        section(ui, "Safety");
+        self.hl_settings(ui, cmds);
+
+        section(ui, "Safety (SnapTrade)");
         ui.horizontal(|ui| {
             let mut limited = self.prefs.trading.max_order_value.is_some();
             if ui.checkbox(&mut limited, "Maximum live order value").changed() {
@@ -1851,7 +1905,13 @@ impl TerminalApp {
             }
         });
         note(ui, "Live orders whose estimated value is above the limit are refused before they are sent.");
-        let accounts: Vec<Account> = self.broker.portfolio.as_ref().map(|p| p.accounts.clone()).unwrap_or_default();
+        // SnapTrade's accounts only: Hyperliquid has its own section above.
+        let accounts: Vec<Account> = self
+            .broker
+            .portfolio
+            .as_ref()
+            .map(|p| p.accounts.iter().filter(|a| !super::hl::is_hl_account(&a.id)).cloned().collect())
+            .unwrap_or_default();
         if !accounts.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Default live account").font(ui_font(12.5)));
@@ -1974,10 +2034,14 @@ impl TerminalApp {
             ),
         );
         note(ui, "Commands (or ⌘K): BUY AAPL 10 · SELL ALL TSLA · BUY NVDA $500 · SELL MSFT 5 LMT 410 · DEMO · LIVE");
+        note(
+            ui,
+            "Hyperliquid testnet: BUY xyz:AAPL 0.05 @250 · SELL BTC 0.0002 MKT · KILL cancels every open Hyperliquid order.",
+        );
     }
 }
 
-enum TicketAct {
+pub(super) enum TicketAct {
     Submit,
     EnableLive,
     Mode(AccountMode),

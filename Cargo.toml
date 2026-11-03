@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/broker", "crates/congress", "crates/data", "crates/chart", "crates/macos", "crates/proto", "app", "server"]
+members = ["crates/core", "crates/broker", "crates/hl", "crates/congress", "crates/data", "crates/chart", "crates/macos", "crates/proto", "app", "server"]
 default-members = ["app"]
 
 [workspace.package]
@@ -11,6 +11,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 tr-core = { path = "crates/core" }
 tr-broker = { path = "crates/broker" }
+tr-hl = { path = "crates/hl" }
 tr-congress = { path = "crates/congress" }
 tr-data = { path = "crates/data" }
 tr-chart = { path = "crates/chart" }

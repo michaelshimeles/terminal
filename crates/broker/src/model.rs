@@ -127,6 +127,10 @@ pub struct Position {
     pub cash_equivalent: bool,
     /// For options: the underlying ticker.
     pub underlying: Option<String>,
+    /// The terminal market key the position prices and charts by, when the source names one
+    /// exactly (`xyz:AAPL` for a Hyperliquid HIP-3 perp). It wins over the kind-based mapping.
+    #[serde(default)]
+    pub market: Option<String>,
 }
 
 impl Position {
@@ -153,9 +157,13 @@ impl Position {
         (cost.abs() > 1e-9).then(|| self.pnl_at(price).map(|p| p / cost.abs() * 100.0)).flatten()
     }
 
-    /// The terminal market key for charting, quotes and Congress lookups, when the
-    /// instrument maps onto one (US-listed equities and ETFs, crypto, option underlyings).
+    /// The terminal market key for charting, quotes and Congress lookups: [`Self::market`]
+    /// when set, else the kind-based mapping (US-listed equities and ETFs, crypto, option
+    /// underlyings).
     pub fn market_key(&self) -> Option<String> {
+        if let Some(m) = &self.market {
+            return Some(m.clone());
+        }
         market_key(self.kind, self.underlying.as_deref().unwrap_or(&self.symbol), &self.currency)
     }
 
@@ -261,6 +269,9 @@ pub struct Order {
     pub placed: Option<DateTime<Utc>>,
     pub updated: Option<DateTime<Utc>>,
     pub underlying: Option<String>,
+    /// As [`Position::market`].
+    #[serde(default)]
+    pub market: Option<String>,
 }
 
 impl Order {
@@ -285,6 +296,9 @@ impl Order {
     }
 
     pub fn market_key(&self) -> Option<String> {
+        if let Some(m) = &self.market {
+            return Some(m.clone());
+        }
         market_key(self.kind, self.underlying.as_deref().unwrap_or(&self.symbol), "USD")
     }
 
@@ -308,10 +322,16 @@ pub struct Activity {
     pub currency: String,
     pub trade_date: Option<DateTime<Utc>>,
     pub settlement_date: Option<DateTime<Utc>>,
+    /// As [`Position::market`].
+    #[serde(default)]
+    pub market: Option<String>,
 }
 
 impl Activity {
     pub fn market_key(&self) -> Option<String> {
+        if let Some(m) = &self.market {
+            return Some(m.clone());
+        }
         market_key(InstrumentKind::Stock, self.symbol.as_deref()?, &self.currency)
     }
 }
@@ -372,9 +392,16 @@ impl Portfolio {
             t.cash += a.cash.unwrap_or(0.0);
             t.buying_power += a.buying_power.unwrap_or(0.0);
         }
+        // Futures (Hyperliquid perps) are margined: the account's cash backs them, so their value
+        // is their profit or loss, never their notional.
+        let mut futures_pnl = 0.0;
         for p in self.positions.iter().filter(|p| selected(&p.account_id) && !p.cash_equivalent) {
             let live = price_of(p);
-            t.invested += p.market_value_at(live).unwrap_or(0.0);
+            if p.kind == InstrumentKind::Future {
+                futures_pnl += p.pnl_at(live).unwrap_or(0.0);
+            } else {
+                t.invested += p.market_value_at(live).unwrap_or(0.0);
+            }
             if let (Some(cost), Some(pnl)) = (p.cost(), p.pnl_at(live)) {
                 t.cost += cost;
                 t.pnl += pnl;
@@ -392,7 +419,7 @@ impl Portfolio {
         t.value = if reported.len() == n && n > 0 && price_of_is_trivial(&self.positions, &price_of) {
             reported.iter().sum()
         } else {
-            t.cash + t.invested + cash_like
+            t.cash + t.invested + futures_pnl + cash_like
         };
         t
     }
@@ -538,6 +565,7 @@ pub fn parse_positions(account_id: &str, v: &Value) -> Vec<Position> {
                     .unwrap_or_else(|| text(&inst["currency"])),
                 cash_equivalent: p["cash_equivalent"].as_bool().unwrap_or(false),
                 underlying,
+                market: None,
             })
         })
         .collect()
@@ -597,6 +625,7 @@ pub fn parse_orders(account_id: &str, v: &Value) -> Vec<Order> {
                 placed: time(&o["time_placed"]),
                 updated: time(&o["time_updated"]).or_else(|| time(&o["time_executed"])),
                 underlying,
+                market: None,
             })
         })
         .collect()
@@ -623,6 +652,7 @@ pub fn parse_activities(account_id: &str, v: &Value) -> Vec<Activity> {
                 currency: Some(text(&a["currency"]["code"])).filter(|c| !c.is_empty()).unwrap_or("USD".into()),
                 trade_date: time(&a["trade_date"]),
                 settlement_date: time(&a["settlement_date"]),
+                market: None,
             }
         })
         .collect()
@@ -645,6 +675,7 @@ mod tests {
             currency: "USD".into(),
             cash_equivalent: false,
             underlying: None,
+            market: None,
         }
     }
 
@@ -687,6 +718,24 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_market_key_wins_over_the_kind() {
+        // A Hyperliquid HIP-3 perp: a future whose key the source names exactly.
+        let mut perp = pos(InstrumentKind::Future, "xyz:AAPL", -0.5, 320.0, 300.0);
+        assert_eq!(perp.market_key(), None, "futures have no key of their own");
+        perp.market = Some("xyz:AAPL".into());
+        assert_eq!(perp.market_key().as_deref(), Some("xyz:AAPL"), "never AAPL US Equity");
+        let mut btc = pos(InstrumentKind::Future, "BTC", 0.01, 76_000.0, 70_000.0);
+        btc.market = Some("BTCUSD Curncy".into());
+        assert_eq!(btc.market_key().as_deref(), Some("BTCUSD Curncy"));
+        // SnapTrade rows have none and keep today's mapping.
+        assert_eq!(pos(InstrumentKind::Stock, "AAPL", 1.0, 1.0, 1.0).market_key().as_deref(), Some("AAPL US Equity"));
+        // Saved data from before the field existed still loads.
+        let mut v = serde_json::to_value(pos(InstrumentKind::Stock, "AAPL", 1.0, 1.0, 1.0)).unwrap();
+        v.as_object_mut().unwrap().remove("market");
+        assert_eq!(serde_json::from_value::<Position>(v).unwrap().market, None);
+    }
+
+    #[test]
     fn totals_reprice_with_live_quotes() {
         let mut pf = Portfolio {
             accounts: vec![Account {
@@ -722,6 +771,40 @@ mod tests {
         pf.accounts[0].total = None;
         assert_eq!(pf.totals(Some("a"), |_| None).value, 2500.0);
         assert_eq!(pf.totals(Some("other"), |_| None), Totals::default());
+    }
+
+    /// Greptile #37: a perp is margined, so repricing it moves equity by its P&L, never by its
+    /// notional. 10 long at 190 marked 200 (P&L 100) in an account worth 1,000.
+    #[test]
+    fn futures_reprice_by_pnl_not_notional() {
+        let account = |cash: f64| Account {
+            id: "hl".into(),
+            name: "Hyperliquid".into(),
+            number: String::new(),
+            institution: "Hyperliquid".into(),
+            currency: "USD".into(),
+            total: Some(1000.0),
+            cash: Some(cash),
+            buying_power: Some(200.0),
+            kind: "Perps".into(),
+            status: String::new(),
+            is_paper: true,
+            synced: None,
+            connection_id: String::new(),
+        };
+        let mut long = pos(InstrumentKind::Future, "BTC", 10.0, 200.0, 190.0);
+        long.account_id = "hl".into();
+        // Cash is the collateral: equity less unrealised P&L.
+        let pf = Portfolio { accounts: vec![account(900.0)], positions: vec![long.clone()], ..Default::default() };
+        assert_eq!(pf.totals(None, |_| None).value, 1000.0, "reported equity");
+        assert_eq!(pf.totals(None, |_| Some(200.0)).value, 1000.0, "the same price leaves equity alone");
+        assert_eq!(pf.totals(None, |_| Some(210.0)).value, 1100.0, "+10 × 10");
+        assert_eq!(pf.totals(None, |_| Some(200.0)).invested, 0.0, "perp notional is not invested cash");
+        let mut short = pos(InstrumentKind::Future, "BTC", -10.0, 200.0, 210.0);
+        short.account_id = "hl".into();
+        let pf = Portfolio { accounts: vec![account(900.0)], positions: vec![short], ..Default::default() };
+        assert_eq!(pf.totals(None, |_| Some(200.0)).value, 1000.0);
+        assert_eq!(pf.totals(None, |_| Some(190.0)).value, 1100.0, "a short gains as the price falls");
     }
 
     #[test]
