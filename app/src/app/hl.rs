@@ -133,6 +133,8 @@ pub struct HlState {
     /// The agent key for the connected account, once loaded.
     pub key: Option<Arc<AgentKey>>,
     pub key_loading: bool,
+    /// The store item already read (found or not), so it isn't read again every frame.
+    key_tried: Option<String>,
     pub nonces: Arc<NonceManager>,
     pub registry: Option<Arc<AssetRegistry>>,
     pub registry_error: Option<String>,
@@ -182,6 +184,7 @@ impl HlState {
             store_error: None,
             key: None,
             key_loading: false,
+            key_tried: None,
             nonces: Arc::new(NonceManager::new()),
             registry: None,
             registry_error: None,
@@ -434,6 +437,12 @@ pub fn intent(t: &super::trading::Ticket, reg: &AssetRegistry) -> Result<OrderIn
     Ok(OrderIntent { coin, is_buy: t.side == tr_broker::trading::Side::Buy, size, kind, reduce_only })
 }
 
+/// Read the agent key from the store? Once per account: a store that has none for an
+/// approved agent is not asked again every frame.
+fn should_load_key(agent: bool, h: &HlState, account: &str) -> bool {
+    agent && h.key.is_none() && !h.key_loading && h.key_tried.as_deref() != Some(account)
+}
+
 /// `terminal-<this machine>`: the host name, or `web` in the browser.
 fn device() -> String {
     if cfg!(target_arch = "wasm32") {
@@ -502,9 +511,11 @@ impl TerminalApp {
             self.hl.dirty = true;
             self.hl_send(HlRequest::Stream { generation: self.hl.generation, user: master.clone() });
         }
-        if self.prefs.trading.hl.agent.is_some() && self.hl.key.is_none() && !self.hl.key_loading {
+        let account = store_account(&master);
+        if should_load_key(self.prefs.trading.hl.agent.is_some(), &self.hl, &account) {
             self.hl.key_loading = true;
-            self.hl_send(HlRequest::LoadKey { store: self.hl.store.clone(), account: store_account(&master) });
+            self.hl.key_tried = Some(account.clone());
+            self.hl_send(HlRequest::LoadKey { store: self.hl.store.clone(), account });
         }
     }
 
@@ -530,6 +541,7 @@ impl TerminalApp {
         }
         self.prefs.trading.hl.master = Some(addr.clone());
         self.save_hl_prefs();
+        self.hl.key_tried = None;
         self.hl.message = Some((
             format!(
                 "Showing Hyperliquid testnet account {} (read-only).",
@@ -646,6 +658,7 @@ impl TerminalApp {
     pub(super) fn hl_revoke_send(&mut self, body: Option<serde_json::Value>) {
         let Some(master) = self.hl_master() else { return };
         self.hl.key = None;
+        self.hl.key_tried = None;
         self.prefs.trading.hl.agent = None;
         self.prefs.trading.hl.enabled = false;
         self.save_hl_prefs();
@@ -932,6 +945,7 @@ impl TerminalApp {
                         self.prefs.trading.hl.agent = Some(agent.clone());
                         self.save_hl_prefs();
                         self.hl.key = Some(key);
+                        self.hl.key_tried = None;
                         let note = match saved {
                             Ok(()) => format!("kept in {}", self.hl.store.describe()),
                             Err(e) => format!("but it could not be saved ({e}), so it lasts only this session"),
@@ -1098,6 +1112,18 @@ mod tests {
         assert!(matches!(i.kind, OrderKind::Trigger { trigger_px: 300.0, .. }));
         t.hl.kind = HlKind::Limit;
         assert!(intent(&t, &reg).unwrap_err().contains("limit price"));
+    }
+
+    #[test]
+    fn the_key_store_is_read_once_per_account() {
+        let mut h = HlState::new(AgentKeyStore::memory());
+        assert!(!should_load_key(false, &h, "testnet:0xa"), "no agent, nothing to load");
+        assert!(should_load_key(true, &h, "testnet:0xa"));
+        h.key_tried = Some("testnet:0xa".into());
+        assert!(!should_load_key(true, &h, "testnet:0xa"), "found nothing once: not every frame");
+        assert!(should_load_key(true, &h, "testnet:0xb"), "another account is read");
+        h.key_loading = true;
+        assert!(!should_load_key(true, &h, "testnet:0xb"));
     }
 
     #[test]
