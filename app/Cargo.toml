@@ -13,6 +13,7 @@ webgl = ["eframe/wgpu"]
 [dependencies]
 tr-core.workspace = true
 tr-broker.workspace = true
+tr-hl.workspace = true
 tr-congress.workspace = true
 tr-data.workspace = true
 tr-chart.workspace = true
@@ -23,6 +24,7 @@ serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 futures = "0.3"
+zeroize = "1"
 egui = { version = "0.36", default-features = false }
 eframe = { version = "0.36", default-features = false, features = ["wgpu_no_default_features", "wayland", "x11"] }
 tr-macos.workspace = true

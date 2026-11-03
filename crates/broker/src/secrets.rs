@@ -246,20 +246,32 @@ mod keychain {
     const NOT_FOUND: i32 = -25300;
 
     pub fn get(service: &str) -> Result<Option<String>> {
-        match get_generic_password(service, KEYCHAIN_ACCOUNT) {
+        get_item(service, KEYCHAIN_ACCOUNT)
+    }
+
+    pub fn set(service: &str, value: &str) -> Result<()> {
+        set_item(service, KEYCHAIN_ACCOUNT, value)
+    }
+
+    pub fn delete(service: &str) -> Result<()> {
+        delete_item(service, KEYCHAIN_ACCOUNT)
+    }
+
+    pub fn get_item(service: &str, account: &str) -> Result<Option<String>> {
+        match get_generic_password(service, account) {
             Ok(bytes) => Ok(Some(String::from_utf8(bytes).context("Keychain item is not UTF-8")?)),
             Err(e) if e.code() == NOT_FOUND => Ok(None),
             Err(e) => Err(anyhow::anyhow!("reading the Keychain: {e}")),
         }
     }
 
-    pub fn set(service: &str, value: &str) -> Result<()> {
-        set_generic_password(service, KEYCHAIN_ACCOUNT, value.as_bytes())
+    pub fn set_item(service: &str, account: &str, value: &str) -> Result<()> {
+        set_generic_password(service, account, value.as_bytes())
             .map_err(|e| anyhow::anyhow!("writing the Keychain: {e}"))
     }
 
-    pub fn delete(service: &str) -> Result<()> {
-        match delete_generic_password(service, KEYCHAIN_ACCOUNT) {
+    pub fn delete_item(service: &str, account: &str) -> Result<()> {
+        match delete_generic_password(service, account) {
             Err(e) if e.code() != NOT_FOUND => Err(anyhow::anyhow!("deleting from the Keychain: {e}")),
             _ => Ok(()),
         }
@@ -278,6 +290,194 @@ mod keychain {
     }
     pub fn delete(_: &str) -> Result<()> {
         bail!("the Keychain is only available on macOS")
+    }
+    #[allow(dead_code)]
+    pub fn get_item(_: &str, _: &str) -> Result<Option<String>> {
+        bail!("the Keychain is only available on macOS")
+    }
+    #[allow(dead_code)]
+    pub fn set_item(_: &str, _: &str, _: &str) -> Result<()> {
+        bail!("the Keychain is only available on macOS")
+    }
+    #[allow(dead_code)]
+    pub fn delete_item(_: &str, _: &str) -> Result<()> {
+        bail!("the Keychain is only available on macOS")
+    }
+}
+
+// ---- Hyperliquid agent keys ----------------------------------------------------------------
+
+/// The Keychain service (and Secret Service attribute) for Hyperliquid agent keys, apart
+/// from the SnapTrade item.
+pub const HL_KEYCHAIN_SERVICE: &str = "terminal.hyperliquid";
+
+/// Where Hyperliquid agent (API wallet) keys live: the macOS Keychain, the Linux Secret
+/// Service, or memory (the browser's session-only keys). Never a file: without a system
+/// secret store the key has nowhere safe to go, so Hyperliquid trading stays off.
+///
+/// Items are named by account, `testnet:<master address>`. Values are the key's hex; this
+/// type hands them back in buffers that are wiped when dropped, and never logs them.
+#[derive(Clone)]
+pub struct AgentKeyStore {
+    backend: KeyBackend,
+}
+
+#[derive(Clone)]
+enum KeyBackend {
+    Keychain,
+    SecretService,
+    Memory(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, zeroize::Zeroizing<String>>>>),
+    Unavailable(String),
+}
+
+impl fmt::Debug for AgentKeyStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+impl AgentKeyStore {
+    /// The system store for this platform, or why there is none.
+    pub fn platform() -> Self {
+        let backend = if cfg!(target_os = "macos") {
+            KeyBackend::Keychain
+        } else if cfg!(target_os = "linux") {
+            KeyBackend::SecretService
+        } else {
+            KeyBackend::Unavailable(
+                "Hyperliquid trading keys need the macOS Keychain or a Linux Secret Service, and this platform has neither in this build."
+                    .into(),
+            )
+        };
+        Self { backend }
+    }
+
+    /// Keys held only while the app runs (lost on quit or reload).
+    pub fn memory() -> Self {
+        Self { backend: KeyBackend::Memory(Default::default()) }
+    }
+
+    pub fn unavailable(why: impl Into<String>) -> Self {
+        Self { backend: KeyBackend::Unavailable(why.into()) }
+    }
+
+    pub fn describe(&self) -> String {
+        match &self.backend {
+            KeyBackend::Keychain => format!("macOS Keychain ({HL_KEYCHAIN_SERVICE})"),
+            KeyBackend::SecretService => format!("the Secret Service keyring ({HL_KEYCHAIN_SERVICE})"),
+            KeyBackend::Memory(_) => "memory only (gone when Terminal closes)".into(),
+            KeyBackend::Unavailable(_) => "no secret store".into(),
+        }
+    }
+
+    pub fn is_memory(&self) -> bool {
+        matches!(self.backend, KeyBackend::Memory(_))
+    }
+
+    /// Whether keys can be stored, and why not. On Linux this asks the Secret Service, so
+    /// call it off the UI thread.
+    pub fn check(&self) -> Result<(), String> {
+        match &self.backend {
+            KeyBackend::Unavailable(why) => Err(why.clone()),
+            KeyBackend::SecretService => secret_service::probe(),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn load(&self, account: &str) -> Result<Option<zeroize::Zeroizing<String>>> {
+        match &self.backend {
+            KeyBackend::Keychain => Ok(keychain::get_item(HL_KEYCHAIN_SERVICE, account)?.map(zeroize::Zeroizing::new)),
+            KeyBackend::SecretService => secret_service::get(account),
+            KeyBackend::Memory(m) => Ok(m.lock().expect("key store").get(account).cloned()),
+            KeyBackend::Unavailable(why) => anyhow::bail!("{why}"),
+        }
+    }
+
+    pub fn save(&self, account: &str, secret: &str) -> Result<()> {
+        match &self.backend {
+            KeyBackend::Keychain => keychain::set_item(HL_KEYCHAIN_SERVICE, account, secret),
+            KeyBackend::SecretService => secret_service::set(account, secret),
+            KeyBackend::Memory(m) => {
+                m.lock().expect("key store").insert(account.into(), zeroize::Zeroizing::new(secret.into()));
+                Ok(())
+            }
+            KeyBackend::Unavailable(why) => anyhow::bail!("{why}"),
+        }
+    }
+
+    /// Remove a key. Removing one that isn't there succeeds.
+    pub fn delete(&self, account: &str) -> Result<()> {
+        match &self.backend {
+            KeyBackend::Keychain => keychain::delete_item(HL_KEYCHAIN_SERVICE, account),
+            KeyBackend::SecretService => secret_service::delete(account),
+            KeyBackend::Memory(m) => {
+                m.lock().expect("key store").remove(account);
+                Ok(())
+            }
+            KeyBackend::Unavailable(_) => Ok(()),
+        }
+    }
+}
+
+/// The Linux Secret Service (GNOME Keyring, KWallet) through `keyring`.
+#[cfg(target_os = "linux")]
+mod secret_service {
+    use anyhow::Result;
+    use keyring::{Entry, Error};
+
+    use super::HL_KEYCHAIN_SERVICE;
+
+    fn unavailable(e: Error) -> String {
+        format!(
+            "No Secret Service keyring is available ({e}). Hyperliquid trading keys are never written to a file, so trading stays off until a keyring (GNOME Keyring or KWallet) is running."
+        )
+    }
+
+    pub fn probe() -> Result<(), String> {
+        let e = Entry::new(HL_KEYCHAIN_SERVICE, "probe").map_err(unavailable)?;
+        match e.get_password() {
+            Ok(_) | Err(Error::NoEntry) => Ok(()),
+            Err(err) => Err(unavailable(err)),
+        }
+    }
+
+    pub fn get(account: &str) -> Result<Option<zeroize::Zeroizing<String>>> {
+        match Entry::new(HL_KEYCHAIN_SERVICE, account)?.get_password() {
+            Ok(s) => Ok(Some(zeroize::Zeroizing::new(s))),
+            Err(Error::NoEntry) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(unavailable(e))),
+        }
+    }
+
+    pub fn set(account: &str, secret: &str) -> Result<()> {
+        Entry::new(HL_KEYCHAIN_SERVICE, account)?.set_password(secret).map_err(|e| anyhow::anyhow!(unavailable(e)))
+    }
+
+    pub fn delete(account: &str) -> Result<()> {
+        match Entry::new(HL_KEYCHAIN_SERVICE, account)?.delete_credential() {
+            Ok(()) | Err(Error::NoEntry) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!(unavailable(e))),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod secret_service {
+    use anyhow::{Result, bail};
+
+    const WHY: &str = "the Secret Service is only used on Linux";
+
+    pub fn probe() -> Result<(), String> {
+        Err(WHY.into())
+    }
+    pub fn get(_: &str) -> Result<Option<zeroize::Zeroizing<String>>> {
+        bail!(WHY)
+    }
+    pub fn set(_: &str, _: &str) -> Result<()> {
+        bail!(WHY)
+    }
+    pub fn delete(_: &str) -> Result<()> {
+        bail!(WHY)
     }
 }
 
@@ -348,6 +548,44 @@ mod tests {
         store.clear().unwrap();
         assert_eq!(store.load().unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_keys_never_fall_back_to_a_file() {
+        let none = AgentKeyStore::unavailable("no keyring here");
+        assert_eq!(none.check(), Err("no keyring here".into()));
+        assert!(none.save("testnet:0xabc", "secret").is_err(), "refused, not written anywhere");
+        assert!(none.load("testnet:0xabc").is_err());
+        assert!(none.delete("testnet:0xabc").is_ok());
+        let platform = AgentKeyStore::platform();
+        if cfg!(target_os = "macos") {
+            assert!(platform.describe().contains("Keychain"));
+        } else if cfg!(target_os = "linux") {
+            assert!(platform.describe().contains("Secret Service"));
+        } else {
+            assert!(platform.check().is_err(), "other platforms have no store, so trading stays off");
+        }
+        let mem = AgentKeyStore::memory();
+        mem.save("testnet:0xabc", "0x11").unwrap();
+        assert_eq!(mem.load("testnet:0xabc").unwrap().as_deref().map(String::as_str), Some("0x11"));
+        mem.delete("testnet:0xabc").unwrap();
+        assert_eq!(mem.load("testnet:0xabc").unwrap(), None);
+        assert!(!format!("{mem:?}").contains("0x11"));
+    }
+
+    /// Writes a throwaway agent key to the login Keychain, so it runs only when asked:
+    /// `cargo test -p tr-broker -- --ignored agent_key`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes to the login Keychain"]
+    fn agent_key_round_trips_through_the_keychain() {
+        let store = AgentKeyStore::platform();
+        let account = format!("test:{}", std::process::id());
+        store.save(&account, "0x00").unwrap();
+        assert_eq!(store.load(&account).unwrap().as_deref().map(String::as_str), Some("0x00"));
+        store.delete(&account).unwrap();
+        assert_eq!(store.load(&account).unwrap(), None);
+        store.delete(&account).unwrap();
     }
 
     /// Writes throwaway items (dummy credentials) to the login Keychain, so it runs only when

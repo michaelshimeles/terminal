@@ -210,6 +210,12 @@ fn approve_agent_matches_python_sdk() {
     assert_eq!(sign_approve_agent(&main, &a).unwrap(), want);
     assert_eq!(format!("{:#x}", main.address()), "0x14791697260e4c9a71f18484c9f997b308e59325");
     assert_eq!(recover_approve_agent(&a, &want).unwrap(), main.address());
+    // A wallet's r ‖ s ‖ v hex (as eth_signTypedData_v4 returns it) reads as the same signature.
+    let rsv = format!("0x{:0>64}{:0>64}{:02x}", &want.r[2..], &want.s[2..], want.v);
+    assert_eq!(WireSignature::from_rsv_hex(&rsv).unwrap(), want);
+    let zero_one = format!("{}{:02x}", &rsv[..rsv.len() - 2], want.v - 27);
+    assert_eq!(WireSignature::from_rsv_hex(&zero_one).unwrap(), want, "v as 0/1");
+    assert!(WireSignature::from_rsv_hex("0x1234").is_err());
     // The same fields addressed to mainnet are refused rather than signed.
     let mainnet = ApproveAgentAction { hyperliquid_chain: "Mainnet".into(), ..a.clone() };
     assert!(sign_approve_agent(&main, &mainnet).is_err());

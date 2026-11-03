@@ -43,6 +43,8 @@ pub enum PortAction {
         account: String,
         key: String,
     },
+    /// The Hyperliquid kill switch (`KILL`).
+    Kill,
 }
 
 // ---- formatting ---------------------------------------------------------------------------
@@ -294,6 +296,7 @@ pub fn portfolio(
     b: &BrokerState,
     demo: Option<&Portfolio>,
     quotes: &HashMap<String, Quote>,
+    testnet: &HashMap<String, f64>,
 ) -> Vec<PortAction> {
     let mut out = Vec::new();
     toolbar(ui, pane, b, demo, &mut out);
@@ -303,7 +306,8 @@ pub fn portfolio(
         None => (b.mode(), b.portfolio.as_deref(), b.error.as_ref()),
     };
     match (mode, pf) {
-        (BrokerMode::Setup, _) => setup_screen(ui, b, &mut out),
+        // Without SnapTrade the panes still show a Hyperliquid account.
+        (BrokerMode::Setup, pf) if pf.is_none_or(|p| p.accounts.is_empty()) => setup_screen(ui, b, &mut out),
         (_, None) if b.loading => {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0));
@@ -327,7 +331,7 @@ pub fn portfolio(
             if pane.account.as_ref().is_some_and(|a| pf.account(a).is_none()) {
                 pane.account = None;
             }
-            let price_of = |p: &Position| b.live_price(quotes, p);
+            let price_of = |p: &Position| super::broker::live_price(quotes, testnet, p);
             match pane.view {
                 PortView::Summary => {
                     egui::ScrollArea::vertical()
@@ -729,16 +733,27 @@ fn position_row(
         (None, _) => resp.on_hover_text("Not available as a terminal market key"),
     };
     if let Some(k) = &key {
-        let tradable = matches!(p.kind, tr_broker::InstrumentKind::Stock | tr_broker::InstrumentKind::Etf)
-            && matches!(tr_data::security(k).class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf);
+        // Hyperliquid perps trade on their own account; a short closes too (reduce-only).
+        let perp = super::hl::is_hl_account(&p.account_id) && p.market.is_some();
+        let tradable = perp
+            || (matches!(p.kind, tr_broker::InstrumentKind::Stock | tr_broker::InstrumentKind::Etf)
+                && matches!(tr_data::security(k).class, tr_core::AssetClass::Equity | tr_core::AssetClass::Etf));
         let mut pills = Vec::new();
         if tradable {
             pills.extend(widgets::buy_sell_pills());
-            if p.units > 0.0 {
+            if p.units > 0.0 || (perp && p.units != 0.0) {
                 pills.push(("Close", theme::control(), text()));
             }
         }
-        let tips = ["Buy more (⇧B)", "Sell (⇧S)", "Close: sell the whole position"];
+        let tips = if perp {
+            [
+                "Buy (Hyperliquid testnet)",
+                "Sell (Hyperliquid testnet)",
+                "Close: a reduce-only market order for all of it",
+            ]
+        } else {
+            ["Buy more (⇧B)", "Sell (⇧S)", "Close: sell the whole position"]
+        };
         let pill = widgets::row_pills(ui, r, ("pos-pills", &p.account_id, &p.symbol), &pills, &tips);
         match pill {
             Some(0) => out.push(PortAction::Trade {
@@ -758,7 +773,13 @@ fn position_row(
             None => {}
         }
         resp.context_menu(|ui| {
-            if p.kind != tr_broker::InstrumentKind::Option {
+            if perp {
+                if ui.button(format!("Close Position ({} {})…", qty(p.units), p.short_label())).clicked() {
+                    out.push(PortAction::ClosePosition { account: p.account_id.clone(), key: k.clone() });
+                    ui.close();
+                }
+                ui.separator();
+            } else if p.kind != tr_broker::InstrumentKind::Option {
                 trade_items(ui, k, Some(&p.account_id), Some(p.units), out);
                 if tradable && p.units > 0.0 {
                     if ui.button(format!("Close Position ({} {})…", qty(p.units), p.short_label())).clicked() {
@@ -943,6 +964,19 @@ fn orders(ui: &mut Ui, pane: &mut PortfolioPane, pf: &Portfolio, out: &mut Vec<P
         let sel = Some(usize::from(!pane.open_only));
         if let Some(i) = widgets::segmented(ui, "port-orders", &["Open", "All"], sel, 20.0) {
             pane.open_only = i == 0;
+        }
+        if pf.accounts.iter().any(|a| super::hl::is_hl_account(&a.id)) {
+            let b = egui::Button::new(RichText::new("KILL").font(mono(11.5)).strong().color(Color32::WHITE))
+                .fill(theme::down());
+            if ui
+                .add(b)
+                .on_hover_text(
+                    "Kill switch: cancel every open Hyperliquid testnet order and turn Hyperliquid orders off",
+                )
+                .clicked()
+            {
+                out.push(PortAction::Kill);
+            }
         }
         if pf.demo {
             note(ui, "Demo orders · hover an open order to cancel it");
@@ -1183,13 +1217,13 @@ mod tests {
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, &HashMap::new());
             });
             out.textures_delta.clear();
             pane.account = Some("sim-ira".into());
             pane.symbol = Some("SPY US Equity".into());
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+                let _ = portfolio(ui, &mut pane, &b, None, &quotes, &HashMap::new());
             });
             out.textures_delta.clear();
         }
@@ -1198,7 +1232,7 @@ mod tests {
         for view in PortView::ALL {
             let mut pane = PortfolioPane::new(view);
             let mut out = ctx.run_ui(Default::default(), |ui| {
-                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes);
+                let _ = portfolio(ui, &mut pane, &b, Some(&demo), &quotes, &HashMap::new());
             });
             out.textures_delta.clear();
         }
@@ -1206,7 +1240,7 @@ mod tests {
         b.simulate = false;
         let mut pane = PortfolioPane::new(PortView::Summary);
         let mut out = ctx.run_ui(Default::default(), |ui| {
-            let _ = portfolio(ui, &mut pane, &b, None, &quotes);
+            let _ = portfolio(ui, &mut pane, &b, None, &quotes, &HashMap::new());
         });
         out.textures_delta.clear();
     }

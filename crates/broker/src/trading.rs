@@ -685,6 +685,7 @@ pub fn simulate_place(pf: &mut Portfolio, preview: &OrderPreview, now: DateTime<
         placed: Some(now),
         updated: Some(now),
         underlying: None,
+        market: None,
     };
     if let Some(px) = fill {
         let signed = if req.side == Side::Buy { units } else { -units };
@@ -715,6 +716,7 @@ fn apply_fill(pf: &mut Portfolio, account: &str, symbol: &str, signed: f64, px: 
             currency: "USD".into(),
             cash_equivalent: false,
             underlying: None,
+            market: None,
         });
         return;
     };

@@ -134,6 +134,17 @@ impl TerminalApp {
             p.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, theme::down()));
         }
         x = badge.right() + 10.0;
+        // A Hyperliquid account in LIVE is on testnet: say so next to the badge.
+        if live_mode && self.hl_master().is_some() {
+            let t = p.layout_no_wrap("TESTNET".into(), mono(11.0), Color32::BLACK);
+            let pill = Rect::from_min_size(pos2(x - 4.0, cy - 10.0), vec2(t.size().x + 18.0, 20.0));
+            p.rect_filled(pill, 10.0, amber());
+            p.galley(pill.center() - t.size() / 2.0, t, Color32::BLACK);
+            ui.interact(pill, Id::new("hl-testnet-badge"), Sense::hover()).on_hover_text(
+                "The Hyperliquid account in LIVE is on testnet (test funds). This build cannot reach mainnet.",
+            );
+            x = pill.right() + 10.0;
+        }
 
         // Right-hand cluster, laid out from the right edge: one-line clock (UTC on hover).
         let now = chrono::Local::now();
@@ -653,7 +664,7 @@ impl TerminalApp {
             });
             let pf = self.shown_portfolio();
             let value_badge = pf.filter(|p| !p.accounts.is_empty()).map(|p| {
-                let t = p.totals(None, |pos| self.broker.live_price(&self.quotes, pos));
+                let t = p.totals(None, |pos| super::broker::live_price(&self.quotes, &self.hl.mids, pos));
                 compact_money(t.value)
             });
             let open_orders = pf.map_or(0, |p| p.orders.iter().filter(|o| o.is_open()).count());

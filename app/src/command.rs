@@ -277,6 +277,8 @@ pub enum Function {
     Trade(TradeArgs),
     /// Switch between the demo account and live accounts (`DEMO`, `MODE LIVE`); `true` = live.
     AccountMode(bool),
+    /// `KILL`: cancel every open Hyperliquid order and turn Hyperliquid orders off (confirmed).
+    Kill,
     /// `AAPL PERP`: open the HIP-3 perp linked to a security. Alone, or on a perp, it switches
     /// the focused pane between the two.
     Perp,
@@ -363,6 +365,7 @@ fn parse_function(head: &str, rest: &[&str]) -> Option<Function> {
         "BUY" => Function::Trade(TradeArgs::parse(Some(true), rest)?),
         "SELL" => Function::Trade(TradeArgs::parse(Some(false), rest)?),
         "TRADE" | "TICKET" | "EMSX" => Function::Trade(TradeArgs::parse(None, rest)?),
+        "KILL" if rest.is_empty() => Function::Kill,
         "DEMO" | "PAPER" if rest.is_empty() => Function::AccountMode(false),
         "MODE" => match words().join(" ").as_str() {
             "DEMO" | "PAPER" => Function::AccountMode(false),
@@ -551,6 +554,9 @@ fn describe(f: &Function) -> String {
         }
         Function::AccountMode(false) => "Switch to the DEMO account (paper trading)".into(),
         Function::AccountMode(true) => "Switch to LIVE brokerage accounts (asks first)".into(),
+        Function::Kill => {
+            "Kill switch: cancel every open Hyperliquid testnet order, then turn Hyperliquid orders off".into()
+        }
         Function::Perp => "Switch between the security and its HIP-3 perp (PERP · HL xyz)".into(),
     }
 }
@@ -712,6 +718,10 @@ mod tests {
         assert_eq!(t("SELL ALL TSLA 5"), None);
         assert_eq!(parse("DEMO"), Some(Command::Function(Function::AccountMode(false))));
         assert_eq!(parse("MODE LIVE"), Some(Command::Function(Function::AccountMode(true))));
+        assert_eq!(parse("KILL"), Some(Command::Function(Function::Kill)));
+        assert_eq!(parse("kill"), Some(Command::Function(Function::Kill)));
+        let perp = t("BUY xyz:AAPL 0.5 @226.4").unwrap();
+        assert_eq!((perp.symbol.as_deref(), perp.units, perp.limit), (Some("xyz:AAPL"), Some(0.5), Some(226.4)));
     }
 
     #[test]

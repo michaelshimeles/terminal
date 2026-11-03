@@ -216,6 +216,44 @@ pub struct TradingPrefs {
     pub max_order_value: Option<f64>,
     /// Account the ticket preselects.
     pub default_account: Option<String>,
+    /// Hyperliquid (testnet only in this build), with its own opt-in.
+    pub hl: HlPrefs,
+}
+
+/// Hyperliquid order entry. Separate from SnapTrade's `enabled`: turning one on never turns on
+/// the other. Holds only public data: the agent's private key lives in the OS secret store.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HlPrefs {
+    /// Orders may be signed and sent (after the acknowledgement dialog). Off by default, and
+    /// turned off again by the kill switch.
+    pub enabled: bool,
+    /// Always testnet: any stored value (`"mainnet"` included) reads as testnet.
+    pub network: tr_hl::Network,
+    /// The account (master address) shown in the portfolio panes, read-only until an agent
+    /// is approved.
+    pub master: Option<String>,
+    /// The approved agent's public details (never its key).
+    pub agent: Option<HlAgent>,
+    /// Keep a `scheduleCancel` about a minute ahead while the app is open, so open orders are
+    /// cancelled if Terminal disappears. Opt-in: it cancels orders placed elsewhere too.
+    pub dead_mans_switch: bool,
+    /// Web only: keep the agent key in this browser (encrypted with a key the page can't
+    /// export) instead of only for the session.
+    pub remember_on_browser: bool,
+}
+
+/// An approved API wallet, as Terminal remembers it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HlAgent {
+    /// Lower-case `0x…`.
+    pub address: String,
+    /// `terminal-<device> valid_until <ms>`.
+    pub name: String,
+    /// Expiry, Unix milliseconds.
+    pub valid_until: u64,
+    #[serde(default)]
+    pub network: tr_hl::Network,
 }
 
 /// Every rebindable action.
@@ -843,6 +881,28 @@ mod tests {
         p.save(&path).unwrap();
         assert_eq!(Prefs::load(&path), p);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hyperliquid_prefs_never_select_mainnet() {
+        // A hand-edited or future file asking for mainnet still loads as testnet, and the rest
+        // of the preferences survive.
+        let json = r#"{"appearance":{"theme":"Nord"},"trading":{"enabled":true,"hl":{"enabled":true,"network":"mainnet",
+            "master":"0xabc","agent":{"address":"0xdef","name":"terminal-mac valid_until 1","valid_until":1,"network":"Mainnet"}}}}"#;
+        let p: Prefs = serde_json::from_str(json).unwrap();
+        assert_eq!(p.trading.hl.network, tr_hl::Network::Testnet);
+        assert_eq!(p.trading.hl.agent.as_ref().unwrap().network, tr_hl::Network::Testnet);
+        assert!(p.trading.hl.enabled && p.trading.enabled);
+        assert_eq!(p.appearance.theme, "Nord", "the rest of the file still loads");
+        for v in ["\"MAINNET\"", "\"a\"", "7", "null", "[]"] {
+            let p: Prefs = serde_json::from_str(&format!(r#"{{"trading":{{"hl":{{"network":{v}}}}}}}"#)).unwrap();
+            assert_eq!(p.trading.hl.network, tr_hl::Network::Testnet, "{v}");
+        }
+        // Off by default, opt-in switches off, nothing secret in the file.
+        let d = Prefs::default().trading.hl;
+        assert!(!d.enabled && !d.dead_mans_switch && !d.remember_on_browser && d.agent.is_none());
+        let saved = serde_json::to_string(&p).unwrap();
+        assert!(saved.contains(r#""network":"Testnet""#) && !saved.contains("ainnet"), "{saved}");
     }
 
     #[test]

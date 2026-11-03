@@ -44,6 +44,18 @@ impl WireSignature {
         Self { r: format!("{:#x}", sig.r()), s: format!("{:#x}", sig.s()), v: 27 + u8::from(sig.v()) }
     }
 
+    /// From a wallet's 65-byte `0x` r ‖ s ‖ v hex (`eth_signTypedData_v4`); `v` may be 0/1.
+    pub fn from_rsv_hex(hex: &str) -> Result<Self> {
+        let h = hex.trim().trim_start_matches("0x");
+        ensure!(
+            h.len() == 130 && h.chars().all(|c| c.is_ascii_hexdigit()),
+            "the wallet returned a malformed signature"
+        );
+        let v = u8::from_str_radix(&h[128..130], 16)?;
+        let num = |s: &str| U256::from_str_radix(s, 16).map(|n| format!("{n:#x}"));
+        Ok(Self { r: num(&h[..64])?, s: num(&h[64..128])?, v: if v < 27 { v + 27 } else { v } })
+    }
+
     fn to_alloy(&self) -> Result<Signature> {
         let num = |s: &str| U256::from_str_radix(s.trim_start_matches("0x"), 16).context("signature is not hex");
         ensure!(self.v == 27 || self.v == 28, "signature v must be 27 or 28");

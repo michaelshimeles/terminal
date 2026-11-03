@@ -154,15 +154,27 @@ impl BrokerState {
             BrokerMode::Setup
         }
     }
+}
 
-    /// The terminal's own quote for a position, when it maps onto a market key (options are
-    /// never repriced from their underlying).
-    pub fn live_price(&self, quotes: &std::collections::HashMap<String, tr_data::Quote>, p: &Position) -> Option<f64> {
-        if p.kind == tr_broker::InstrumentKind::Option {
-            return None;
-        }
-        quotes.get(&p.market_key()?).map(|q| q.last).filter(|x| x.is_finite() && *x > 0.0)
+/// The terminal's own price for a position, from the network the position is on: testnet
+/// mids for Hyperliquid testnet rows, the Terminal server's (mainnet) quotes for everything
+/// else. Both use the same market keys (`xyz:AAPL`), so a row never falls back to the other
+/// map. Options are never repriced from their underlying.
+pub fn live_price(
+    quotes: &std::collections::HashMap<String, tr_data::Quote>,
+    testnet: &std::collections::HashMap<String, f64>,
+    p: &Position,
+) -> Option<f64> {
+    if p.kind == tr_broker::InstrumentKind::Option {
+        return None;
     }
+    let key = p.market_key()?;
+    let px = if super::hl::is_testnet_account(&p.account_id) {
+        testnet.get(&key).copied()
+    } else {
+        quotes.get(&key).map(|q| q.last)
+    };
+    px.filter(|x| x.is_finite() && *x > 0.0)
 }
 
 /// Open a URL or path with the system handler.
@@ -229,10 +241,13 @@ impl TerminalApp {
         if let Some(pf) = self.shown_portfolio()
             && self.broker.last_quotes.is_none_or(|t| t.elapsed() > Duration::from_secs(20))
         {
+            // Testnet rows price from testnet mids (the Hyperliquid stream), never the server.
             let mut keys: Vec<String> = pf
                 .positions
                 .iter()
-                .filter(|p| p.kind != tr_broker::InstrumentKind::Option)
+                .filter(|p| {
+                    p.kind != tr_broker::InstrumentKind::Option && !super::hl::is_testnet_account(&p.account_id)
+                })
                 .filter_map(Position::market_key)
                 .collect();
             keys.sort();
@@ -808,6 +823,42 @@ mod tests {
         let b = new_user_id();
         assert!(a.starts_with("terminal-") && a.len() == "terminal-".len() + 16);
         assert_ne!(a, b);
+    }
+
+    /// A Hyperliquid testnet row and a mainnet row on the same key (`xyz:AAPL`) with mainnet
+    /// and testnet updates arriving interleaved: each reads only its own network's price.
+    #[test]
+    fn testnet_rows_never_read_mainnet_quotes() {
+        let quote =
+            |last: f64| tr_data::Quote { symbol: "xyz:AAPL".into(), last, prev_close: last, ts: 0, spark: Vec::new() };
+        let row = |account: &str| Position {
+            account_id: account.into(),
+            symbol: "xyz:AAPL".into(),
+            description: String::new(),
+            kind: tr_broker::InstrumentKind::Future,
+            units: 1.0,
+            price: None,
+            cost_basis: Some(300.0),
+            multiplier: 1.0,
+            currency: "USD".into(),
+            cash_equivalent: false,
+            underlying: None,
+            market: Some("xyz:AAPL".into()),
+        };
+        let testnet = row("hl:testnet:0x00000000000000000000000000000000000f107e");
+        let mainnet = row("mainnet-account");
+        let mut quotes = std::collections::HashMap::new();
+        let mut mids = std::collections::HashMap::new();
+        for (main, test) in [(230.0, 322.0), (231.0, 321.5), (229.5, 323.0)] {
+            quotes.insert("xyz:AAPL".to_string(), quote(main));
+            assert_eq!(live_price(&quotes, &mids, &testnet).is_some(), mids.contains_key("xyz:AAPL"));
+            mids.insert("xyz:AAPL".to_string(), test);
+            assert_eq!(live_price(&quotes, &mids, &testnet), Some(test), "the testnet row reads the testnet mid");
+            assert_eq!(live_price(&quotes, &mids, &mainnet), Some(main), "the mainnet row reads the gateway quote");
+        }
+        // With only the other network's price, neither row borrows it.
+        assert_eq!(live_price(&quotes, &Default::default(), &testnet), None);
+        assert_eq!(live_price(&Default::default(), &mids, &mainnet), None);
     }
 
     #[test]
