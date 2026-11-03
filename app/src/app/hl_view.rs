@@ -11,7 +11,7 @@ use tr_hl::rounding::to_wire;
 use tr_hl::trader::{EXPIRES_AFTER_MS, OrderKind};
 
 use super::TerminalApp;
-use super::hl::{HlConfirm, HlKind, intent, is_hl_account, resolve_coin, settle_size};
+use super::hl::{HlConfirm, HlKind, intent, is_hl_account, market_edited, resolve_coin, settle_size};
 use super::portfolio_view::{money, price, qty};
 use super::settings_view::SettingsCmd;
 use super::trading::TicketAct;
@@ -129,11 +129,7 @@ impl TerminalApp {
             );
             if r.changed() {
                 t.error = None;
-                // If the size came from dollars, size the amount again for the new market.
-                if let Some(d) = t.hl.from_dollars.take() {
-                    t.dollars = true;
-                    t.qty = to_wire(d).unwrap_or_default();
-                }
+                market_edited(t);
             }
             match ctx.mid {
                 Some(m) => {
@@ -182,7 +178,7 @@ impl TerminalApp {
                 }
             }
             // `BUY xyz:AAPL $50` gets its size from the testnet mid. It is never 50 contracts.
-            unsized_note = settle_size(t, ctx.mid, asset.as_ref());
+            unsized_note = reg.as_ref().and_then(|r| settle_size(t, r, ctx.mid, asset.as_ref()));
             if let (false, Some(m), Ok(q)) = (t.dollars, ctx.mid, t.qty.trim().parse::<f64>()) {
                 let from = t.hl.from_dollars.map_or(String::new(), |d| format!(" (from ${d}, at the testnet mid)"));
                 ui.label(RichText::new(format!("≈ {}{from}", money(q * m, "USD"))).font(mono(11.5)).color(muted()));
@@ -315,9 +311,11 @@ impl TerminalApp {
         }
 
         ui.separator();
+        // Value it with the market `intent` resolved now, not the one read before an edit.
+        let hl = &self.hl;
         let planned = reg.as_ref().map(|r| {
             intent(t, r).and_then(|i| {
-                tr_hl::trader::plan_order(r, &i, &ctx, &tr_hl::actions::cloid(1)).map_err(|e| e.to_string())
+                tr_hl::trader::plan_order(r, &i, &hl.ctx(&i.coin), &tr_hl::actions::cloid(1)).map_err(|e| e.to_string())
             })
         });
         let row = |ui: &mut Ui, k: &str, v: String, strong: bool| {

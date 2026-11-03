@@ -42,10 +42,10 @@ const FOLLOW_UP_MAX: Duration = Duration::from_millis(
 );
 
 /// When signed actions may run. Orders, modifies and leverage changes take turns, one at a
-/// time in the order sent. Cancels and the dead man's switch never wait for them. KILL never
-/// waits either. It cancels everything open at once, refuses any order confirmed before it
-/// that hasn't been signed, even one still reading the market, and sweeps again once an
-/// order that was already being sent can no longer land.
+/// time in the order sent. Cancels never wait for them, and dead man's switch changes take
+/// turns of their own. KILL never waits either. It cancels everything open at once, refuses
+/// any order confirmed before it that hasn't been signed, even one still reading the market,
+/// and sweeps again once an order that was already being sent can no longer land.
 pub struct Turns {
     turn: tokio::sync::Mutex<()>,
     /// The newest kill switch seen. `place` refuses an order confirmed before it that isn't
@@ -55,6 +55,16 @@ pub struct Turns {
     sending: std::sync::atomic::AtomicBool,
     /// An order sent without a clear answer may still land on Hyperliquid until then (ms).
     may_land_until: AtomicU64,
+    /// Dead man's switch changes go out one at a time.
+    schedule: tokio::sync::Mutex<Schedule>,
+}
+
+#[derive(Default)]
+struct Schedule {
+    /// The app's id for the newest change sent.
+    newest: u64,
+    /// A change sent without a clear answer may still land until then (ms).
+    may_land_until: u64,
 }
 
 impl Default for Turns {
@@ -64,6 +74,7 @@ impl Default for Turns {
             kills: tokio::sync::watch::Sender::new(0),
             sending: Default::default(),
             may_land_until: AtomicU64::new(0),
+            schedule: Default::default(),
         }
     }
 }
@@ -133,10 +144,35 @@ impl Turns {
         outcome
     }
 
-    /// A cancel or the dead man's switch. These only take risk off, so they never wait for an
-    /// order. Hyperliquid accepts nonces that arrive out of order.
+    /// A cancel. It only takes risk off, so it never waits for an order. Hyperliquid accepts
+    /// nonces that arrive out of order.
     pub async fn cancel(&self, go: impl Future<Output = Outcome>) -> Outcome {
         go.await
+    }
+
+    /// A dead man's switch change (`scheduleCancel`), where `seq` is the app's id for it.
+    /// Changes go out one at a time, in the order the app made them, and never wait for an
+    /// order. The worker drops one that reaches it after a newer one went out (`None`).
+    /// After a change whose send got no clear answer, the next waits until that one can no
+    /// longer land, so an old clear never removes a newer schedule.
+    pub async fn schedule<GF>(&self, seq: u64, go: impl FnOnce() -> GF) -> Option<Outcome>
+    where
+        GF: Future<Output = (Outcome, Option<u64>)>,
+    {
+        let mut s = self.schedule.lock().await;
+        if seq <= s.newest {
+            return None;
+        }
+        s.newest = seq;
+        let wait = s.may_land_until.saturating_sub(now_ms());
+        if wait > 0 {
+            rt::sleep(Duration::from_millis(wait).min(FOLLOW_UP_MAX)).await;
+        }
+        let (outcome, may_land_until) = go().await;
+        if let Some(t) = may_land_until {
+            s.may_land_until = s.may_land_until.max(t);
+        }
+        Some(outcome)
     }
 
     /// The kill switch. `sweep` reads every open order and cancels it; `report` gets each
@@ -476,11 +512,11 @@ pub async fn handle(req: HlRequest, send: impl Fn(HlResponse) + Clone + 'static)
                         .await
                 }
                 HlAct::ScheduleCancel(at) => {
-                    turns
-                        .cancel(async {
-                            send_signed(c, k, trader::sign_schedule_cancel(k, n, at, now_ms()).map(|s| vec![s])).await.0
-                        })
-                        .await
+                    let go = || send_signed(c, k, trader::sign_schedule_cancel(k, n, at, now_ms()).map(|s| vec![s]));
+                    match turns.schedule(id, go).await {
+                        Some(outcome) => outcome,
+                        None => return, // the app has since made a newer change
+                    }
                 }
                 HlAct::CancelAll { registry } => {
                     return turns.kill(kill_epoch, || kill_all(c, k, n, &user, &registry), done).await;
@@ -826,6 +862,84 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let o = tokio::time::timeout(QUICK, turns.cancel(async { ok() })).await;
         assert_eq!(o.expect("a cancel waited behind an order"), ok());
+    }
+
+    /// Greptile #37 (f1ff1b3): dead man's switch changes ran side by side. Turning the switch
+    /// off and on again while the clear was slow let the new schedule go out first, and the
+    /// old clear could then land after it and remove it.
+    #[tokio::test]
+    async fn dead_mans_switch_changes_go_out_in_the_order_they_were_made() {
+        let turns = Arc::new(Turns::default());
+        // An order stuck reading the market holds the order turn. Schedule changes don't wait.
+        let _order = tokio::spawn({
+            let turns = turns.clone();
+            async move {
+                let read = std::future::pending::<Result<(), String>>();
+                turns.place(Some(0), read, |()| async { (ok(), None) }).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+        let clear = tokio::spawn({
+            let (turns, sent) = (turns.clone(), sent.clone());
+            async move {
+                let go = || async move {
+                    sent.lock().unwrap().push("clear");
+                    let _ = answered.await; // the answer is slow
+                    (ok(), None)
+                };
+                turns.schedule(1, go).await
+            }
+        });
+        eventually("the clear went out without waiting for the order", || !sent.lock().unwrap().is_empty()).await;
+        let set = tokio::spawn({
+            let (turns, sent) = (turns.clone(), sent.clone());
+            async move {
+                let go = || async move {
+                    sent.lock().unwrap().push("set");
+                    (ok(), None)
+                };
+                turns.schedule(2, go).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*sent.lock().unwrap(), ["clear"], "the new schedule went out before the clear was answered");
+        answer.send(()).unwrap();
+        assert_eq!(tokio::time::timeout(QUICK, clear).await.unwrap().unwrap(), Some(ok()));
+        assert_eq!(tokio::time::timeout(QUICK, set).await.unwrap().unwrap(), Some(ok()));
+        assert_eq!(*sent.lock().unwrap(), ["clear", "set"]);
+    }
+
+    /// A change with no clear answer may still land until its `expiresAfter` passes, so the
+    /// next one waits until then.
+    #[tokio::test]
+    async fn after_a_change_with_no_clear_answer_the_next_waits_until_it_cannot_land() {
+        let turns = Turns::default();
+        let window = 300;
+        let until = now_ms() + window;
+        let clear = turns
+            .schedule(1, || async move { (Outcome::Failed(SendError::Uncertain("timed out".into())), Some(until)) })
+            .await;
+        assert!(matches!(clear, Some(Outcome::Failed(SendError::Uncertain(_)))));
+        let t0 = std::time::Instant::now();
+        assert_eq!(turns.schedule(2, || async { (ok(), None) }).await, Some(ok()));
+        assert!(t0.elapsed() >= Duration::from_millis(window - 20), "sent while the clear could still land");
+    }
+
+    /// The worker runs requests side by side, so an older change can reach it after a newer
+    /// one went out. The worker drops it and never sends it.
+    #[tokio::test]
+    async fn a_dead_mans_switch_change_the_app_has_replaced_is_dropped() {
+        let turns = Turns::default();
+        assert_eq!(turns.schedule(5, || async { (ok(), None) }).await, Some(ok()));
+        let sent = AtomicBool::new(false);
+        let go = || async {
+            sent.store(true, Ordering::SeqCst);
+            (ok(), None)
+        };
+        assert_eq!(turns.schedule(4, go).await, None);
+        assert!(!sent.load(Ordering::SeqCst));
     }
 
     /// An order confirmed before KILL is never signed; one confirmed after it goes ahead.

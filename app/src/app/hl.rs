@@ -450,15 +450,25 @@ fn parse_num(s: &str) -> Option<f64> {
 }
 
 /// A dollar amount on a Hyperliquid ticket, as in `BUY xyz:AAPL $50`, becomes a size at the
-/// testnet mid, rounded down to the market's size step so the order is never worth more than
-/// the amount. Until there is a mid, or when the amount is under one step, it stays a dollar
-/// amount, which [`intent`] refuses. Returns why it isn't a size yet.
-pub fn settle_size(t: &mut super::trading::Ticket, mid: Option<f64>, asset: Option<&Asset>) -> Option<String> {
+/// testnet mid of the market the ticket names, rounded down to that market's size step so the
+/// order is never worth more than the amount. Until there is a mid for that market, or when
+/// the amount is under one step, it stays a dollar amount, which [`intent`] refuses. Returns
+/// why it isn't a size yet.
+pub fn settle_size(
+    t: &mut super::trading::Ticket,
+    reg: &AssetRegistry,
+    mid: Option<f64>,
+    asset: Option<&Asset>,
+) -> Option<String> {
     if !t.dollars {
         return None;
     }
     let amount = parse_num(&t.qty).filter(|a| a.is_finite() && *a > 0.0)?;
     let dollars = tr_hl::rounding::to_wire(amount).unwrap_or_else(|_| format!("{amount:.2}"));
+    // Only the market the ticket names now. The caller may have read `asset` and `mid`
+    // before the user edited the market.
+    let named = resolve_coin(&t.symbol, reg).ok();
+    let asset = asset.filter(|a| named.as_deref() == Some(a.coin.as_str()));
     let (Some(a), Some(mid)) = (asset, mid.filter(|m| m.is_finite() && *m > 0.0)) else {
         return Some(format!("Waiting for the testnet mid to size ${dollars}…"));
     };
@@ -476,6 +486,15 @@ pub fn settle_size(t: &mut super::trading::Ticket, mid: Option<f64>, asset: Opti
     t.dollars = false;
     t.hl.from_dollars = Some(amount);
     None
+}
+
+/// The user edited the ticket's market.
+pub fn market_edited(t: &mut super::trading::Ticket) {
+    // If the size came from dollars, size the amount again for the new market.
+    if let Some(d) = t.hl.from_dollars.take() {
+        t.dollars = true;
+        t.qty = tr_hl::rounding::to_wire(d).unwrap_or_default();
+    }
 }
 
 /// The order a Hyperliquid ticket describes.
@@ -1325,36 +1344,72 @@ mod tests {
         };
         // With no testnet mid yet, the amount stays in dollars and intent() refuses it.
         let mut t = dollars("xyz:INTC", 10.0);
-        let note = settle_size(&mut t, None, Some(&intc));
+        let note = settle_size(&mut t, &reg, None, Some(&intc));
         let e = intent(&t, &reg).expect_err("$10 is never read as 10 contracts");
         assert!(e.contains("$10") && e.contains("dollar"), "{e}");
         assert!(t.dollars);
         assert_eq!(note.as_deref(), Some("Waiting for the testnet mid to size $10…"));
         // At a $2 mid, $10 is 5 contracts.
-        assert_eq!(settle_size(&mut t, Some(2.0), Some(&intc)), None);
+        assert_eq!(settle_size(&mut t, &reg, Some(2.0), Some(&intc)), None);
         assert!(!t.dollars);
         assert_eq!((t.qty.as_str(), t.hl.from_dollars), ("5", Some(10.0)));
         assert_eq!(intent(&t, &reg).unwrap().size, 5.0);
         // Rounded down to the size step (2 decimals), so it is never worth more than $10.
         let mut t = dollars("xyz:INTC", 10.0);
-        settle_size(&mut t, Some(3.0), Some(&intc));
+        settle_size(&mut t, &reg, Some(3.0), Some(&intc));
         assert_eq!(intent(&t, &reg).unwrap().size, 3.33);
         // BTC has five size decimals, so $10 at $76,000 is 0.00013 BTC.
         let btc = reg.get("BTC").unwrap().clone();
         let mut t = dollars("BTC", 10.0);
-        settle_size(&mut t, Some(76_000.0), Some(&btc));
+        settle_size(&mut t, &reg, Some(76_000.0), Some(&btc));
         assert_eq!(intent(&t, &reg).unwrap().size, 0.00013);
         // An amount under one step stays in dollars. It never rounds to zero or turns into units.
         let mut t = dollars("BTC", 0.5);
-        let why = settle_size(&mut t, Some(76_000.0), Some(&btc)).expect("too small");
+        let why = settle_size(&mut t, &reg, Some(76_000.0), Some(&btc)).expect("too small");
         assert!(why.contains("smallest BTC size") && t.dollars, "{why}");
         assert!(intent(&t, &reg).is_err());
         // A size typed in units is left alone.
         let mut t = Ticket::new(2);
         t.symbol = "BTC".into();
         t.qty = "0.001".into();
-        assert_eq!(settle_size(&mut t, Some(76_000.0), Some(&btc)), None);
+        assert_eq!(settle_size(&mut t, &reg, Some(76_000.0), Some(&btc)), None);
         assert_eq!((t.qty.as_str(), t.hl.from_dollars), ("0.001", None));
+    }
+
+    /// Greptile #37 (f1ff1b3): the ticket reads its market at the start of a frame, before an
+    /// edit to the market field, so a dollar amount was sized at the old market's mid. $10 at
+    /// a $2 mid is 5 units, worth $20 on a $4 market.
+    #[test]
+    fn a_dollar_amount_is_sized_for_the_market_the_ticket_names() {
+        use super::super::trading::Ticket;
+        let reg = registry();
+        let intc = reg.get("xyz:INTC").unwrap().clone();
+        let tsla = reg.get("xyz:TSLA").unwrap().clone();
+        let mut t = Ticket::new(1);
+        t.apply(&crate::command::TradeArgs {
+            buy: Some(true),
+            symbol: Some("xyz:INTC".into()),
+            notional: Some(10.0),
+            ..Default::default()
+        });
+        settle_size(&mut t, &reg, Some(2.0), Some(&intc));
+        assert_eq!(t.qty, "5");
+        // The user changes the market, and the amount goes back to dollars.
+        t.symbol = "xyz:TSLA".into();
+        market_edited(&mut t);
+        assert_eq!((t.dollars, t.qty.as_str()), (true, "10"));
+        // This frame still holds INTC's market, read before the edit.
+        let note = settle_size(&mut t, &reg, Some(2.0), Some(&intc));
+        assert!(t.dollars, "sized $10 of TSLA at INTC's mid: {} units", t.qty);
+        assert!(note.is_some_and(|n| n.contains("$10")));
+        // The next frame reads TSLA's market: 10 / 400 is 0.025 (three size decimals).
+        assert_eq!(settle_size(&mut t, &reg, Some(400.0), Some(&tsla)), None);
+        assert_eq!(intent(&t, &reg).unwrap().size, 0.025);
+        // Half-typed, the market names nothing yet, so nothing is sized.
+        market_edited(&mut t);
+        t.symbol = "xyz:TS".into();
+        settle_size(&mut t, &reg, Some(400.0), Some(&tsla));
+        assert!(t.dollars);
     }
 
     #[test]
