@@ -223,7 +223,7 @@ impl Pool {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
@@ -475,7 +475,7 @@ mod tests {
     }
 
     fn book(c: &str) -> SubKey {
-        SubKey::L2Book { coin: c.into() }
+        SubKey::L2Book { coin: c.into(), fast: false }
     }
 
     fn pool(max_connections: usize, max_subscriptions: usize) -> Pool {

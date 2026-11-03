@@ -16,6 +16,9 @@ use tr_proto::{Level, Side, Trade};
 
 use crate::provider::UpstreamEvent;
 
+/// Levels a side in a `fast` l2Book message.
+pub const FAST_BOOK_LEVELS: usize = 5;
+
 /// One upstream subscription, as Hyperliquid identifies it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SubKey {
@@ -23,8 +26,11 @@ pub enum SubKey {
     AllMids {
         dex: String,
     },
+    /// Hyperliquid sends the default book (20 levels a side) about every 5 s, and the `fast` one
+    /// (5 levels a side) about every 0.5 s.
     L2Book {
         coin: String,
+        fast: bool,
     },
     Trades {
         coin: String,
@@ -40,7 +46,8 @@ impl SubKey {
         match self {
             SubKey::AllMids { dex } if dex.is_empty() => json!({ "type": "allMids" }),
             SubKey::AllMids { dex } => json!({ "type": "allMids", "dex": dex }),
-            SubKey::L2Book { coin } => json!({ "type": "l2Book", "coin": coin }),
+            SubKey::L2Book { coin, fast: false } => json!({ "type": "l2Book", "coin": coin }),
+            SubKey::L2Book { coin, fast: true } => json!({ "type": "l2Book", "coin": coin, "fast": true }),
             SubKey::Trades { coin } => json!({ "type": "trades", "coin": coin }),
             SubKey::Candle { coin, interval } => json!({ "type": "candle", "coin": coin, "interval": interval }),
         }
@@ -66,7 +73,8 @@ impl fmt::Display for SubKey {
         match self {
             SubKey::AllMids { dex } if dex.is_empty() => f.write_str("allMids"),
             SubKey::AllMids { dex } => write!(f, "allMids:{dex}"),
-            SubKey::L2Book { coin } => write!(f, "l2Book:{coin}"),
+            SubKey::L2Book { coin, fast: false } => write!(f, "l2Book:{coin}"),
+            SubKey::L2Book { coin, fast: true } => write!(f, "l2Book:{coin}:fast"),
             SubKey::Trades { coin } => write!(f, "trades:{coin}"),
             SubKey::Candle { coin, interval } => write!(f, "candle:{coin}:{interval}"),
         }
@@ -135,6 +143,9 @@ struct WsBook {
     coin: String,
     time: i64,
     levels: (Vec<WsLevel>, Vec<WsLevel>),
+    /// Set on the fast feed's messages; the default feed leaves it out.
+    #[serde(default)]
+    fast: bool,
 }
 
 #[derive(Deserialize)]
@@ -179,13 +190,14 @@ struct SubObj {
     coin: Option<String>,
     dex: Option<String>,
     interval: Option<String>,
+    fast: Option<bool>,
 }
 
 impl SubObj {
     fn key(self) -> Option<SubKey> {
         Some(match self.ty.as_str() {
             "allMids" => SubKey::AllMids { dex: self.dex.unwrap_or_default() },
-            "l2Book" => SubKey::L2Book { coin: self.coin? },
+            "l2Book" => SubKey::L2Book { coin: self.coin?, fast: self.fast.unwrap_or(false) },
             "trades" => SubKey::Trades { coin: self.coin? },
             "candle" => SubKey::Candle { coin: self.coin?, interval: static_interval(self.interval.as_deref()?)? },
             _ => return None,
@@ -240,8 +252,11 @@ pub fn parse(text: &str) -> Result<Incoming, String> {
         }
         "l2Book" => {
             let b: WsBook = serde_json::from_str(data()?).map_err(err)?;
+            // The fast feed marks its messages `"fast":true`. Depth can't tell the feeds apart: a
+            // thin market's default book is 5 levels a side or fewer too.
+            let fast = b.fast;
             let ev = UpstreamEvent::Book { bids: levels(b.levels.0), asks: levels(b.levels.1), time_ms: b.time };
-            Incoming::Data(SubKey::L2Book { coin: b.coin }, ev)
+            Incoming::Data(SubKey::L2Book { coin: b.coin, fast }, ev)
         }
         "trades" => {
             let ts: Vec<WsTrade> = serde_json::from_str(data()?).map_err(err)?;
@@ -299,6 +314,11 @@ mod tests {
         assert_eq!(SubKey::AllMids { dex: String::new() }.subscription(), json!({"type": "allMids"}));
         assert_eq!(SubKey::AllMids { dex: "xyz".into() }.to_string(), "allMids:xyz");
         assert_eq!(k.to_string(), "candle:BTC:1m");
+        let slow = SubKey::L2Book { coin: "BTC".into(), fast: false };
+        let fast = SubKey::L2Book { coin: "BTC".into(), fast: true };
+        assert_eq!(slow.subscription(), json!({"type": "l2Book", "coin": "BTC"}));
+        assert_eq!(fast.subscription(), json!({"type": "l2Book", "coin": "BTC", "fast": true}));
+        assert_eq!((slow.to_string().as_str(), fast.to_string().as_str()), ("l2Book:BTC", "l2Book:BTC:fast"));
         assert_eq!(Timeframe::ALL.map(interval), ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"]);
     }
 
@@ -320,13 +340,22 @@ mod tests {
         assert!(m.iter().any(|(k, _)| k == "BTC") && m.iter().any(|(k, _)| k.starts_with('@')));
         assert!(!m.iter().any(|(k, _)| k.starts_with('#')), "outcome markets are dropped");
 
-        let Incoming::Data(SubKey::L2Book { coin }, UpstreamEvent::Book { bids, asks, time_ms }) =
+        let Incoming::Data(SubKey::L2Book { coin, fast: false }, UpstreamEvent::Book { bids, asks, time_ms }) =
             parse(&fixture("l2book_btc.json")).unwrap()
         else {
             panic!("l2Book")
         };
         assert_eq!((coin.as_str(), bids.len(), asks.len()), ("BTC", 20, 20));
         assert!(bids[0].px < asks[0].px && bids.windows(2).all(|w| w[0].px > w[1].px) && time_ms > 1_700_000_000_000);
+        let Incoming::Data(SubKey::L2Book { coin, fast: true }, UpstreamEvent::Book { bids, asks, .. }) =
+            parse(&fixture("l2book_btc_fast.json")).unwrap()
+        else {
+            panic!("fast l2Book")
+        };
+        assert_eq!((coin.as_str(), bids.len(), asks.len()), ("BTC", FAST_BOOK_LEVELS, FAST_BOOK_LEVELS));
+        // A default book as thin as a fast one is still the default feed's: only the flag counts.
+        let thin = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[{"px":"1","sz":"1","n":1}],[{"px":"2","sz":"1","n":1}]]}}"#;
+        assert!(matches!(parse(thin).unwrap(), Incoming::Data(SubKey::L2Book { fast: false, .. }, _)));
 
         let Incoming::Data(SubKey::Trades { coin }, UpstreamEvent::Trades(t)) =
             parse(&fixture("trades_btc.json")).unwrap()
@@ -349,7 +378,9 @@ mod tests {
     #[test]
     fn control_messages() {
         let ack = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":null,"mantissa":null,"fast":false}}}"#;
-        assert_eq!(parse(ack).unwrap(), Incoming::Subscribed(SubKey::L2Book { coin: "BTC".into() }));
+        assert_eq!(parse(ack).unwrap(), Incoming::Subscribed(SubKey::L2Book { coin: "BTC".into(), fast: false }));
+        let ack = ack.replace(r#""fast":false"#, r#""fast":true"#);
+        assert_eq!(parse(&ack).unwrap(), Incoming::Subscribed(SubKey::L2Book { coin: "BTC".into(), fast: true }));
         let ack = r#"{"channel":"subscriptionResponse","data":{"method":"unsubscribe","subscription":{"type":"candle","interval":"1h","coin":"xyz:TSLA"}}}"#;
         assert_eq!(
             parse(ack).unwrap(),

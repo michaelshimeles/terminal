@@ -13,7 +13,7 @@ fn fixture(name: &str) -> String {
 /// subscription that asked for `xyz:AAPL`, exactly like a core coin's.
 #[test]
 fn hip3_frames_route_by_their_prefixed_coin() {
-    let Ok(Incoming::Data(SubKey::L2Book { coin }, UpstreamEvent::Book { bids, asks, time_ms })) =
+    let Ok(Incoming::Data(SubKey::L2Book { coin, fast: false }, UpstreamEvent::Book { bids, asks, time_ms })) =
         parse(&fixture("l2book_xyz_aapl.json"))
     else {
         panic!("l2Book")
@@ -49,14 +49,17 @@ fn hip3_frames_route_by_their_prefixed_coin() {
 fn hip3_subscriptions_keep_the_prefix() {
     let coin = || "xyz:AAPL".to_string();
     for key in [
-        SubKey::L2Book { coin: coin() },
+        SubKey::L2Book { coin: coin(), fast: false },
+        SubKey::L2Book { coin: coin(), fast: true },
         SubKey::Trades { coin: coin() },
         SubKey::Candle { coin: coin(), interval: interval(Timeframe::M1) },
     ] {
         assert_eq!(key.subscription()["coin"], "xyz:AAPL", "{key}");
     }
     let ack = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"xyz:AAPL","nSigFigs":null,"mantissa":null,"fast":false}}}"#;
-    assert_eq!(parse(ack).unwrap(), Incoming::Subscribed(SubKey::L2Book { coin: coin() }));
+    assert_eq!(parse(ack).unwrap(), Incoming::Subscribed(SubKey::L2Book { coin: coin(), fast: false }));
+    let ack = ack.replace(r#""fast":false"#, r#""fast":true"#);
+    assert_eq!(parse(&ack).unwrap(), Incoming::Subscribed(SubKey::L2Book { coin: coin(), fast: true }));
     let ack = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"candle","coin":"xyz:AAPL","interval":"1m"}}}"#;
     assert_eq!(parse(ack).unwrap(), Incoming::Subscribed(SubKey::Candle { coin: coin(), interval: "1m" }));
 }
