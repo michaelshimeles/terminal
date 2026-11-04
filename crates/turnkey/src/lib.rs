@@ -27,14 +27,15 @@ pub use client::Client;
 pub use session::{Session, SessionKey};
 
 /// Terminal's sign-in page.
-pub const SIGN_IN_PAGE: &str = "https://terminal.rasmic.xyz/wallet/";
+pub const SIGN_IN_PAGE: &str = "https://terminal.rasmic.xyz/wallet";
 
-/// The sign-in page, unless `TR_WALLET_SIGN_IN_URL` names a local mock (desktop only).
+/// The sign-in page, unless `TR_WALLET_SIGN_IN_URL` names a local mock's page (desktop only,
+/// loopback only, e.g. `http://127.0.0.1:<port>/wallet`).
 pub fn sign_in_page() -> String {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(u) = std::env::var("TR_WALLET_SIGN_IN_URL").ok().and_then(|u| client::loopback_only(&u)) {
         tracing::warn!("turnkey: using the local mock sign-in page named by TR_WALLET_SIGN_IN_URL");
-        return format!("{u}/");
+        return u;
     }
     SIGN_IN_PAGE.to_string()
 }

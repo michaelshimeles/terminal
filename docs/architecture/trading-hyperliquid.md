@@ -157,7 +157,7 @@ Decided 2026-11-04 (§15). Users never connect MetaMask or any other external wa
 | Session key, P-256 | Made on the device. Desktop: the OS secret store, like the agent key. Web: memory. | Turnkey API requests (the `X-Stamp` header) for 15 minutes. The session token alone authorizes nothing [tk: SESSIONS]. |
 | Agent key, secp256k1 | Made on the device, stored as in §3.2 (Keychain, Secret Service, browser memory or the opt-in encrypted IndexedDB copy). | Every L1 action: orders, cancels, modify, leverage, `scheduleCancel`, `noop`. |
 
-**Sign-in.** The desktop opens the system browser at Terminal's sign-in page, `https://terminal.rasmic.xyz/wallet/`. The web build opens the same page in a popup.
+**Sign-in.** The desktop opens the system browser at Terminal's sign-in page, `https://terminal.rasmic.xyz/wallet`. The web build opens the same page in a popup.
 
 ```mermaid
 sequenceDiagram
@@ -474,7 +474,7 @@ Unrealized PnL is then repriced from the gateway's live marks on mainnet, or tes
 **Decided (2026-11-04).** Micky: built-in wallets only. Users never connect MetaMask or any external wallet, and never paste a private key. As designed in §4.5:
 
 1. Each user gets a Turnkey sub-organization with one Ethereum wallet, created at first sign-in. Its address is their Hyperliquid account.
-2. Sign-in happens in the system browser on `terminal.rasmic.xyz/wallet/` (email code or passkey through Turnkey's Auth Proxy). The page returns a session bound to a key made on the device: a loopback redirect to `127.0.0.1` on the desktop, `postMessage` on the web.
+2. Sign-in happens in the system browser on `terminal.rasmic.xyz/wallet` (email code or passkey through Turnkey's Auth Proxy). The page returns a session bound to a key made on the device: a loopback redirect to `127.0.0.1` on the desktop, `postMessage` on the web.
 3. The built-in wallet signs only `approveAgent` (approve, renew, revoke), named `terminal-<device>`, valid 180 days, never unnamed and never a reused address. `withdraw3` and `usdSend` are not built.
 4. The agent key is made on the device and kept as decided on 2026-11-02 (items 3 and 4 below). It signs every L1 action.
 5. No Terminal server holds a Turnkey credential: the Auth Proxy signs sub-organization creation with a key Turnkey keeps. `tr-gateway` stays data-only. A fallback signup function with a narrowly scoped key is designed in §4.5 but not built.

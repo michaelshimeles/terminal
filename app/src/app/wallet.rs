@@ -80,7 +80,7 @@ pub(crate) fn now_secs() -> u64 {
 /// The sign-in page in the browser build: this site's own `/wallet/`.
 #[cfg(target_arch = "wasm32")]
 fn web_page() -> String {
-    format!("{}/wallet/", super::hl_web::origin())
+    format!("{}/wallet", super::hl_web::origin())
 }
 
 impl TerminalApp {
