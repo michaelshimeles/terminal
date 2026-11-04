@@ -40,13 +40,19 @@ pub fn sign_in_page() -> String {
 }
 
 /// The page that signs a desktop in: it returns the session for `public_key` to
-/// `http://127.0.0.1:<port>/callback` with `state`. Only public values are in the URL.
+/// `http://127.0.0.1:<port>/callback` with `state`. Only public values are in the URL, and
+/// they are in the fragment, which browsers never send to a server or in a `Referer`.
 pub fn desktop_sign_in_url(page: &str, public_key: &str, state: &str, port: u16) -> String {
-    format!("{page}?flow=desktop&pk={public_key}&state={state}&port={port}")
+    format!("{page}#flow=desktop&pk={public_key}&state={state}&port={port}")
+}
+
+/// The browser build's popup: the page answers with `postMessage` to its opener.
+pub fn web_sign_in_url(page: &str, public_key: &str, state: &str) -> String {
+    format!("{page}#flow=web&pk={public_key}&state={state}")
 }
 
 /// The page in export mode: the user signs in again there, and Turnkey's export iframe shows
 /// the recovery phrase. Terminal is not involved.
 pub fn export_url(page: &str) -> String {
-    format!("{page}?mode=export")
+    format!("{page}#mode=export")
 }

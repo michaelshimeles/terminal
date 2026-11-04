@@ -24,8 +24,9 @@ use crate::signing::{WireSignature, sign_l1};
 
 /// How long a signed L1 action stays valid.
 pub const EXPIRES_AFTER_MS: u64 = 30_000;
-/// Default agent lifetime, and the most Hyperliquid allows.
-pub const DEFAULT_AGENT_DAYS: u64 = 30;
+/// Default agent lifetime: the most Hyperliquid allows, because the built-in wallet's
+/// approval is a paid Turnkey signature, so it should be rare.
+pub const DEFAULT_AGENT_DAYS: u64 = 180;
 pub const MAX_AGENT_DAYS: u64 = 180;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 

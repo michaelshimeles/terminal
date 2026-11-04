@@ -200,7 +200,7 @@ pub struct ApproveAgentAction {
     #[serde(rename = "type")]
     pub kind: String,
     pub hyperliquid_chain: String,
-    /// The chain the wallet signs on, as `0x…` hex (`0x66eee`, or a browser wallet's chain).
+    /// The chain the wallet signs on, as `0x…` hex: always `0x66eee` (testnet).
     pub signature_chain_id: String,
     /// Lower-case `0x…`.
     pub agent_address: String,

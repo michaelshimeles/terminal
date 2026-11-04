@@ -104,8 +104,7 @@ impl MockTurnkey {
         };
         match (method.as_str(), path) {
             ("GET", "/wallet/") | ("GET", "/wallet") => {
-                let page = sign_in_page(&q("flow"), &q("mode"), &q("pk"), &q("state"), &q("port"));
-                write(&mut sock, "200 OK", "text/html; charset=utf-8", &[], &page).await
+                write(&mut sock, "200 OK", "text/html; charset=utf-8", &[], &sign_in_page()).await
             }
             ("GET", "/wallet/complete") => {
                 let (pk, state, port) = (q("pk"), q("state"), q("port"));
@@ -241,27 +240,12 @@ async fn write(sock: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, 
     Ok(())
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
-/// The pretend sign-in page: one button that issues a session for the device's key.
-fn sign_in_page(flow: &str, mode: &str, pk: &str, state: &str, port: &str) -> String {
-    let style = "body{font:15px -apple-system,system-ui,sans-serif;background:#0b0b0c;color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0}main{width:420px}.b{background:#f5a623;color:#000;border-radius:9px;padding:2px 8px;font:600 12px ui-monospace,monospace}.m{color:#9a9a9a;font-size:13px}a.go{display:block;margin-top:18px;padding:10px;background:#2a6df4;color:#fff;text-align:center;border-radius:8px;text-decoration:none}";
-    let body = if mode == "export" {
-        "<p>Export happens in Turnkey's own iframe on the real page. This mock doesn't show a recovery phrase.</p>"
-            .to_string()
-    } else {
-        format!(
-            "<p class=m>Sign in or create your wallet. A real page sends a code to your email (Turnkey).</p><p>Email<br><input value=\"test@example.com\" style=\"width:100%;padding:8px\"></p><a class=go href=\"/wallet/complete?pk={}&state={}&port={}\">Continue</a><p class=m>Flow: {} · the session is issued for this device's key {}…</p>",
-            html_escape(pk),
-            html_escape(state),
-            html_escape(port),
-            html_escape(flow),
-            html_escape(&pk.chars().take(10).collect::<String>())
-        )
-    };
+/// The pretend sign-in page: one button that issues a session for the device's key. Like the
+/// real page it reads its parameters from the URL fragment.
+fn sign_in_page() -> String {
+    let style = "body{font:15px -apple-system,system-ui,sans-serif;background:#0b0b0c;color:#e6e6e6;display:grid;place-items:center;height:100vh;margin:0}main{width:420px}.b{background:#f5a623;color:#000;border-radius:9px;padding:2px 8px;font:600 12px ui-monospace,monospace}.m{color:#9a9a9a;font-size:13px}a.go{display:block;margin-top:18px;padding:10px;background:#2a6df4;color:#fff;text-align:center;border-radius:8px;text-decoration:none}input{width:100%;padding:8px;box-sizing:border-box}";
+    let script = "const p=new URLSearchParams(location.hash.slice(1));const ok=/^0[23][0-9a-f]{64}$/.test(p.get('pk')||'')&&/^[0-9a-f]{64}$/.test(p.get('state')||'')&&/^[0-9]{1,5}$/.test(p.get('port')||'');if(p.get('mode')==='export'){document.getElementById('f').innerHTML='<p>Export happens in Turnkey\\'s own iframe on the real page. This mock shows no recovery phrase.</p>'}else if(!ok){document.getElementById('f').textContent='Bad sign-in link.'}else{document.getElementById('go').href='/wallet/complete?pk='+p.get('pk')+'&state='+p.get('state')+'&port='+p.get('port');document.getElementById('k').textContent=p.get('pk').slice(0,10)}";
     format!(
-        "<!doctype html><meta charset=utf-8><title>Terminal wallet (mock)</title><style>{style}</style><main><h2>Terminal wallet <span class=b>TESTNET</span></h2><p class=m>MOCK TURNKEY (local test server, not Turnkey)</p>{body}</main>"
+        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><title>Terminal wallet (mock)</title><style>{style}</style><main><h2>Terminal wallet <span class=b>TESTNET</span></h2><p class=m>MOCK TURNKEY (local test server, not Turnkey)</p><div id=f><p class=m>Sign in or create your wallet. The real page sends a code to your email (Turnkey).</p><p>Email<br><input value=\"test@example.com\"></p><a class=go id=go href=#>Continue</a><p class=m>The session is issued for this device's key <span id=k></span>…</p></div></main><script>{script}</script>"
     )
 }

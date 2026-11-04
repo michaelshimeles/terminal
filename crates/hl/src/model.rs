@@ -282,10 +282,41 @@ pub fn parse_extra_agents(v: &Value) -> Vec<ExtraAgent> {
         .collect()
 }
 
+/// USDC in the account's spot balances (`spotClearinghouseState`): what a deposit lands in.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpotUsdc {
+    pub total: f64,
+    /// Held by open spot orders.
+    pub hold: f64,
+}
+
+pub fn spot_usdc(v: &Value) -> SpotUsdc {
+    v["balances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|b| b["coin"] == "USDC")
+        .map(|b| SpotUsdc { total: num(&b["total"]).unwrap_or(0.0), hold: num(&b["hold"]).unwrap_or(0.0) })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::assets::fixtures::json;
+
+    /// The response shape from Hyperliquid's info-endpoint docs (spot), not a recording.
+    #[test]
+    fn spot_usdc_is_read_from_the_spot_balances() {
+        let v: Value = serde_json::from_str(
+            r#"{"balances":[{"coin":"USDC","token":0,"hold":"1.5","total":"14.625485","entryNtl":"0.0"},
+                {"coin":"PURR","token":1,"hold":"0","total":"2000","entryNtl":"1234.56"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(spot_usdc(&v), SpotUsdc { total: 14.625485, hold: 1.5 });
+        assert_eq!(spot_usdc(&serde_json::json!({"balances": []})), SpotUsdc::default());
+        assert_eq!(spot_usdc(&serde_json::json!({})), SpotUsdc::default());
+    }
 
     #[test]
     fn recorded_testnet_account_parses() {

@@ -20,6 +20,8 @@ mod portfolio_view;
 mod settings_view;
 mod theming;
 mod trading;
+mod wallet;
+mod wallet_view;
 mod workspace;
 
 pub use broker::PosSort;

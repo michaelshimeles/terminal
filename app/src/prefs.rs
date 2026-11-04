@@ -235,12 +235,27 @@ pub struct HlPrefs {
     pub master: Option<String>,
     /// The approved agent's public details (never its key).
     pub agent: Option<HlAgent>,
+    /// The built-in wallet, once signed in (its address is `master`). Public details only:
+    /// Turnkey holds the wallet's key, and the session lives in the OS secret store.
+    pub wallet: Option<HlWallet>,
     /// Keep a `scheduleCancel` about a minute ahead while the app is open, so open orders are
     /// cancelled if Terminal disappears. Opt-in: it cancels orders placed elsewhere too.
     pub dead_mans_switch: bool,
     /// Web only: keep the agent key in this browser (encrypted with a key the page can't
     /// export) instead of only for the session.
     pub remember_on_browser: bool,
+}
+
+/// The user's built-in wallet on Turnkey, as Terminal remembers it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HlWallet {
+    /// Lower-case `0x…`: the Hyperliquid account.
+    pub address: String,
+    /// The user's Turnkey sub-organization.
+    pub organization_id: String,
+    /// Turnkey's name for the user (`whoami`), shown so a wrong account is noticed.
+    #[serde(default)]
+    pub user: String,
 }
 
 /// An approved API wallet, as Terminal remembers it.

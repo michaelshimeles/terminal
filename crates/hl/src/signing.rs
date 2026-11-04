@@ -205,7 +205,8 @@ pub fn recover_approve_agent(a: &ApproveAgentAction, sig: &WireSignature) -> Res
     Ok(sig.to_alloy()?.recover_address_from_prehash(&approve_agent_hash(a)?)?)
 }
 
-/// The `eth_signTypedData_v4` payload for a browser wallet to sign `a`.
+/// The EIP-712 typed data of an approval, as a wallet's `eth_signTypedData_v4` takes it
+/// (the tests check it names the same domain and message as the digest).
 pub fn approve_agent_typed_data(a: &ApproveAgentAction) -> Result<serde_json::Value> {
     approve_agent_hash(a)?;
     Ok(serde_json::json!({

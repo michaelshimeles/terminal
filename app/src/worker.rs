@@ -148,6 +148,8 @@ pub enum Request {
     Trade(TradeRequest),
     /// Hyperliquid testnet: the user stream, reads, the agent key and signed actions.
     Hl(crate::hl_worker::HlRequest),
+    /// The built-in wallet (Turnkey sign-in and approvals).
+    Wallet(crate::wallet_worker::WalletRequest),
 }
 
 /// A trading call through SnapTrade. Previews never place anything; placing takes a preview
@@ -815,6 +817,10 @@ async fn handle(s: &Arc<Shared>, req: Request) {
         Request::Hl(r) => {
             let out = s.clone();
             crate::hl_worker::handle(r, move |resp| out.send(Response::Hl(Box::new(resp)))).await
+        }
+        Request::Wallet(r) => {
+            let out = s.clone();
+            crate::wallet_worker::handle(r, move |resp| out.send(Response::Hl(Box::new(resp)))).await
         }
     }
 }

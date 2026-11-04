@@ -16,6 +16,7 @@ mod prefs;
 mod storage;
 mod theme;
 mod themes;
+mod wallet_worker;
 #[cfg(target_arch = "wasm32")]
 mod web;
 mod widgets;

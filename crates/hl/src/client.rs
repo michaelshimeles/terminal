@@ -217,6 +217,12 @@ impl Client {
         Ok(parse_clearinghouse(dex, &v))
     }
 
+    /// The account's spot USDC (`spotClearinghouseState`), for the Deposit window.
+    pub async fn spot_usdc(&self, user: &Address) -> Result<crate::model::SpotUsdc> {
+        let v = self.info(json!({"type": "spotClearinghouseState", "user": address_hex(user)})).await?;
+        Ok(crate::model::spot_usdc(&v))
+    }
+
     pub async fn open_orders(&self, user: &Address, dex: &str) -> Result<Vec<OpenOrder>> {
         let v = self.info(json!({"type": "frontendOpenOrders", "user": address_hex(user), "dex": dex})).await?;
         Ok(parse_open_orders(&v))

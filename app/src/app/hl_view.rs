@@ -6,7 +6,6 @@ use egui::{Color32, RichText, Ui};
 use tr_broker::trading::Side;
 use tr_hl::actions::Tif;
 use tr_hl::caps::{MAX_LEVERAGE, MAX_MARKET_SLIPPAGE, MAX_ORDER_NOTIONAL_USD};
-use tr_hl::nonce::now_ms;
 use tr_hl::rounding::to_wire;
 use tr_hl::trader::{EXPIRES_AFTER_MS, OrderKind};
 
@@ -33,10 +32,6 @@ pub fn testnet_badge(ui: &mut Ui) -> egui::Response {
 pub(super) fn masked(addr: &str) -> String {
     tr_hl::key::parse_address(addr).map(|a| tr_hl::mask_address(&a)).unwrap_or_else(|_| addr.to_string())
 }
-
-/// The pasted main key's field (its state is wiped once the key has signed).
-#[cfg(not(target_arch = "wasm32"))]
-const MAIN_KEY_FIELD: &str = "hl-main-key";
 
 const HIP3_RISK: &str = "A leveraged perpetual future with funding, priced by the deployer's oracle. It can diverge from the \
 listed stock (off-hours, opens, earnings, corporate actions), and the deployer can halt the market and settle it at mark.";
@@ -670,10 +665,14 @@ impl TerminalApp {
         ui.label(
             RichText::new(match (h.master.is_some(), h.agent.is_some(), on) {
                 (false, _, _) => {
-                    "Not connected. Perps on the core dex and HIP-3 xyz (BTC, xyz:AAPL), testnet only.".to_string()
+                    "No wallet yet. Create one to trade perps on the core dex and HIP-3 xyz (BTC, xyz:AAPL), testnet only."
+                        .to_string()
+                }
+                (true, false, _) if h.wallet.is_some() => {
+                    "Wallet ready. Approve a trading key to trade; until then PORT, POS and ORD are read-only.".into()
                 }
                 (true, false, _) => {
-                    "Read-only: positions and orders show in PORT, POS and ORD. Approve an agent to trade.".into()
+                    "Watching an address (read-only): positions and orders show in PORT, POS and ORD.".into()
                 }
                 (true, true, true) => {
                     "Orders are ON (testnet): confirmed orders are signed here and sent to Hyperliquid testnet.".into()
@@ -684,108 +683,11 @@ impl TerminalApp {
             .color(if on { amber() } else { theme::accent() }),
         );
 
-        // Account.
-        match &h.master {
-            Some(m) => {
-                let value = self.hl.user.as_ref().map(|u| money(u.account_value(), "USD"));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("Account {}", masked(m))).font(mono(12.5)).color(text()));
-                    let (dot, status) = if self.hl.connected {
-                        (theme::up(), self.hl.stream_status.clone())
-                    } else {
-                        (
-                            amber(),
-                            if self.hl.stream_status.is_empty() {
-                                "Connecting…".into()
-                            } else {
-                                self.hl.stream_status.clone()
-                            },
-                        )
-                    };
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 4.0, dot);
-                    note(ui, &status);
-                    if let Some(v) = value {
-                        note(ui, &format!("· value {v}"));
-                    }
-                    // Not while an approval is in flight: its answer belongs to this account.
-                    if ui
-                        .add_enabled(self.hl.busy.is_none(), egui::Button::new("Remove").small())
-                        .on_hover_text("Stop showing this account (the agent key stays unless revoked)")
-                        .clicked()
-                    {
-                        self.hl_disconnect();
-                    }
-                });
-            }
-            None => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Account").font(ui_font(12.5)));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.hl.connect_form)
-                            .hint_text("0x… (testnet address)")
-                            .font(mono(12.0))
-                            .desired_width(dp(330.0)),
-                    );
-                    if ui.button("Show Account").on_hover_text("Read-only: no key involved").clicked() {
-                        let a = self.hl.connect_form.clone();
-                        self.hl_connect(&a);
-                    }
-                });
-                note(
-                    ui,
-                    "A read-only address fills PORT, POS, ORD and ACTV from Hyperliquid testnet. Nothing is signed.",
-                );
-            }
-        }
-
-        // Agent.
-        ui.add_space(dp(6.0));
-        match &h.agent {
-            Some(a) => {
-                let days = (a.valid_until.saturating_sub(now_ms())) / (24 * 3600 * 1000);
-                let expiry = chrono::DateTime::from_timestamp_millis(a.valid_until as i64)
-                    .map(|t| t.with_timezone(&chrono::Local).format("%d %b %Y").to_string())
-                    .unwrap_or_default();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "Agent {} · {}",
-                            tr_hl::trader::agent_base_name(&a.name),
-                            masked(&a.address)
-                        ))
-                        .font(mono(12.0))
-                        .color(text()),
-                    );
-                    note(ui, &format!("· expires {expiry} · key in {}", self.hl.store.describe()));
-                });
-                if days < 7 {
-                    ui.label(
-                        RichText::new(format!("The agent expires in {days} days: revoke it and approve a new one."))
-                            .font(ui_font(12.0))
-                            .color(amber()),
-                    );
-                }
-                if self.hl.key.is_none() && !self.hl.key_loading {
-                    ui.label(
-                        RichText::new("This device has no key for this agent.").font(ui_font(12.0)).color(amber()),
-                    );
-                }
-            }
-            None => {
-                note(
-                    ui,
-                    "Approve an agent (API wallet): Terminal makes a new key on this device; your main wallet signs approveAgent once, named terminal-<device>, valid 30 days. The agent can trade but not withdraw.",
-                );
-            }
-        }
+        self.wallet_section(ui, &h);
         if let Some(e) = &self.hl.store_error {
             ui.label(
                 RichText::new(format!("Trading is off on this device: {e}")).font(ui_font(12.0)).color(theme::down()),
             );
-        }
-        if h.master.is_some() || h.agent.is_none() {
-            self.hl_key_controls(ui, &h);
         }
 
         // Orders on or off.
@@ -799,7 +701,7 @@ impl TerminalApp {
                 }
             } else if ui
                 .add_enabled(h.agent.is_some(), egui::Button::new(RichText::new("Enable Hyperliquid Orders…").strong()))
-                .on_disabled_hover_text("Approve an agent first")
+                .on_disabled_hover_text("Approve a trading key first")
                 .clicked()
             {
                 self.hl.enable_prompt = true;
@@ -836,7 +738,9 @@ impl TerminalApp {
                     &mut keep,
                     "Remember the agent key on this browser (encrypted with a key the page can't read)",
                 )
-                .on_hover_text("Off: the key lasts for this tab only, and you approve again next visit.")
+                .on_hover_text(
+                    "Off: the key lasts for this tab only, and each visit needs a new approval, which is one paid Turnkey signature.",
+                )
                 .changed()
             {
                 self.prefs.trading.hl.remember_on_browser = keep;
@@ -847,6 +751,13 @@ impl TerminalApp {
                 } else {
                     self.hl_web_forget_key();
                 }
+            }
+            if !self.prefs.trading.hl.remember_on_browser {
+                ui.label(
+                    RichText::new("Each visit without it approves a new trading key: one Turnkey signature each time.")
+                        .font(ui_font(11.5))
+                        .color(muted()),
+                );
             }
         }
 
@@ -889,67 +800,6 @@ impl TerminalApp {
         }
         if let Some((m, err)) = &self.hl.message {
             ui.label(RichText::new(m).font(ui_font(12.0)).color(if *err { theme::down() } else { theme::up() }));
-        }
-    }
-
-    /// Approve or revoke with a pasted testnet key (desktop), or the browser wallet (web).
-    fn hl_key_controls(&mut self, ui: &mut Ui, h: &crate::prefs::HlPrefs) {
-        let busy = self.hl.busy.is_some();
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.hl_web_wallet_controls(ui, h, busy);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            ui.label(
-                RichText::new(
-                    "Testnet only: paste a throwaway TESTNET main wallet key. Terminal uses it once to sign approveAgent (or the revoke), wipes it from memory and never stores it. Never paste a key that holds real funds.",
-                )
-                .font(ui_font(11.5))
-                .color(amber()),
-            );
-            ui.horizontal(|ui| {
-                let field = egui::TextEdit::singleline(&mut *self.hl.main_key_form)
-                    .id(egui::Id::new(MAIN_KEY_FIELD))
-                    .password(true)
-                    .hint_text("testnet main key (0x…)")
-                    .font(mono(12.0))
-                    .desired_width(dp(300.0));
-                ui.add_enabled(!busy, field);
-                let pasted = !self.hl.main_key_form.trim().is_empty();
-                let used = if h.agent.is_none() {
-                    let go = ui
-                        .add_enabled(pasted && !busy, egui::Button::new(RichText::new("Approve Agent").strong()))
-                        .clicked();
-                    if go {
-                        self.hl_approve_with_pasted_key();
-                    }
-                    go
-                } else {
-                    let go = ui
-                        .add_enabled(pasted && !busy, egui::Button::new("Revoke on Hyperliquid"))
-                        .on_hover_text(
-                            "Deletes the key here and replaces the agent on Hyperliquid with an address nobody holds",
-                        )
-                        .clicked();
-                    if go {
-                        self.hl_revoke(true);
-                    }
-                    go
-                };
-                // The field's undo history holds copies of what was typed: drop it with the key.
-                if used {
-                    egui::text_edit::TextEditState::default().store(ui.ctx(), egui::Id::new(MAIN_KEY_FIELD));
-                }
-            });
-        }
-        if h.agent.is_some()
-            && ui
-                .add_enabled(!busy, egui::Button::new("Delete Agent Key Here"))
-                .on_hover_text("Terminal can't sign with it any more; it stays approved on Hyperliquid until it expires or is revoked")
-                .clicked()
-        {
-            self.hl_revoke(false);
         }
     }
 
