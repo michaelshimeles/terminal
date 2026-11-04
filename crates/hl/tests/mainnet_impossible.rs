@@ -92,3 +92,141 @@ fn signatures_are_testnet_signatures() {
     assert!(sign_approve_agent(&main, &mainnet).is_err());
     assert!(recover_approve_agent(&mainnet, &sig).is_err());
 }
+
+/// A main wallet held elsewhere (Turnkey) signs a digest this crate hands it. It is only
+/// ever asked for a testnet `approveAgent` at the testnet signature chain, and its answer is
+/// used only if it recovers the main wallet.
+#[test]
+fn a_remote_main_wallet_signs_only_testnet_approvals() {
+    use std::cell::Cell;
+    use tr_hl::actions::ApproveAgentAction;
+    use tr_hl::signing::{recover_approve_agent, sign_approve_agent_with};
+    use tr_hl::trader::approve_agent;
+
+    // The remote wallet is a plain k256 key here, signing whatever 32 bytes it is given.
+    let main = k256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+    let master = alloy_primitives::Address::from_private_key(&main);
+    let sign = |key: &k256::ecdsa::SigningKey,
+                digest: alloy_primitives::B256|
+     -> anyhow::Result<alloy_primitives::Signature> {
+        let (sig, recid) = key.sign_prehash_recoverable(digest.as_slice())?;
+        Ok(alloy_primitives::Signature::from_signature_and_parity(sig, recid.is_y_odd()))
+    };
+    let agent = tr_hl::AgentKey::generate();
+    let a = approve_agent(&tr_hl::SigningKey::address(&agent), "ci", 180, 1_793_667_000_000);
+    assert_eq!((a.hyperliquid_chain.as_str(), a.signature_chain_id.as_str()), ("Testnet", "0x66eee"));
+
+    let asked = Cell::new(0);
+    let remote = |digest: alloy_primitives::B256| {
+        asked.set(asked.get() + 1);
+        let sig = sign(&main, digest);
+        async move { sig }
+    };
+    let sig = futures::executor::block_on(sign_approve_agent_with(&a, &master, remote)).unwrap();
+    assert_eq!(recover_approve_agent(&a, &sig).unwrap(), master);
+    assert_eq!(asked.get(), 1);
+
+    // Mainnet, or a mainnet signature chain (Arbitrum One, 0xa4b1), never reaches the signer.
+    for bad in [
+        ApproveAgentAction { hyperliquid_chain: "Mainnet".into(), ..a.clone() },
+        ApproveAgentAction { signature_chain_id: "0xa4b1".into(), ..a.clone() },
+        ApproveAgentAction { kind: "usdSend".into(), ..a.clone() },
+    ] {
+        assert!(futures::executor::block_on(sign_approve_agent_with(&bad, &master, remote)).is_err(), "{bad:?}");
+    }
+    assert_eq!(asked.get(), 1, "the remote signer was asked to sign a non-testnet action");
+
+    // A signature from any other key is refused rather than sent.
+    let other = k256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+    let wrong = |digest: alloy_primitives::B256| {
+        let sig = sign(&other, digest);
+        async move { sig }
+    };
+    let err = futures::executor::block_on(sign_approve_agent_with(&a, &master, wrong)).unwrap_err();
+    assert!(err.to_string().contains("not the wallet's"), "{err}");
+}
+
+/// The built-in wallet (Turnkey's API; here its local stand-in) is never sent anything for
+/// mainnet: the request is refused before it is made.
+#[tokio::test]
+async fn the_built_in_wallet_is_never_asked_to_sign_for_mainnet() {
+    use tr_hl::actions::ApproveAgentAction;
+    use tr_hl::signing::sign_approve_agent_with;
+    use tr_hl::trader::approve_agent;
+
+    let mock = tr_turnkey::mock::MockTurnkey::start(0, None).await.unwrap();
+    let key = tr_turnkey::SessionKey::generate();
+    let token = mock.mint_session(&key.public_hex(), 60);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let session = tr_turnkey::Session::accept(key, &token, now).unwrap();
+    let client = tr_turnkey::Client::with_base(&mock.base).unwrap();
+    let master: alloy_primitives::Address = mock.address().parse().unwrap();
+    let sign = |a: ApproveAgentAction| {
+        let (client, session) = (&client, &session);
+        async move {
+            sign_approve_agent_with(&a, &master, |d| async move { client.sign_digest(session, &master, &d).await })
+                .await
+        }
+    };
+    let a = approve_agent(&tr_hl::SigningKey::address(&tr_hl::AgentKey::generate()), "ci", 180, 1_793_667_000_000);
+    for bad in [
+        ApproveAgentAction { hyperliquid_chain: "Mainnet".into(), ..a.clone() },
+        ApproveAgentAction { signature_chain_id: "0xa4b1".into(), ..a.clone() },
+    ] {
+        assert!(sign(bad).await.is_err());
+    }
+    assert!(mock.requests().is_empty(), "the wallet was asked to sign a mainnet action");
+    // The testnet approval goes through and is the only thing signed.
+    assert!(sign(a).await.is_ok());
+    let paths: Vec<String> = mock.requests().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(paths, ["/public/v1/submit/sign_raw_payload"]);
+}
+
+/// Code added for the built-in wallet names no mainnet host either: the Turnkey crate, the
+/// app's wallet modules and the sign-in page.
+#[test]
+fn the_wallet_code_names_no_mainnet_host() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    for d in [
+        "crates/turnkey/src",
+        "crates/turnkey/tests",
+        "crates/turnkey/examples",
+        "site/src/routes/wallet",
+        "site/src/lib/wallet",
+    ] {
+        if repo.join(d).exists() {
+            sources_any(&repo.join(d), &mut files);
+        }
+    }
+    files.push(repo.join("crates/turnkey/Cargo.toml"));
+    for f in [
+        "app/src/app/wallet.rs",
+        "app/src/app/wallet_view.rs",
+        "app/src/app/hl_web.rs",
+        "app/src/app/hl.rs",
+        "app/src/app/hl_view.rs",
+    ] {
+        if repo.join(f).exists() {
+            files.push(repo.join(f));
+        }
+    }
+    assert!(files.iter().filter(|f| f.starts_with(repo.join("crates/turnkey"))).count() >= 5, "{files:?}");
+    for f in files {
+        let text = std::fs::read_to_string(&f).unwrap();
+        for host in MAINNET_HOSTS {
+            assert!(!text.contains(host), "{} names the mainnet host {host}", f.display());
+        }
+    }
+}
+
+fn sources_any(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            sources_any(&p, out);
+        } else if p.extension().is_some_and(|x| ["rs", "toml", "ts", "svelte", "js", "html"].iter().any(|e| x == *e)) {
+            out.push(p);
+        }
+    }
+}

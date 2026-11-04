@@ -25,5 +25,7 @@ getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
+# The built-in wallet's approval, end to end against Turnkey's local stand-in.
+tr-turnkey = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }
 tracing-subscriber.workspace = true

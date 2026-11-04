@@ -244,3 +244,44 @@ fn expires_after_is_part_of_the_hash() {
     );
     assert_ne!(recover_l1(&n, 5, Some(1_700_000_030_000), &bad).unwrap(), key().address());
 }
+
+/// The same approval signed by a main wallet held elsewhere (as Turnkey's `sign_raw_payload`
+/// with `HASH_FUNCTION_NO_OP` signs the digest it is given) is the Python SDK's signature.
+#[test]
+fn a_remote_main_wallet_reproduces_the_approve_agent_vector() {
+    let a = ApproveAgentAction {
+        kind: "approveAgent".into(),
+        hyperliquid_chain: "Testnet".into(),
+        signature_chain_id: "0x66eee".into(),
+        agent_address: "0x5e9ee1089755c3435139848e47e6635505d5a13a".into(),
+        agent_name: "terminal-vector valid_until 1700000000000".into(),
+        nonce: 1700000000000,
+    };
+    let remote = k256::ecdsa::SigningKey::from_slice(&alloy_primitives::hex::decode(SDK_KEY).unwrap()).unwrap();
+    let master = Address::from_private_key(&remote);
+    let signed = futures::executor::block_on(sign_approve_agent_with(&a, &master, |digest: B256| {
+        let (s, recid) = remote.sign_prehash_recoverable(digest.as_slice()).unwrap();
+        async move { Ok(alloy_primitives::Signature::from_signature_and_parity(s, recid.is_y_odd())) }
+    }))
+    .unwrap();
+    let want = sig(
+        "0x8138ea721e1fb5afe9239b21b19ffe1e4690dc2c06b0aaf661aeb9859f598a25",
+        "0x169543c6dbf8c0caa9e6225e6612e5c3b495afbdc840537be74a6fb465cfc321",
+        28,
+    );
+    assert_eq!(signed, want);
+}
+
+/// `approveAgent` is only hashed for testnet's signature chain (0x66eee): never Arbitrum One
+/// (0xa4b1, the chain Hyperliquid's docs show for mainnet), and never an unparseable id.
+#[test]
+fn approve_agent_is_hashed_only_at_the_testnet_signature_chain() {
+    let a = crate::trader::approve_agent(&key().address(), "vector", 30, 1_700_000_000_000);
+    assert!(approve_agent_hash(&a).is_ok());
+    for chain in ["0xa4b1", "0x1", "0x66EEE0", "", "zz"] {
+        let other = ApproveAgentAction { signature_chain_id: chain.into(), ..a.clone() };
+        assert!(approve_agent_hash(&other).is_err(), "{chain}");
+    }
+    // The chain id may be written in either case.
+    assert!(approve_agent_hash(&ApproveAgentAction { signature_chain_id: "0x66EEE".into(), ..a }).is_ok());
+}
