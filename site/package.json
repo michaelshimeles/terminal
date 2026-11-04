@@ -28,6 +28,8 @@
 		"#lib/*": "./src/lib/*"
 	},
 	"dependencies": {
+		"@turnkey/core": "2.13.1",
+		"@turnkey/iframe-stamper": "2.11.1",
 		"@upstash/redis": "^1.39.0",
 		"@vercel/analytics": "^2.0.1"
 	},

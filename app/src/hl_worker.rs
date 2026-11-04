@@ -247,15 +247,6 @@ pub enum HlRequest {
         store: AgentKeyStore,
         account: String,
     },
-    /// Check the key store, post a signed `approveAgent` for `master`, and keep the agent key
-    /// only if Hyperliquid accepts it.
-    Approve {
-        store: AgentKeyStore,
-        master: String,
-        key: Arc<AgentKey>,
-        body: Value,
-        agent: HlAgent,
-    },
     /// Forget the local key, then post the signed revoke (if the main wallet signed one).
     Revoke {
         store: AgentKeyStore,
@@ -381,6 +372,66 @@ pub enum HlResponse {
         cloid: String,
         result: Result<Option<String>, String>,
     },
+    Wallet(Box<crate::wallet_worker::WalletResponse>),
+}
+
+/// Check the key store, post a signed `approveAgent` for `master`, and keep the agent key only
+/// if Hyperliquid accepts it.
+pub async fn approve(
+    client: &Client,
+    store: AgentKeyStore,
+    master: String,
+    key: Arc<AgentKey>,
+    body: Value,
+    agent: HlAgent,
+) -> HlResponse {
+    // The keyring may be slow or locked: never ask it from the UI thread.
+    let checked = {
+        let store = store.clone();
+        rt::blocking(move || store.check()).await.unwrap_or_else(|| Err("the key store task failed".into()))
+    };
+    if let Err(e) = checked {
+        let result = Err(format!("this device can't keep an agent key: {e}"));
+        return HlResponse::Approved { master, agent, key, result, saved: Ok(()) };
+    }
+    let r = client.send_user_signed(&body).await;
+    let result = match &r {
+        Ok(resp) if resp.ok && resp.first_error().is_none() => Ok(resp.summary()),
+        Ok(resp) => Err(resp.first_error().unwrap_or("rejected").to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    // Keep the key only for an agent Hyperliquid accepted.
+    let saved = if result.is_ok() {
+        let (k, account) = (key.clone(), crate::app::hl_store_account(&master));
+        rt::blocking(move || store.save(&account, &k.to_hex()).map_err(|e| format!("{e:#}")))
+            .await
+            .unwrap_or_else(|| Err("the key store task failed".into()))
+    } else {
+        Ok(())
+    };
+    HlResponse::Approved { master, agent, key, result, saved }
+}
+
+/// Forget the local key, then post the signed revoke (if the wallet signed one).
+pub async fn revoke(client: &Client, store: AgentKeyStore, account: String, body: Option<Value>) -> HlResponse {
+    let deleted = rt::blocking(move || store.delete(&account).map_err(|e| format!("{e:#}")))
+        .await
+        .unwrap_or_else(|| Err("the key store task failed".into()));
+    let result = match (deleted, body) {
+        (Err(e), _) => Err(format!("could not delete the local key: {e}")),
+        (Ok(()), None) => Ok("Agent key deleted from this device.".into()),
+        (Ok(()), Some(b)) => match client.send_user_signed(&b).await {
+            Ok(resp) if resp.ok && resp.first_error().is_none() => {
+                Ok(format!("Agent key deleted and the agent replaced on Hyperliquid ({}).", resp.summary()))
+            }
+            Ok(resp) => Err(format!(
+                "Agent key deleted from this device; Hyperliquid refused the revoke: {}",
+                resp.first_error().unwrap_or("rejected")
+            )),
+            Err(e) => Err(format!("Agent key deleted from this device; the revoke wasn't confirmed: {e}")),
+        },
+    };
+    HlResponse::Revoked(result)
 }
 
 /// Run one request; answers go through `send`.
@@ -440,53 +491,7 @@ pub async fn handle(req: HlRequest, send: impl Fn(HlResponse) + Clone + 'static)
                 Err(e) => send(HlResponse::KeyLoaded { account: String::new(), result: Err(e) }),
             }
         }
-        HlRequest::Approve { store, master, key, body, agent } => {
-            // The keyring may be slow or locked: never ask it from the UI thread.
-            let checked = {
-                let store = store.clone();
-                rt::blocking(move || store.check()).await.unwrap_or_else(|| Err("the key store task failed".into()))
-            };
-            if let Err(e) = checked {
-                let result = Err(format!("this device can't keep an agent key: {e}"));
-                return send(HlResponse::Approved { master, agent, key, result, saved: Ok(()) });
-            }
-            let r = client.send_user_signed(&body).await;
-            let result = match &r {
-                Ok(resp) if resp.ok && resp.first_error().is_none() => Ok(resp.summary()),
-                Ok(resp) => Err(resp.first_error().unwrap_or("rejected").to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-            // Keep the key only for an agent Hyperliquid accepted.
-            let saved = if result.is_ok() {
-                let (k, account) = (key.clone(), crate::app::hl_store_account(&master));
-                rt::blocking(move || store.save(&account, &k.to_hex()).map_err(|e| format!("{e:#}")))
-                    .await
-                    .unwrap_or_else(|| Err("the key store task failed".into()))
-            } else {
-                Ok(())
-            };
-            send(HlResponse::Approved { master, agent, key, result, saved });
-        }
-        HlRequest::Revoke { store, account, body } => {
-            let deleted = rt::blocking(move || store.delete(&account).map_err(|e| format!("{e:#}")))
-                .await
-                .unwrap_or_else(|| Err("the key store task failed".into()));
-            let result = match (deleted, body) {
-                (Err(e), _) => Err(format!("could not delete the local key: {e}")),
-                (Ok(()), None) => Ok("Agent key deleted from this device.".into()),
-                (Ok(()), Some(b)) => match client.send_user_signed(&b).await {
-                    Ok(resp) if resp.ok && resp.first_error().is_none() => {
-                        Ok(format!("Agent key deleted and the agent replaced on Hyperliquid ({}).", resp.summary()))
-                    }
-                    Ok(resp) => Err(format!(
-                        "Agent key deleted from this device; Hyperliquid refused the revoke: {}",
-                        resp.first_error().unwrap_or("rejected")
-                    )),
-                    Err(e) => Err(format!("Agent key deleted from this device; the revoke wasn't confirmed: {e}")),
-                },
-            };
-            send(HlResponse::Revoked(result));
-        }
+        HlRequest::Revoke { store, account, body } => send(revoke(&client, store, account, body).await),
         HlRequest::Act { id, key, nonces, user, act, kill_epoch } => {
             let turns = Turns::global();
             let label = act.label();

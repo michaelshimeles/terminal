@@ -968,6 +968,9 @@ impl TerminalApp {
         if self.hl.enable_prompt {
             self.hl_enable_dialog(ctx);
         }
+        if self.hl.wallet.deposit || self.hl.wallet.backup_prompt {
+            self.wallet_windows(ctx);
+        }
     }
 
     fn ticket_window(&mut self, ctx: &egui::Context) {

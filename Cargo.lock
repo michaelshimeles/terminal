@@ -263,7 +263,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -4202,6 +4202,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "p256"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2",
+]
+
+[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4595,6 +4607,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 
 [[package]]
+name = "primeorder"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
+dependencies = [
+ "elliptic-curve",
+]
+
+[[package]]
 name = "primitive-types"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4697,6 +4718,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"
@@ -5255,7 +5282,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6117,6 +6144,7 @@ dependencies = [
  "epaint_default_fonts",
  "futures",
  "js-sys",
+ "qrcode",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -6129,6 +6157,7 @@ dependencies = [
  "tr-data",
  "tr-hl",
  "tr-macos",
+ "tr-turnkey",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
@@ -6577,6 +6606,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tr-turnkey",
  "tracing",
  "tracing-subscriber",
  "web-time",
@@ -6600,6 +6630,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tr-core",
+]
+
+[[package]]
+name = "tr-turnkey"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "hex",
+ "k256",
+ "p256",
+ "rand_core 0.6.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tr-turnkey",
+ "tracing",
+ "turnkey_api_key_stamper",
+ "web-time",
+ "zeroize",
 ]
 
 [[package]]
@@ -6707,6 +6760,22 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha1 0.11.0",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "turnkey_api_key_stamper"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29562813524a3ed246d3fe01663153a7b0578e52b80deff5d42ca8a3307c61c8"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "k256",
+ "p256",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

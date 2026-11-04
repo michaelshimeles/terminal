@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::ApproveAgentAction;
 use crate::key::{SigningKey, sign_hash};
-use crate::network::Network;
+use crate::network::{Network, SIGNATURE_CHAIN_ID};
 
 sol! {
     struct Agent {
@@ -157,10 +157,15 @@ const APPROVE_AGENT_TYPE: &str =
     "HyperliquidTransaction:ApproveAgent(string hyperliquidChain,address agentAddress,string agentName,uint64 nonce)";
 
 /// The hash the main wallet signs to approve an agent. Refuses anything not addressed to
-/// testnet.
+/// testnet: `hyperliquidChain` must be `Testnet` and `signatureChainId` the testnet
+/// signature chain ([`SIGNATURE_CHAIN_ID`], 0x66eee), never Arbitrum One's 0xa4b1.
 pub fn approve_agent_hash(a: &ApproveAgentAction) -> Result<B256> {
     ensure!(a.kind == "approveAgent", "not an approveAgent action");
     ensure!(a.hyperliquid_chain == Network::Testnet.hyperliquid_chain(), "this build only approves agents on testnet");
+    ensure!(
+        a.chain_id().ok() == Some(SIGNATURE_CHAIN_ID),
+        "this build only signs at the testnet signature chain ({SIGNATURE_CHAIN_ID:#x})"
+    );
     let agent = crate::key::parse_address(&a.agent_address)?;
     let fields = [Field::Str(&a.hyperliquid_chain), Field::Addr(agent), Field::Str(&a.agent_name), Field::U64(a.nonce)];
     Ok(user_signed_hash(APPROVE_AGENT_TYPE, &fields, a.chain_id()?))
@@ -172,13 +177,36 @@ pub fn sign_approve_agent(main: &impl SigningKey, a: &ApproveAgentAction) -> Res
     Ok(WireSignature::from_alloy(&sig))
 }
 
-/// Who signed an `approveAgent` (a browser wallet's signature is checked with this before
-/// it is sent).
+/// A main wallet held elsewhere (the built-in Turnkey wallet) signs `approveAgent`.
+///
+/// `sign` gets only the digest of a testnet approval: [`approve_agent_hash`] refuses
+/// anything else before `sign` is called. The answer is used only if it recovers `main`,
+/// so a wrong or swapped signature is never sent. This is the only way a remote wallet's
+/// signature enters this crate; L1 actions (orders, cancels) are signed by the local agent
+/// key alone.
+pub async fn sign_approve_agent_with<F, Fut>(a: &ApproveAgentAction, main: &Address, sign: F) -> Result<WireSignature>
+where
+    F: FnOnce(B256) -> Fut,
+    Fut: std::future::Future<Output = Result<Signature>>,
+{
+    let digest = approve_agent_hash(a)?;
+    let sig = sign(digest).await.context("the wallet didn't sign")?;
+    let signer = sig.recover_address_from_prehash(&digest).context("the wallet's signature is malformed")?;
+    ensure!(
+        &signer == main,
+        "the signature is not the wallet's ({}); nothing was sent",
+        crate::key::mask_address(&signer)
+    );
+    Ok(WireSignature::from_alloy(&sig))
+}
+
+/// Who signed an `approveAgent`.
 pub fn recover_approve_agent(a: &ApproveAgentAction, sig: &WireSignature) -> Result<Address> {
     Ok(sig.to_alloy()?.recover_address_from_prehash(&approve_agent_hash(a)?)?)
 }
 
-/// The `eth_signTypedData_v4` payload for a browser wallet to sign `a`.
+/// The EIP-712 typed data of an approval, as a wallet's `eth_signTypedData_v4` takes it
+/// (the tests check it names the same domain and message as the digest).
 pub fn approve_agent_typed_data(a: &ApproveAgentAction) -> Result<serde_json::Value> {
     approve_agent_hash(a)?;
     Ok(serde_json::json!({

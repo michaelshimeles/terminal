@@ -1,5 +1,6 @@
 //! Private keys that sign: the agent (API wallet) key Terminal generates and keeps, and a
-//! main-wallet key that signs one `approveAgent` and is dropped.
+//! main-wallet key for tests and the developer-only `testnet_check` example. The app never
+//! holds a main-wallet key: its main wallet is the built-in Turnkey wallet.
 //!
 //! Neither type is `Clone`, `Serialize` or printable: `Debug` and `Display` show only the
 //! masked address. The secret scalar lives in a k256 `SigningKey`, which zeroizes itself on
@@ -85,8 +86,8 @@ impl sealed::Sealed for AgentKey {
 }
 impl SigningKey for AgentKey {}
 
-/// A main-wallet key, held only while it signs `approveAgent` (testnet throwaway keys on
-/// the desktop). It cannot be exported or stored.
+/// A main-wallet key for tests and the `testnet_check` example (throwaway testnet keys from
+/// a 0600 file). Nothing in the app makes one. It cannot be exported or stored.
 pub struct MainKey(EcdsaKey);
 
 impl MainKey {

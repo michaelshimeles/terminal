@@ -5,8 +5,9 @@
 //! Safety rails, in order:
 //! 1. Off until enabled in Settings › Trading › Hyperliquid, with its own acknowledgement
 //!    (SnapTrade's switch never turns it on, or the reverse).
-//! 2. Orders are signed only by a Terminal-generated agent key the main wallet approved; the
-//!    key lives in the macOS Keychain, the Linux Secret Service, or browser memory.
+//! 2. Orders are signed only by a Terminal-generated agent key the built-in wallet approved;
+//!    the key lives in the macOS Keychain, the Linux Secret Service, or browser memory. The
+//!    wallet itself (Turnkey) signs only that approval (see `super::wallet`).
 //! 3. Every order, modify, cancel, cancel-all and leverage change opens one confirmation.
 //! 4. `tr_hl` checks the hard caps ($100 per order, 3× leverage, 1% market slippage) when the
 //!    confirmation opens, and the worker checks them again against the market just before
@@ -29,13 +30,11 @@ use tr_hl::model::AssetData;
 use tr_hl::nonce::{NonceManager, now_ms};
 use tr_hl::stream::UserState;
 use tr_hl::trader::{self, MarketCtx, OrderIntent, OrderKind, OrderPlan};
-use tr_hl::{AgentKey, MainKey, SigningKey};
+use tr_hl::{AgentKey, SigningKey};
 use web_time::Instant;
-use zeroize::Zeroizing;
 
 use super::TerminalApp;
 use crate::hl_worker::{HlAct, HlRequest, HlResponse, HlRoles, Outcome};
-use crate::prefs::HlAgent;
 use crate::worker::Request;
 
 /// Account ids of Hyperliquid testnet accounts: `hl:testnet:0x…`.
@@ -177,8 +176,8 @@ pub struct HlState {
     pub enable_prompt: bool,
     pub ack: bool,
     pub connect_form: String,
-    /// A pasted testnet main key, held only until it signs (then wiped).
-    pub main_key_form: Zeroizing<String>,
+    /// The built-in wallet: sign-in, the Turnkey session, Deposit.
+    pub wallet: super::wallet::WalletState,
     pub busy: Option<&'static str>,
     pub message: Option<(String, bool)>,
     pub confirm: Option<HlConfirm>,
@@ -190,15 +189,12 @@ pub struct HlState {
     /// Kill switches pressed; every signed action carries the count when it was confirmed.
     kill_epoch: u64,
     /// The account an approval in flight is for. A late answer for any other is ignored.
-    pending_approval: Option<String>,
+    pub(super) pending_approval: Option<String>,
     next_id: u64,
     deadman_at: Option<Instant>,
     deadman_armed: bool,
     /// The panes need the rows rebuilt.
     pub dirty: bool,
-    /// The browser wallet's account (web).
-    #[cfg(target_arch = "wasm32")]
-    pub wallet: Option<String>,
     /// For the page's promises to wake the UI (web).
     #[cfg(target_arch = "wasm32")]
     pub ctx: Option<egui::Context>,
@@ -229,7 +225,7 @@ impl HlState {
             enable_prompt: false,
             ack: false,
             connect_form: String::new(),
-            main_key_form: Zeroizing::new(String::new()),
+            wallet: Default::default(),
             busy: None,
             message: None,
             confirm: None,
@@ -243,8 +239,6 @@ impl HlState {
             deadman_armed: false,
             dirty: true,
             #[cfg(target_arch = "wasm32")]
-            wallet: None,
-            #[cfg(target_arch = "wasm32")]
             ctx: None,
         }
     }
@@ -253,6 +247,11 @@ impl HlState {
     /// the browser (with an opt-in encrypted copy, see `crate::hl_web`).
     pub fn platform() -> Self {
         Self::new(if cfg!(target_arch = "wasm32") { AgentKeyStore::memory() } else { AgentKeyStore::platform() })
+    }
+
+    /// Read the agent key from the store again (the account changed).
+    pub fn reset_key_lookup(&mut self) {
+        self.key_tried = None;
     }
 
     /// The ticket's view of a market: testnet mid (the stream's, else the last REST read)
@@ -591,7 +590,7 @@ fn should_load_key(agent: bool, h: &HlState, account: &str) -> bool {
 }
 
 /// `terminal-<this machine>`: the host name, or `web` in the browser.
-fn device() -> String {
+pub(super) fn device() -> String {
     if cfg!(target_arch = "wasm32") {
         return "web".into();
     }
@@ -663,10 +662,13 @@ impl TerminalApp {
             Err(e) => return self.hl.message = Some((format!("{e}."), true)),
         };
         if self.hl_master().as_deref() != Some(&addr) {
-            // Another account: its agent (if any) is not this one's.
+            // Another account: its agent (if any) is not this one's, nor is the wallet.
             self.prefs.trading.hl.agent = None;
             self.prefs.trading.hl.enabled = false;
             self.hl.key = None;
+            if self.prefs.trading.hl.wallet.is_some() {
+                self.wallet_remove();
+            }
         }
         self.prefs.trading.hl.master = Some(addr.clone());
         self.save_hl_prefs();
@@ -684,6 +686,7 @@ impl TerminalApp {
 
     /// Stop showing the account. The agent key stays in the store unless revoked.
     pub(super) fn hl_disconnect(&mut self) {
+        self.wallet_remove();
         self.hl.pending_approval = None;
         self.hl.uncertain = None;
         self.prefs.trading.hl.master = None;
@@ -698,102 +701,33 @@ impl TerminalApp {
         self.hl.message = Some(("Hyperliquid account removed from Terminal.".into(), false));
     }
 
-    fn save_hl_prefs(&mut self) {
+    pub(super) fn save_hl_prefs(&mut self) {
         if let Err(e) = self.prefs.save(&super::prefs_path()) {
             self.status = format!("Could not save preferences: {e}");
         }
     }
 
-    /// Desktop, testnet only: sign `approveAgent` for a fresh agent with a pasted **testnet
-    /// throwaway** main key, which is wiped as soon as it has signed and is never stored.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn hl_approve_with_pasted_key(&mut self) {
-        let pasted = std::mem::replace(&mut self.hl.main_key_form, Zeroizing::new(String::new()));
-        let main = match MainKey::from_hex(&pasted) {
-            Ok(k) => k,
-            Err(e) => return self.hl.message = Some((format!("{e}."), true)),
-        };
-        drop(pasted);
-        let agent = AgentKey::generate();
-        let action = trader::approve_agent(&agent.address(), &device(), trader::DEFAULT_AGENT_DAYS, now_ms());
-        let signature = match tr_hl::signing::sign_approve_agent(&main, &action) {
-            Ok(s) => s,
-            Err(e) => return self.hl.message = Some((format!("Could not sign: {e:#}"), true)),
-        };
-        let master = tr_hl::key::address_hex(&main.address());
-        drop(main);
-        let body = trader::user_signed_body(&action, &signature);
-        self.hl_submit_approval(master, agent, &action, body);
-    }
-
-    /// Post a signed `approveAgent` (from the pasted key or the browser wallet).
-    pub(super) fn hl_submit_approval(
-        &mut self,
-        master: String,
-        agent: AgentKey,
-        action: &tr_hl::actions::ApproveAgentAction,
-        body: serde_json::Value,
-    ) {
-        if self.hl_master().as_deref() != Some(&master) {
-            self.prefs.trading.hl.master = Some(master.clone());
-            self.prefs.trading.hl.enabled = false;
-            self.save_hl_prefs();
-        }
-        let meta = HlAgent {
-            address: action.agent_address.clone(),
-            name: action.agent_name.clone(),
-            valid_until: trader::agent_valid_until(&action.agent_name).unwrap_or(0),
-            network: tr_hl::Network::Testnet,
-        };
-        self.hl.busy = Some("Approving the agent on Hyperliquid testnet…");
-        self.hl.message = None;
-        self.hl.pending_approval = Some(master.clone());
-        self.hl_send(HlRequest::Approve {
-            store: self.hl.store.clone(),
-            master,
-            key: Arc::new(agent),
-            body,
-            agent: meta,
-        });
-        self.hl_start();
-    }
-
-    /// Revoke: delete the key here, and (with a pasted main key) replace the agent on
-    /// Hyperliquid by approving a throwaway address under the same name.
-    pub(super) fn hl_revoke(&mut self, on_chain: bool) {
-        let Some(master) = self.hl_master() else { return };
-        let name = self.prefs.trading.hl.agent.as_ref().map(|a| trader::agent_base_name(&a.name).to_string());
-        let body = if on_chain {
-            let pasted = std::mem::replace(&mut self.hl.main_key_form, Zeroizing::new(String::new()));
-            let main = match MainKey::from_hex(&pasted) {
-                Ok(k) => k,
-                Err(e) => return self.hl.message = Some((format!("{e}."), true)),
-            };
-            if tr_hl::key::address_hex(&main.address()) != master {
-                return self.hl.message = Some(("That key is not this account's main wallet.".into(), true));
-            }
-            let base = name.clone().unwrap_or_else(|| format!("terminal-{}", device()));
-            let action = trader::revoke_agent(&base, now_ms());
-            match tr_hl::signing::sign_approve_agent(&main, &action) {
-                Ok(sig) => Some(trader::user_signed_body(&action, &sig)),
-                Err(e) => return self.hl.message = Some((format!("Could not sign: {e:#}"), true)),
-            }
-        } else {
-            None
-        };
-        self.hl_revoke_send(body);
+    /// Delete the agent key on this device only. It stays approved on Hyperliquid until it
+    /// expires or the wallet revokes it.
+    pub(super) fn hl_delete_agent_key(&mut self) {
+        self.hl_revoke_send(None);
     }
 
     /// Forget the agent here and post the signed revoke, if there is one.
     pub(super) fn hl_revoke_send(&mut self, body: Option<serde_json::Value>) {
         let Some(master) = self.hl_master() else { return };
+        self.hl_forget_agent();
+        self.hl.busy = Some("Revoking…");
+        self.hl_send(HlRequest::Revoke { store: self.hl.store.clone(), account: store_account(&master), body });
+    }
+
+    /// Forget the approved agent in prefs and memory; orders turn off.
+    pub(super) fn hl_forget_agent(&mut self) {
         self.hl.key = None;
         self.hl.key_tried = None;
         self.prefs.trading.hl.agent = None;
         self.prefs.trading.hl.enabled = false;
         self.save_hl_prefs();
-        self.hl.busy = Some("Revoking…");
-        self.hl_send(HlRequest::Revoke { store: self.hl.store.clone(), account: store_account(&master), body });
     }
 
     /// `userRole` and `extraAgents`, for Settings.
@@ -806,6 +740,7 @@ impl TerminalApp {
 
     /// Keep the ticket's market fresh, the rows current, and the dead man's switch armed.
     pub(super) fn hl_periodic(&mut self) {
+        self.wallet_sign_in_deadline();
         #[cfg(target_arch = "wasm32")]
         if self.hl_master().is_none() {
             self.hl_web_poll();
@@ -822,6 +757,7 @@ impl TerminalApp {
         self.hl_start();
         #[cfg(target_arch = "wasm32")]
         self.hl_web_poll();
+        self.wallet_periodic();
         self.hl_sync_portfolio();
         self.hl_ticket_market();
         self.hl_deadman();
@@ -1135,6 +1071,10 @@ impl TerminalApp {
             }
             HlResponse::Revoked(result) => {
                 self.hl.busy = None;
+                // A wallet revoke deleted the key here (whatever Hyperliquid answered).
+                if std::mem::take(&mut self.hl.wallet.revoking) {
+                    self.hl_forget_agent();
+                }
                 self.hl.message = Some(match result {
                     Ok(m) => (tr_hl::mask_addresses(&m), false),
                     Err(e) => (tr_hl::mask_addresses(&e), true),
@@ -1144,6 +1084,7 @@ impl TerminalApp {
                 self.hl_check_roles();
             }
             HlResponse::Done { id, label, outcome } => self.on_hl_done(id, label, outcome),
+            HlResponse::Wallet(w) => self.on_wallet(*w),
             HlResponse::OrderStatus { cloid, result } => {
                 let Some(u) = self.hl.uncertain.clone().filter(|u| u.cloid == cloid) else { return };
                 match result {
@@ -1240,6 +1181,7 @@ fn outcome_raw(o: &Outcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prefs::HlAgent;
 
     const MASTER: &str = "0x00000000000000000000000000000000000f107e";
 

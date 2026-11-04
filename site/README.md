@@ -45,6 +45,26 @@ npm run check
   the download starts anyway.
   Without JavaScript the buttons link straight to `/download`.
 
+## Wallet sign-in (`/wallet/`)
+
+`src/routes/wallet/` is where Terminal users create or open their built-in Hyperliquid
+**testnet** wallet (design: `docs/architecture/trading-hyperliquid.md` §4.5). The desktop app
+opens it in the system browser and the web app in a popup. The page signs the user in with an
+email code or a passkey through Turnkey's Auth Proxy (`@turnkey/core`). It then asks Turnkey for
+a 15-minute session bound to the app's own key, hands that back, and logs out. In export mode
+(`#mode=export`) it shows the recovery phrase in Turnkey's export iframe instead.
+
+It reads two public build-time variables, which are identifiers and not secrets:
+
+- `VITE_TURNKEY_ORGANIZATION_ID`: the parent Turnkey organization.
+- `VITE_TURNKEY_AUTH_PROXY_CONFIG_ID`: the Auth Proxy configuration.
+
+Set them in the Vercel project's environment variables; the deploy workflow's `vercel pull`
+brings them into the build. Without them the page only says that wallet sign-in isn't set up. No server route holds a
+Turnkey key: the Auth Proxy creates each user's sub-organization with a key Turnkey keeps.
+`VITE_TURNKEY_API_BASE_URL` and `VITE_TURNKEY_AUTH_PROXY_URL` point the SDK elsewhere (a
+local stand-in); leave them unset in production.
+
 ## Deploys
 
 GitHub Actions deploys the site, not Vercel's Git integration, because the browser app at `/app`

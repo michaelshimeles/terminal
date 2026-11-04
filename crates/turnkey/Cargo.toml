@@ -1,0 +1,38 @@
+[package]
+name = "tr-turnkey"
+description = "Built-in wallets on Turnkey: the device's session key and request stamps, the few Turnkey calls Terminal makes, and the desktop sign-in's loopback callback"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# An in-process stand-in for Turnkey's API and sign-in page, for tests and screenshots.
+# Never in a shipped build.
+mock = ["dep:k256"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+alloy-primitives = { version = "1", default-features = false, features = ["std", "k256"] }
+turnkey_api_key_stamper = "0.17.1"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+base64 = "0.22"
+hex = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+web-time = "1"
+k256 = { version = "0.13", default-features = false, features = ["std", "ecdsa"], optional = true }
+
+# The desktop sign-in listens for the browser's redirect on 127.0.0.1.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+# Key generation on the web reads the browser's crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
+tr-turnkey = { path = ".", features = ["mock"] }
