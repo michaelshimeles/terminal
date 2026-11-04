@@ -62,6 +62,20 @@ export async function verifyCode(
 	});
 }
 
+/// Verify the emailed code and log in to an existing wallet only (backup: never create one).
+export async function verifyCodeLoginOnly(
+	c: TurnkeyClient,
+	otp: { otpId: string; otpEncryptionTargetBundle: string },
+	code: string
+) {
+	const { verificationToken } = await c.verifyOtp({
+		otpId: otp.otpId,
+		otpEncryptionTargetBundle: otp.otpEncryptionTargetBundle,
+		otpCode: code.trim()
+	});
+	return c.loginWithOtp({ verificationToken });
+}
+
 export async function passkeyLogin(c: TurnkeyClient) {
 	return c.loginWithPasskey();
 }

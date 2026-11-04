@@ -53,7 +53,9 @@
 	const verify = () =>
 		run(async () => {
 			if (!otp) return;
-			await tk.verifyCode(await turnkey(), email.trim(), otp, code);
+			const c = await turnkey();
+			// Backing up opens an existing wallet; it never creates one.
+			await (request.mode === 'export' ? tk.verifyCodeLoginOnly(c, otp, code) : tk.verifyCode(c, email.trim(), otp, code));
 			await signedIn();
 		});
 
@@ -148,9 +150,11 @@
 					<button type="submit" disabled={busy || !email.includes('@')}>Email me a code</button>
 				</form>
 				<div class="or">or</div>
-				<div class="row">
+				<div class="row" class:single={request.mode === 'export'}>
 					<button class="secondary" onclick={() => passkey(false)} disabled={busy}>Sign in with a passkey</button>
-					<button class="secondary" onclick={() => passkey(true)} disabled={busy}>Create with a passkey</button>
+					{#if request.mode !== 'export'}
+						<button class="secondary" onclick={() => passkey(true)} disabled={busy}>Create with a passkey</button>
+					{/if}
 				</div>
 			{:else if stage === 'code'}
 				<form onsubmit={(e) => (e.preventDefault(), verify())}>
@@ -279,6 +283,9 @@
 		display: grid;
 		grid-template-columns: 1fr 1fr;
 		gap: 8px;
+	}
+	.row.single {
+		grid-template-columns: 1fr;
 	}
 	@media (max-width: 420px) {
 		.row {
