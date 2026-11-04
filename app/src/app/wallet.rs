@@ -60,6 +60,8 @@ pub struct WalletState {
     /// Spot USDC for the Deposit window: `(address, result)`.
     pub spot: Option<(String, Result<SpotUsdc, String>)>,
     spot_at: Option<Instant>,
+    /// A revoke is with the wallet: the agent is forgotten only once it really happens.
+    pub revoking: bool,
 }
 
 impl WalletState {
@@ -194,7 +196,10 @@ impl TerminalApp {
             .as_ref()
             .map(|a| tr_hl::trader::agent_base_name(&a.name).to_string())
             .unwrap_or_else(|| format!("terminal-{}", super::hl::device()));
-        self.hl_forget_agent();
+        // Orders stop now; the agent itself is forgotten when the revoke happens.
+        self.prefs.trading.hl.enabled = false;
+        self.save_hl_prefs();
+        self.hl.wallet.revoking = true;
         self.hl.busy = Some("Revoking: the wallet signs the replacement on Turnkey…");
         self.wallet_send(WalletRequest::Revoke { store: self.hl.store.clone(), session, master: w.address, base });
     }
@@ -268,6 +273,18 @@ impl TerminalApp {
                 {
                     self.hl.wallet.session = session;
                 }
+            }
+            WalletResponse::ApproveNotSigned(e) => {
+                self.hl.busy = None;
+                self.hl.pending_approval = None;
+                let e = tr_hl::mask_addresses(&e);
+                self.hl.message = Some((format!("Nothing was approved: {e}"), true));
+            }
+            WalletResponse::RevokeNotSigned(e) => {
+                self.hl.wallet.revoking = false;
+                self.hl.busy = None;
+                let e = tr_hl::mask_addresses(&e);
+                self.hl.message = Some((format!("Nothing was revoked; the trading key still works: {e}"), true));
             }
             WalletResponse::Balances { user, result } => {
                 if self.wallet().is_some_and(|w| w.address == user) {

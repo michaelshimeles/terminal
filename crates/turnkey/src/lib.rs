@@ -33,7 +33,7 @@ pub const SIGN_IN_PAGE: &str = "https://terminal.rasmic.xyz/wallet/";
 pub fn sign_in_page() -> String {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(u) = std::env::var("TR_WALLET_SIGN_IN_URL").ok().and_then(|u| client::loopback_only(&u)) {
-        tracing::warn!("turnkey: using a local mock sign-in page at {u}");
+        tracing::warn!("turnkey: using the local mock sign-in page named by TR_WALLET_SIGN_IN_URL");
         return format!("{u}/");
     }
     SIGN_IN_PAGE.to_string()

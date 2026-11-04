@@ -40,7 +40,7 @@ pub fn loopback_only(url: &str) -> Option<String> {
 pub fn api_url() -> String {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(u) = std::env::var("TR_TURNKEY_API_URL").ok().and_then(|u| loopback_only(&u)) {
-        tracing::warn!("turnkey: using a local mock API at {u}");
+        tracing::warn!("turnkey: using the local mock API named by TR_TURNKEY_API_URL");
         return u;
     }
     API_URL.to_string()

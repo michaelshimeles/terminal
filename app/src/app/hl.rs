@@ -1070,6 +1070,10 @@ impl TerminalApp {
             }
             HlResponse::Revoked(result) => {
                 self.hl.busy = None;
+                // A wallet revoke deleted the key here (whatever Hyperliquid answered).
+                if std::mem::take(&mut self.hl.wallet.revoking) {
+                    self.hl_forget_agent();
+                }
                 self.hl.message = Some(match result {
                     Ok(m) => (tr_hl::mask_addresses(&m), false),
                     Err(e) => (tr_hl::mask_addresses(&e), true),

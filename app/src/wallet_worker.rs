@@ -80,6 +80,10 @@ pub enum WalletResponse {
         user: String,
         result: Result<SpotUsdc, String>,
     },
+    /// The wallet didn't sign the approval: nothing was sent, and the new key is dropped.
+    ApproveNotSigned(String),
+    /// The wallet didn't sign the revoke, so nothing changed: the agent key is still here.
+    RevokeNotSigned(String),
 }
 
 /// The secret store item for a wallet's Turnkey session.
@@ -176,7 +180,8 @@ pub async fn handle(req: WalletRequest, send: impl Fn(HlResponse) + Clone + 'sta
                         HlResponse::Approved { master, agent: meta, key, result: Err(format!("{e:#}")), saved: Ok(()) }
                     }
                 },
-                Err(e) => HlResponse::Approved { master, agent: meta, key, result: Err(e), saved: Ok(()) },
+                // The agent key is dropped here; nothing was sent.
+                Err(e) => wallet(WalletResponse::ApproveNotSigned(e)),
             };
             send(r);
         }
@@ -189,8 +194,8 @@ pub async fn handle(req: WalletRequest, send: impl Fn(HlResponse) + Clone + 'sta
             };
             let r = match (signed, tr_hl::client::Client::new()) {
                 (Ok(body), Ok(client)) => revoke(&client, store, account, Some(body)).await,
-                (Err(e), _) => HlResponse::Revoked(Err(format!("Nothing changed: {e}"))),
-                (_, Err(e)) => HlResponse::Revoked(Err(format!("{e:#}"))),
+                (Err(e), _) => wallet(WalletResponse::RevokeNotSigned(e)),
+                (_, Err(e)) => wallet(WalletResponse::RevokeNotSigned(format!("{e:#}"))),
             };
             send(r);
         }
@@ -311,6 +316,65 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
         let err = wallet_sign(&tk, &late, &mock.address(), &action).await.unwrap_err();
         assert!(err.contains("expired"), "{err}");
+        assert!(mock.requests().is_empty());
+    }
+
+    /// An approval the wallet didn't sign is reported as such, not as Hyperliquid's refusal.
+    #[tokio::test]
+    async fn an_approval_the_wallet_did_not_sign_says_so() {
+        let mock = MockTurnkey::start(0, None).await.unwrap();
+        let key = SessionKey::generate();
+        let token = mock.mint_session(&key.public_hex(), 1);
+        let session = Arc::new(Session::accept(key, &token, now_secs()).unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let got = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = got.clone();
+        let req = WalletRequest::Approve {
+            store: AgentKeyStore::memory(),
+            session,
+            master: mock.address(),
+            device: "ci".into(),
+        };
+        handle(req, move |r| {
+            *sink.lock().unwrap() = Some(match r {
+                HlResponse::Wallet(w) => match *w {
+                    WalletResponse::ApproveNotSigned(e) => e,
+                    _ => "other".into(),
+                },
+                _ => "sent to Hyperliquid".into(),
+            });
+        })
+        .await;
+        assert!(got.lock().unwrap().as_deref().is_some_and(|e| e.contains("expired")), "{:?}", got.lock().unwrap());
+        assert!(mock.requests().is_empty());
+    }
+
+    /// A revoke the wallet didn't sign changes nothing: the agent key stays in the store and
+    /// the app is told so (it keeps the agent until a revoke really happens).
+    #[tokio::test]
+    async fn a_revoke_the_wallet_did_not_sign_keeps_the_agent() {
+        let mock = MockTurnkey::start(0, None).await.unwrap();
+        let store = AgentKeyStore::memory();
+        let master = mock.address();
+        let agent_item = crate::app::hl_store_account(&master);
+        store.save(&agent_item, &AgentKey::generate().to_hex()).unwrap();
+        let key = SessionKey::generate();
+        let token = mock.mint_session(&key.public_hex(), 1);
+        let session = Arc::new(Session::accept(key, &token, now_secs()).unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let got = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = got.clone();
+        let req = WalletRequest::Revoke { store: store.clone(), session, master, base: "terminal-ci".into() };
+        handle(req, move |r| {
+            *sink.lock().unwrap() = Some(match r {
+                HlResponse::Wallet(w) if matches!(*w, WalletResponse::RevokeNotSigned(_)) => "not signed",
+                HlResponse::Revoked(_) => "revoked",
+                _ => "other",
+            });
+        })
+        .await;
+        assert_eq!(*got.lock().unwrap(), Some("not signed"));
+        assert!(store.load(&agent_item).unwrap().is_some(), "the agent key is still here");
         assert!(mock.requests().is_empty());
     }
 
