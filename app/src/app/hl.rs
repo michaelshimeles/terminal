@@ -740,6 +740,7 @@ impl TerminalApp {
 
     /// Keep the ticket's market fresh, the rows current, and the dead man's switch armed.
     pub(super) fn hl_periodic(&mut self) {
+        self.wallet_sign_in_deadline();
         #[cfg(target_arch = "wasm32")]
         if self.hl_master().is_none() {
             self.hl_web_poll();

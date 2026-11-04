@@ -26,6 +26,9 @@ pub mod mock;
 pub use client::Client;
 pub use session::{Session, SessionKey};
 
+/// How long a sign-in waits for the browser, on the desktop and in the browser build.
+pub const SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Terminal's sign-in page.
 pub const SIGN_IN_PAGE: &str = "https://terminal.rasmic.xyz/wallet";
 

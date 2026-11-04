@@ -41,9 +41,45 @@ pub struct SignIn {
     pub url: Option<String>,
     pub started: Instant,
     then: Option<After>,
+    /// The wallet the pending action is for. A sign-in to any other wallet is refused.
+    expected: Option<String>,
     /// Web: the key waits here for the page's message. Desktop: the worker holds it.
     #[cfg(target_arch = "wasm32")]
     key: Option<SessionKey>,
+}
+
+impl SignIn {
+    fn new(id: u64, state: String, then: Option<After>, expected: Option<String>) -> Self {
+        Self {
+            id,
+            state,
+            #[cfg(not(target_arch = "wasm32"))]
+            public_key: String::new(),
+            url: None,
+            started: Instant::now(),
+            then,
+            expected,
+            #[cfg(target_arch = "wasm32")]
+            key: None,
+        }
+    }
+
+    /// Past the sign-in's deadline ([`tr_turnkey::SIGN_IN_TIMEOUT`]).
+    pub fn expired(&self) -> bool {
+        self.started.elapsed() > tr_turnkey::SIGN_IN_TIMEOUT
+    }
+
+    /// Refuse a wallet other than the one the pending action is for.
+    fn check_account(&self, address: &str) -> Result<(), String> {
+        match &self.expected {
+            Some(want) if !want.eq_ignore_ascii_case(address) => Err(format!(
+                "You signed in to wallet {}, but this was for wallet {}. Nothing changed; sign in with that wallet's email or passkey.",
+                super::hl_view::masked(address),
+                super::hl_view::masked(want)
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -65,6 +101,18 @@ pub struct WalletState {
 }
 
 impl WalletState {
+    /// A new id for a sign-in, never one used before in this run.
+    fn next_request_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    /// Forget the wallet's state but keep counting request ids, so a late answer to an old
+    /// sign-in can never match a new one.
+    fn reset(&mut self) {
+        *self = Self { next_id: self.next_id, ..Default::default() };
+    }
+
     /// Minutes left on the session, if it can still sign.
     pub fn session_minutes(&self) -> Option<u64> {
         let s = self.session.as_ref()?;
@@ -95,24 +143,28 @@ impl TerminalApp {
 
     /// Open the sign-in page. `then` runs once the session is back.
     pub(super) fn wallet_sign_in(&mut self, then: Option<After>) {
-        self.hl.wallet.next_id += 1;
-        let id = self.hl.wallet.next_id;
+        let id = self.hl.wallet.next_request_id();
         let key = SessionKey::generate();
         let state = random_state();
         let public_key = key.public_hex();
+        // An approve or revoke is for the wallet shown now, and only that one.
+        let expected = then.and(self.wallet().map(|w| w.address.clone()));
+        #[allow(unused_mut)]
+        let mut sign_in = SignIn::new(id, state.clone(), then, expected);
         self.hl.message = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.hl.wallet.signing_in =
-                Some(SignIn { id, state: state.clone(), public_key, url: None, started: Instant::now(), then });
+            sign_in.public_key = public_key;
+            self.hl.wallet.signing_in = Some(sign_in);
             self.wallet_send(WalletRequest::SignIn { id, store: self.hl.store.clone(), key, state });
         }
         #[cfg(target_arch = "wasm32")]
         {
             let url = tr_turnkey::web_sign_in_url(&web_page(), &public_key, &state);
             let opened = super::hl_web::wallet_popup(&url);
-            self.hl.wallet.signing_in =
-                Some(SignIn { id, state, url: Some(url), started: Instant::now(), then, key: Some(key) });
+            sign_in.url = Some(url);
+            sign_in.key = Some(key);
+            self.hl.wallet.signing_in = Some(sign_in);
             if !opened {
                 self.hl.message = Some((
                     "The browser blocked the sign-in window: allow pop-ups, then press Open Again.".into(),
@@ -263,7 +315,7 @@ impl TerminalApp {
                     return;
                 }
                 match result {
-                    Ok(signed) => self.wallet_signed_in(*signed, s.then),
+                    Ok(signed) => self.wallet_signed_in(*signed, &s),
                     Err(e) => self.hl.message = Some((tr_hl::mask_addresses(&e), true)),
                 }
             }
@@ -294,8 +346,16 @@ impl TerminalApp {
         }
     }
 
-    fn wallet_signed_in(&mut self, s: SignedIn, then: Option<After>) {
+    fn wallet_signed_in(&mut self, s: SignedIn, sign_in: &SignIn) {
         let SignedIn { session, address, user, saved } = s;
+        if let Err(e) = sign_in.check_account(&address) {
+            // Not the wallet the action was for: drop that session and change nothing.
+            let account = session_account(&address);
+            self.wallet_send(WalletRequest::EndSession { store: self.hl.store.clone(), account });
+            self.hl.message = Some((e, true));
+            return;
+        }
+        let then = sign_in.then;
         let organization_id = session.organization_id().to_string();
         if self.hl_master().as_deref() != Some(&address) {
             // Another account: its agent (if any) is not this one's.
@@ -325,15 +385,60 @@ impl TerminalApp {
 
     /// Stop showing the wallet here and forget its session (its agent key stays unless revoked).
     pub(super) fn wallet_remove(&mut self) {
+        self.wallet_cancel_sign_in();
         self.wallet_end_session();
         self.prefs.trading.hl.wallet = None;
-        self.hl.wallet = Default::default();
+        self.hl.wallet.reset();
+    }
+
+    /// Give up on a sign-in the browser never finished (the desktop's listener stops at the
+    /// same deadline; the browser build has no listener to time out).
+    pub(super) fn wallet_sign_in_deadline(&mut self) {
+        if self.hl.wallet.signing_in.as_ref().is_some_and(SignIn::expired) {
+            self.wallet_cancel_sign_in();
+            let mins = tr_turnkey::SIGN_IN_TIMEOUT.as_secs() / 60;
+            self.hl.message =
+                Some((format!("The sign-in wasn't finished within {mins} minutes. Start it again."), true));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Greptile #38: removing the wallet reset the request counter, so a cancelled sign-in's
+    /// late answer carried the same id as the next one and ended it.
+    #[test]
+    fn request_ids_stay_unique_when_the_wallet_is_removed() {
+        let mut w = WalletState::default();
+        let first = w.next_request_id();
+        w.reset();
+        assert_ne!(w.next_request_id(), first);
+    }
+
+    /// Greptile #38: a revoke (or approval) that needed a sign-in must not act on whichever
+    /// wallet the user happened to sign in to.
+    #[test]
+    fn a_sign_in_for_an_action_accepts_only_that_wallet() {
+        let a = "0x00000000000000000000000000000000000000aa";
+        let b = "0x00000000000000000000000000000000000000bb";
+        let pending = SignIn::new(1, "s".into(), Some(After::Revoke), Some(a.into()));
+        assert!(pending.check_account(a).is_ok());
+        assert!(pending.check_account(&a.to_ascii_uppercase().replace("0X", "0x")).is_ok());
+        assert!(pending.check_account(b).unwrap_err().contains("0x0000…00aa"));
+        let plain = SignIn::new(2, "s".into(), None, None);
+        assert!(plain.check_account(b).is_ok(), "a plain sign-in takes any wallet");
+    }
+
+    /// Greptile #38: the browser build's sign-in had no deadline at all.
+    #[test]
+    fn a_sign_in_expires_after_ten_minutes() {
+        let mut s = SignIn::new(1, "s".into(), None, None);
+        assert!(!s.expired());
+        s.started = Instant::now() - (tr_turnkey::SIGN_IN_TIMEOUT + Duration::from_secs(1));
+        assert!(s.expired());
+    }
 
     #[test]
     fn a_session_close_to_expiry_does_not_sign() {

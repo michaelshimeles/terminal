@@ -17,8 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::session::same_secret;
 
-/// How long the browser has to come back.
-pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(600);
+pub use crate::SIGN_IN_TIMEOUT;
 /// Bad requests tolerated before the sign-in gives up.
 const MAX_STRAY: usize = 32;
 const MAX_REQUEST: usize = 8 * 1024;

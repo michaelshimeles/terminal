@@ -76,7 +76,17 @@
 		}
 		if (request.mode !== 'desktop' && request.mode !== 'web') return;
 		stage = 'working';
-		const session = await tk.sessionForDevice(c, request.publicKey);
+		let session: string;
+		try {
+			session = await tk.sessionForDevice(c, request.publicKey);
+		} catch (e) {
+			// The page logged itself out either way: back to the sign-in controls (Cancel included).
+			stage = 'start';
+			otp = null;
+			code = '';
+			const why = e instanceof Error ? e.message : String(e);
+			throw new Error(`Signed in, but Turnkey didn't connect this device (${why}). Sign in again, or cancel.`);
+		}
 		answer({ session });
 	}
 
