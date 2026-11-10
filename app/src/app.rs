@@ -7,6 +7,7 @@
 mod broker;
 mod chrome;
 mod demo;
+mod faucet;
 mod hl;
 pub(crate) use hl::store_account as hl_store_account;
 mod hl_view;

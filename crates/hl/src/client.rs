@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::assets::{AssetRegistry, SUPPORTED_DEXES};
+use crate::faucet::DripOutcome;
 use crate::key::address_hex;
 use crate::model::*;
 use crate::network::Network;
@@ -175,6 +176,12 @@ impl Client {
         Self::with_urls(format!("{base}/info"), format!("{base}/exchange"))
     }
 
+    /// Unit tests only: a shorter deadline.
+    #[cfg(test)]
+    pub(crate) fn with_timeout(self, timeout: std::time::Duration) -> Self {
+        Self { timeout, ..self }
+    }
+
     fn with_urls(info_url: String, exchange_url: String) -> Result<Self> {
         let b = reqwest::Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
@@ -255,6 +262,32 @@ impl Client {
         Ok(parse_extra_agents(&self.info(json!({"type": "extraAgents", "user": address_hex(user)})).await?))
     }
 
+    /// The faucet request for `user` (see [`crate::faucet`]): a POST of
+    /// `{"type": "claimDrip", "user": …}` to this client's `/info` URL, which is testnet's.
+    pub fn claim_drip_request(&self, user: &Address) -> reqwest::Result<reqwest::Request> {
+        self.post(&self.info_url).json(&crate::faucet::request_body(user)).build()
+    }
+
+    /// Ask Hyperliquid testnet's faucet for a drip for `user`. Never fails: a network problem
+    /// is [`DripOutcome::Network`]. Logs the outcome's label only.
+    pub async fn claim_drip(&self, user: &Address) -> DripOutcome {
+        let outcome = match self.claim_drip_request(user) {
+            Err(e) => DripOutcome::Network(describe(&e)),
+            Ok(req) => match self.http.execute(req).await {
+                Err(e) => DripOutcome::Network(describe(&e)),
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    match r.text().await {
+                        Ok(text) => crate::faucet::classify(status, &text),
+                        Err(e) => DripOutcome::Network(describe(&e)),
+                    }
+                }
+            },
+        };
+        tracing::info!("hyperliquid testnet faucet: {}", outcome.label());
+        outcome
+    }
+
     /// Post a signed L1 action.
     pub async fn send(&self, signed: &Signed) -> Result<ExchangeResponse, SendError> {
         tracing::info!(kind = signed.kind, nonce = signed.nonce, "hyperliquid testnet: sending");
@@ -298,6 +331,27 @@ impl Client {
             serde_json::from_str(&text).map_err(|_| SendError::Uncertain(format!("unreadable answer: {text}")))?;
         Ok(ExchangeResponse::parse(&v))
     }
+}
+
+/// Why a request got no usable answer, in a few words, without the URL.
+fn describe(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return "timed out".into();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if e.is_connect() {
+        return "couldn't connect".into();
+    }
+    let mut text = e.to_string();
+    if let Some(url) = e.url() {
+        text = text.replace(&format!(" for url ({url})"), "").replace(url.as_str(), "the faucet");
+    }
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        text.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    text
 }
 
 /// A failure before any answer: certainly not sent only if the connection never opened.

@@ -1,0 +1,61 @@
+{
+  "about": "MOCK faucet answers for tests: what Hyperliquid testnet's /info might send back to {\"type\": \"claimDrip\", \"user\": ...}. Only no_mainnet_deposit came from the live faucet. The rest follow the testnet app's own handling (assets/Drip-*.js and its request helper) or are guesses, as each source says.",
+  "cases": [
+    {
+      "name": "claimed",
+      "status": 200,
+      "body": "null",
+      "expect": "claimed",
+      "source": "MOCK. The testnet app's Drip page shows 'Drip confirmed.' when the answer is null. Not seen live: that needs an address with a mainnet deposit."
+    },
+    {
+      "name": "no_mainnet_deposit",
+      "status": 200,
+      "body": "\"Cannot claim drip because user 0x00000000000000000000000000000000000000aa does not exist on mainnet.\"",
+      "expect": "no_mainnet_deposit",
+      "source": "Seen live on 2026-11-09 for a random, never-funded address (the address here is a placeholder)."
+    },
+    {
+      "name": "already_claimed",
+      "status": 200,
+      "body": "\"User has already claimed drip.\"",
+      "expect": "already_claimed",
+      "source": "MOCK. The wording is a guess: Hyperliquid's real text is not public. Any refusal that says 'already' counts."
+    },
+    {
+      "name": "rate_limited",
+      "status": 429,
+      "body": "null",
+      "expect": "rate_limited",
+      "source": "MOCK. The testnet app shows 'Rate limited' for HTTP 429."
+    },
+    {
+      "name": "other_refusal",
+      "status": 200,
+      "body": "\"Drip is paused.\"",
+      "expect": "refused:Drip is paused.",
+      "source": "MOCK. Any other string is a refusal in the faucet's own words, as the testnet app shows it."
+    },
+    {
+      "name": "bad_request",
+      "status": 422,
+      "body": "Failed to deserialize the JSON body into the target type",
+      "expect": "refused:Failed to deserialize the JSON body into the target type",
+      "source": "MOCK. A plain-text 4xx answer."
+    },
+    {
+      "name": "server_error",
+      "status": 502,
+      "body": "<html>Bad Gateway</html>",
+      "expect": "network",
+      "source": "MOCK. A 5xx answer from a proxy."
+    },
+    {
+      "name": "unreadable",
+      "status": 200,
+      "body": "<html>maintenance</html>",
+      "expect": "network",
+      "source": "MOCK. A 200 that isn't JSON."
+    }
+  ]
+}

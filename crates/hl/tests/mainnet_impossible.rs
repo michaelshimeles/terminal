@@ -230,3 +230,40 @@ fn sources_any(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         }
     }
 }
+
+/// The faucet request can only go to testnet: the client has no URL to set, and the request
+/// it builds is a POST to the testnet `/info` with nothing in it that names a network.
+#[test]
+fn the_faucet_asks_testnet_only() {
+    let user = tr_hl::SigningKey::address(&tr_hl::AgentKey::generate());
+    let req = tr_hl::client::Client::new().unwrap().claim_drip_request(&user).unwrap();
+    assert_eq!(req.url().scheme(), "https");
+    assert_eq!(req.url().host_str(), Some("api.hyperliquid-testnet.xyz"));
+    assert_eq!(req.url().path(), "/info");
+    assert_eq!(req.method(), "POST");
+    let body: serde_json::Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+    assert_eq!(body, serde_json::json!({"type": "claimDrip", "user": tr_hl::key::address_hex(&user)}));
+    assert!(!body.to_string().to_ascii_lowercase().contains("mainnet"), "{body}");
+}
+
+/// The faucet code names no mainnet host, nor any other host on Hyperliquid's mainnet domain
+/// (the testnet app's `api-ui.` included).
+#[test]
+fn the_faucet_code_names_no_mainnet_host() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let files = [
+        "crates/hl/src/faucet.rs",
+        "crates/hl/src/client.rs",
+        "crates/hl/tests/fixtures/faucet_mock.json",
+        "app/src/app/faucet.rs",
+        "app/src/app/wallet_view.rs",
+        "app/src/app/wallet.rs",
+        "app/src/wallet_worker.rs",
+    ];
+    for f in files {
+        let text = std::fs::read_to_string(repo.join(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+        for host in MAINNET_HOSTS.iter().chain(&["hyperliquid.xyz"]) {
+            assert!(!text.contains(host), "{f} names the mainnet host {host}");
+        }
+    }
+}

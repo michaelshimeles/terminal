@@ -1,11 +1,16 @@
-//! The built-in wallet's views: its part of Settings › Trading › Hyperliquid, the Deposit
-//! window (address, QR code, testnet balances) and the warning before a backup. Each shows
-//! the amber TESTNET badge.
+//! The built-in wallet's views: its part of Settings › Trading › Hyperliquid (with "Get
+//! testnet USDC", the faucet), the Deposit window (address, QR code, testnet balances) and
+//! the warning before a backup. Each shows the amber TESTNET badge.
+
+use std::time::Duration;
 
 use egui::{Color32, RichText, Ui};
+use tr_hl::faucet::DRIP_USDC;
 use tr_hl::nonce::now_ms;
+use web_time::Instant;
 
 use super::TerminalApp;
+use super::faucet::{Tone, drip_message, thousands};
 use super::hl_view::{masked, testnet_badge};
 use super::portfolio_view::money;
 use crate::prefs::HlPrefs;
@@ -56,6 +61,7 @@ impl TerminalApp {
                     {
                         self.wallet_open_deposit();
                     }
+                    self.drip_button(ui);
                     if ui
                         .button("Back Up Wallet…")
                         .on_hover_text("Show the recovery phrase in Turnkey's own window")
@@ -72,6 +78,7 @@ impl TerminalApp {
                         self.hl_disconnect();
                     }
                 });
+                self.drip_status(ui, &w.address);
                 ui.horizontal_wrapped(|ui| match self.hl.wallet.session_minutes() {
                     Some(m) => {
                         note(ui, &format!("Signed in to Turnkey for {m} more min."));
@@ -217,6 +224,52 @@ impl TerminalApp {
                 );
             }
             None => {}
+        }
+    }
+
+    /// "Get testnet USDC". Off while a request is out and for a minute after the faucet answers.
+    fn drip_button(&mut self, ui: &mut Ui) {
+        let drip = &self.hl.wallet.drip;
+        let asking = drip.in_flight();
+        let left = drip.cooldown_left(Instant::now());
+        let label = match left {
+            Some(d) => format!("Get testnet USDC ({} s)", d.as_secs() + u64::from(d.subsec_nanos() > 0)),
+            None => "Get testnet USDC".to_string(),
+        };
+        let hover = format!(
+            "Asks Hyperliquid's testnet faucet for {} test USDC for this wallet. Testnet only, and nothing is signed. The faucet pays only addresses that have deposited on Hyperliquid mainnet.",
+            thousands(DRIP_USDC)
+        );
+        let waiting = if asking { "Asking the faucet…" } else { "You can ask again when the countdown ends" };
+        if ui
+            .add_enabled(!asking && left.is_none(), egui::Button::new(label))
+            .on_hover_text(hover)
+            .on_disabled_hover_text(waiting)
+            .clicked()
+        {
+            self.wallet_claim_drip();
+        }
+        if left.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
+    /// The faucet request in flight, or what the faucet last said for `address`.
+    fn drip_status(&self, ui: &mut Ui, address: &str) {
+        let drip = &self.hl.wallet.drip;
+        if drip.in_flight() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.label(RichText::new("Asking Hyperliquid's testnet faucet…").font(ui_font(11.5)).color(muted()));
+            });
+        } else if let Some(outcome) = drip.last_for(address) {
+            let (message, tone) = drip_message(outcome);
+            let color = match tone {
+                Tone::Good => theme::up(),
+                Tone::Refused => amber(),
+                Tone::Failed => theme::down(),
+            };
+            ui.label(RichText::new(message).font(ui_font(12.0)).color(color));
         }
     }
 

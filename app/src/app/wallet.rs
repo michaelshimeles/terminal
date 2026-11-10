@@ -98,6 +98,8 @@ pub struct WalletState {
     spot_at: Option<Instant>,
     /// A revoke is with the wallet: the agent is forgotten only once it really happens.
     pub revoking: bool,
+    /// "Get testnet USDC": the faucet request in flight or its last answer.
+    pub drip: super::faucet::DripState,
 }
 
 impl WalletState {
@@ -132,7 +134,7 @@ fn web_page() -> String {
 }
 
 impl TerminalApp {
-    fn wallet_send(&self, r: WalletRequest) {
+    pub(super) fn wallet_send(&self, r: WalletRequest) {
         self.worker.send(Request::Wallet(r));
     }
 
@@ -276,6 +278,13 @@ impl TerminalApp {
         }
     }
 
+    /// Read spot USDC again now (after a faucet drip).
+    pub(super) fn wallet_refresh_balances(&mut self) {
+        let Some(w) = self.wallet().cloned() else { return };
+        self.hl.wallet.spot_at = Some(Instant::now());
+        self.wallet_send(WalletRequest::Balances { user: w.address });
+    }
+
     pub(super) fn wallet_open_deposit(&mut self) {
         self.hl.wallet.deposit = true;
         self.hl.wallet.spot_at = None;
@@ -343,6 +352,7 @@ impl TerminalApp {
                     self.hl.wallet.spot = Some((user, result));
                 }
             }
+            WalletResponse::Drip { user, outcome } => self.on_drip(user, outcome),
         }
     }
 
