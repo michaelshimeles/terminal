@@ -428,6 +428,8 @@ Unrealized PnL is then repriced from the gateway's live marks on mainnet, or tes
 
 **Testnet funding caveat:** the faucet gives 1,000 mock USDC only to addresses that "have deposited on mainnet with the same address" [doc: FAUCET]. For an Ontario resident, that mainnet deposit is itself a ToS question (§12, Q2).
 
+**Get testnet USDC (2026-11-09).** Settings › Trading › Hyperliquid has a button next to Deposit… that asks the faucet for the built-in wallet. It sends the same request as the testnet app's Faucet page, `{"type": "claimDrip", "user": "0x…"}` to the testnet `/info`, unsigned (`tr_hl::faucet`, `Client::claim_drip`). The faucet answers `null` for a drip and a string for a refusal. For an address with no mainnet deposit the string is "Cannot claim drip because user 0x… does not exist on mainnet.", and the app explains that and points to Deposit…. HTTP 429 means rate limited. The button stays off while a request is out and for 60 s after each answer. `tests/mainnet_impossible.rs` checks that the request goes to the testnet host and that the faucet code names no `hyperliquid.xyz` host.
+
 ---
 
 ## 12. Legal and Terms of Use (needs Micky)

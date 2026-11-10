@@ -5,6 +5,7 @@
 //!   developer-only `testnet_check` example, both redacted. The app's main wallet is the
 //!   built-in Turnkey wallet, which signs through [`signing::sign_approve_agent_with`].
 //! - [`signing`]: L1 phantom-agent and user-signed EIP-712 signatures.
+//! - [`faucet`]: testnet's faucet (`claimDrip`), unsigned.
 //! - [`actions`]: order, cancel, cancelByCloid, modify, updateLeverage, scheduleCancel, noop
 //!   and approveAgent, with the field order Hyperliquid hashes.
 //!
@@ -16,6 +17,7 @@ pub mod actions;
 pub mod assets;
 pub mod caps;
 pub mod client;
+pub mod faucet;
 pub mod key;
 pub mod model;
 pub mod network;

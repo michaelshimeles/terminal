@@ -1,6 +1,7 @@
 //! The built-in wallet's background work: the desktop sign-in (a loopback listener the
 //! browser returns to), turning a Turnkey session into a signed-in wallet, the Turnkey
-//! session in the OS secret store, and `approveAgent` signed by the wallet.
+//! session in the OS secret store, `approveAgent` signed by the wallet, and the testnet
+//! faucet's drip (unsigned).
 //!
 //! Turnkey signs only here, and only through `tr_hl::signing::sign_approve_agent_with`, which
 //! hands it the digest of a testnet approval and nothing else. Orders never come this way:
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tr_broker::secrets::AgentKeyStore;
 use tr_data::rt;
+use tr_hl::faucet::DripOutcome;
 use tr_hl::model::SpotUsdc;
 use tr_hl::nonce::now_ms;
 use tr_hl::signing::sign_approve_agent_with;
@@ -49,6 +51,8 @@ pub enum WalletRequest {
     Revoke { store: AgentKeyStore, session: Arc<Session>, master: String, base: String },
     /// Spot USDC for the Deposit window.
     Balances { user: String },
+    /// Ask testnet's faucet for a drip for the wallet (unsigned; testnet only).
+    ClaimDrip { id: u64, user: String },
 }
 
 /// A wallet the user just signed in to.
@@ -79,6 +83,12 @@ pub enum WalletResponse {
     Balances {
         user: String,
         result: Result<SpotUsdc, String>,
+    },
+    /// What the faucet said to [`WalletRequest::ClaimDrip`].
+    Drip {
+        id: u64,
+        user: String,
+        outcome: DripOutcome,
     },
     /// The wallet didn't sign the approval: nothing was sent, and the new key is dropped.
     ApproveNotSigned(String),
@@ -205,6 +215,14 @@ pub async fn handle(req: WalletRequest, send: impl Fn(HlResponse) + Clone + 'sta
                 (Err(e), _) | (_, Err(e)) => Err(format!("{e:#}")),
             };
             send(wallet(WalletResponse::Balances { user, result }));
+        }
+        WalletRequest::ClaimDrip { id, user } => {
+            let outcome = match (tr_hl::client::Client::new(), tr_hl::key::parse_address(&user)) {
+                (Ok(c), Ok(a)) => c.claim_drip(&a).await,
+                (Err(e), _) => DripOutcome::Network(format!("{e:#}")),
+                (_, Err(e)) => DripOutcome::Refused(format!("{e:#}")),
+            };
+            send(wallet(WalletResponse::Drip { id, user, outcome }));
         }
     }
 }
