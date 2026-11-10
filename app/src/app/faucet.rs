@@ -25,8 +25,8 @@ pub enum Tone {
 /// The faucet request for the wallet: in flight, or the last answer.
 #[derive(Default)]
 pub struct DripState {
-    /// The address a request is out for.
-    asking: Option<String>,
+    /// The request that is out: its id and the address it is for.
+    asking: Option<(u64, String)>,
     /// The last answer: for which address, what, and when.
     last: Option<(String, DripOutcome, Instant)>,
 }
@@ -44,24 +44,22 @@ impl DripState {
         (!left.is_zero()).then_some(left)
     }
 
-    /// Start a request for `user`. `false`: one is out, or the cooldown hasn't ended.
-    pub fn start(&mut self, user: &str, now: Instant) -> bool {
+    /// Start request `id` for `user`. `false`: one is out, or the cooldown hasn't ended.
+    /// Ids must never repeat in a run (the wallet's request counter survives its removal).
+    pub fn start(&mut self, id: u64, user: &str, now: Instant) -> bool {
         if self.in_flight() || self.cooldown_left(now).is_some() {
             return false;
         }
-        self.asking = Some(user.to_string());
+        self.asking = Some((id, user.to_string()));
         true
     }
 
-    /// The faucet's answer for `user`. `None` when nothing was asked for that address (a late
-    /// answer for a wallet that was removed); otherwise whether to re-read the balances.
-    pub fn finish(&mut self, user: &str, outcome: DripOutcome, now: Instant) -> Option<bool> {
-        if !self.asking.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(user)) {
-            return None;
-        }
-        self.asking = None;
+    /// The faucet's answer to request `id`. `None` when that request isn't the one out (a late
+    /// answer from before the wallet was removed); otherwise whether to re-read the balances.
+    pub fn finish(&mut self, id: u64, outcome: DripOutcome, now: Instant) -> Option<bool> {
+        let (_, user) = self.asking.take_if(|(asked, _)| *asked == id)?;
         let refresh = matches!(outcome, DripOutcome::Claimed { .. });
-        self.last = Some((user.to_string(), outcome, now));
+        self.last = Some((user, outcome, now));
         Some(refresh)
     }
 
@@ -120,14 +118,15 @@ impl super::TerminalApp {
     /// The button: ask the faucet for the wallet shown, unless a request is out or cooling down.
     pub(super) fn wallet_claim_drip(&mut self) {
         let Some(w) = self.wallet().cloned() else { return };
-        if self.hl.wallet.drip.start(&w.address, Instant::now()) {
-            self.wallet_send(WalletRequest::ClaimDrip { user: w.address });
+        let id = self.hl.wallet.next_request_id();
+        if self.hl.wallet.drip.start(id, &w.address, Instant::now()) {
+            self.wallet_send(WalletRequest::ClaimDrip { id, user: w.address });
         }
     }
 
     /// The worker's answer.
-    pub(super) fn on_drip(&mut self, user: String, outcome: DripOutcome) {
-        let refresh = self.hl.wallet.drip.finish(&user, outcome, Instant::now());
+    pub(super) fn on_drip(&mut self, id: u64, user: String, outcome: DripOutcome) {
+        let refresh = self.hl.wallet.drip.finish(id, outcome, Instant::now());
         // The user stream brings the perp balance on its own. Read spot USDC now.
         if refresh == Some(true) && self.wallet().is_some_and(|w| w.address == user) {
             self.wallet_refresh_balances();
@@ -198,34 +197,35 @@ mod tests {
             let t0 = Instant::now();
             assert!(!s.in_flight());
             assert_eq!(s.cooldown_left(t0), None);
-            assert!(s.start(A, t0));
+            assert!(s.start(1, A, t0));
             assert!(s.in_flight());
-            assert!(!s.start(A, t0), "a second request while one is out");
-            let refresh = s.finish(A, outcome.clone(), t0);
+            assert!(!s.start(2, A, t0), "a second request while one is out");
+            let refresh = s.finish(1, outcome.clone(), t0);
             assert_eq!(refresh, Some(matches!(outcome, DripOutcome::Claimed { .. })), "{outcome:?}");
             assert!(!s.in_flight());
             assert_eq!(s.last_for(A), Some(&outcome));
             assert_eq!(s.cooldown_left(t0), Some(COOLDOWN));
             let later = t0 + COOLDOWN / 2;
             assert_eq!(s.cooldown_left(later), Some(COOLDOWN / 2));
-            assert!(!s.start(A, later), "{outcome:?}: started during the cooldown");
+            assert!(!s.start(3, A, later), "{outcome:?}: started during the cooldown");
             let after = t0 + COOLDOWN;
             assert_eq!(s.cooldown_left(after), None);
-            assert!(s.start(A, after), "{outcome:?}");
+            assert!(s.start(4, A, after), "{outcome:?}");
         }
     }
 
-    /// An answer for another address, or when nothing was asked, changes nothing.
+    /// An answer to any other request, or when nothing was asked, changes nothing.
     #[test]
     fn a_stray_answer_is_ignored() {
         let t0 = Instant::now();
         let mut s = DripState::default();
-        assert_eq!(s.finish(A, DripOutcome::Claimed { usdc: DRIP_USDC }, t0), None);
+        assert_eq!(s.finish(1, DripOutcome::Claimed { usdc: DRIP_USDC }, t0), None);
         assert_eq!(s.cooldown_left(t0), None);
-        assert!(s.start(A, t0));
-        assert_eq!(s.finish(B, DripOutcome::Claimed { usdc: DRIP_USDC }, t0), None);
-        assert!(s.in_flight(), "still waiting for A's answer");
-        assert_eq!(s.finish(A, DripOutcome::NoMainnetDeposit, t0), Some(false));
+        assert!(s.start(2, A, t0));
+        assert_eq!(s.finish(1, DripOutcome::Claimed { usdc: DRIP_USDC }, t0), None);
+        assert!(s.in_flight(), "still waiting for request 2");
+        assert_eq!(s.finish(2, DripOutcome::NoMainnetDeposit, t0), Some(false));
+        assert_eq!(s.last_for(A), Some(&DripOutcome::NoMainnetDeposit));
         assert_eq!(s.last_for(B), None, "A's answer isn't shown for B");
     }
 }

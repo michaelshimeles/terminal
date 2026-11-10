@@ -52,7 +52,7 @@ pub enum WalletRequest {
     /// Spot USDC for the Deposit window.
     Balances { user: String },
     /// Ask testnet's faucet for a drip for the wallet (unsigned; testnet only).
-    ClaimDrip { user: String },
+    ClaimDrip { id: u64, user: String },
 }
 
 /// A wallet the user just signed in to.
@@ -86,6 +86,7 @@ pub enum WalletResponse {
     },
     /// What the faucet said to [`WalletRequest::ClaimDrip`].
     Drip {
+        id: u64,
         user: String,
         outcome: DripOutcome,
     },
@@ -215,13 +216,13 @@ pub async fn handle(req: WalletRequest, send: impl Fn(HlResponse) + Clone + 'sta
             };
             send(wallet(WalletResponse::Balances { user, result }));
         }
-        WalletRequest::ClaimDrip { user } => {
+        WalletRequest::ClaimDrip { id, user } => {
             let outcome = match (tr_hl::client::Client::new(), tr_hl::key::parse_address(&user)) {
                 (Ok(c), Ok(a)) => c.claim_drip(&a).await,
                 (Err(e), _) => DripOutcome::Network(format!("{e:#}")),
                 (_, Err(e)) => DripOutcome::Refused(format!("{e:#}")),
             };
-            send(wallet(WalletResponse::Drip { user, outcome }));
+            send(wallet(WalletResponse::Drip { id, user, outcome }));
         }
     }
 }

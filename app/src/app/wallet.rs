@@ -103,8 +103,8 @@ pub struct WalletState {
 }
 
 impl WalletState {
-    /// A new id for a sign-in, never one used before in this run.
-    fn next_request_id(&mut self) -> u64 {
+    /// A new id for a sign-in or a faucet request, never one used before in this run.
+    pub(super) fn next_request_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
     }
@@ -352,7 +352,7 @@ impl TerminalApp {
                     self.hl.wallet.spot = Some((user, result));
                 }
             }
-            WalletResponse::Drip { user, outcome } => self.on_drip(user, outcome),
+            WalletResponse::Drip { id, user, outcome } => self.on_drip(id, user, outcome),
         }
     }
 
@@ -448,6 +448,29 @@ mod tests {
         assert!(!s.expired());
         s.started = Instant::now() - (tr_turnkey::SIGN_IN_TIMEOUT + Duration::from_secs(1));
         assert!(s.expired());
+    }
+
+    /// Greptile #40: a faucet answer was matched by address only, so after removing the wallet
+    /// and adding it again, the first request's late answer ended the second one.
+    #[test]
+    fn a_late_drip_answer_from_before_a_removal_is_ignored() {
+        use tr_hl::faucet::{DRIP_USDC, DripOutcome};
+        let a = "0x00000000000000000000000000000000000000aa";
+        let t0 = Instant::now();
+        let mut w = WalletState::default();
+        let first = w.next_request_id();
+        assert!(w.drip.start(first, a, t0));
+        w.reset();
+        let second = w.next_request_id();
+        assert!(w.drip.start(second, a, t0), "the same wallet, added again, asks again");
+        assert_eq!(
+            w.drip.finish(first, DripOutcome::Claimed { usdc: DRIP_USDC }, t0),
+            None,
+            "the first request's answer"
+        );
+        assert!(w.drip.in_flight(), "the second request is still out");
+        assert_eq!(w.drip.finish(second, DripOutcome::NoMainnetDeposit, t0), Some(false));
+        assert_eq!(w.drip.last_for(a), Some(&DripOutcome::NoMainnetDeposit));
     }
 
     #[test]
