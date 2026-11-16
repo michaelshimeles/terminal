@@ -1,0 +1,94 @@
+---
+name: Nix flake
+
+# Validates the flake (flake.nix + package.nix + default.nix). Runs on
+# pushes and PRs that touch Nix files or Cargo manifests/lockfile — a
+# lockfile change can invalidate the vendored-deps hash even when no .nix
+# file changed. Manual dispatch for ad-hoc runs.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "**/*.nix"
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - ".github/workflows/nix.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "**/*.nix"
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - ".github/workflows/nix.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group:
+    nix-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: nix flake (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest = x86_64-linux, macos-26 = aarch64-darwin,
+        # macos-26-intel = x86_64-darwin (exercises the nixpkgs-darwin-legacy
+        # pin). aarch64-linux is covered by flake check --all-systems eval.
+        runner: [ubuntu-latest, macos-26, macos-26-intel]
+    steps:
+      - name: Checkout
+        # actions/checkout v4
+        uses: >-
+          actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          # Full history — flake-compat (default.nix) evaluates revCount,
+          # which fails on checkout's default shallow clone.
+          fetch-depth: 0
+
+      - name: Install Nix
+        # DeterminateSystems/nix-installer-action v23
+        uses: >-
+          DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa
+
+      - name: Nix store cache (GitHub Actions cache)
+        # DeterminateSystems/magic-nix-cache-action v15 — the static binary
+        # fails on macOS runners (dyld libc++ mismatch); darwin builds work
+        # without the cache, just slower.
+        uses: >-
+          DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7
+        if: runner.os == 'Linux'
+        with:
+          use-flakehub: false
+
+      # Evaluate every system's outputs (including darwin on an ubuntu
+      # runner) without realising them; the build steps below realise for
+      # the runner's own system.
+      - name: nix flake check --all-systems
+        run: nix flake check --all-systems --no-build
+
+      - name: nix build .#default
+        run: nix build .#default --print-build-logs
+
+      # SECURITY: nix run executes the built binary outside the Nix sandbox
+      # where it can reach the OIDC endpoint and GITHUB_TOKEN. On a PR the
+      # binary is PR-controlled code, so gate to non-PR events.
+      - name: nix run .#default -- --version
+        if: github.event_name != 'pull_request'
+        run: nix run .#default -- --version
+
+      # The non-flake entry point (flake-compat shim over default.nix).
+      - name: nix-build default.nix
+        run: nix-build default.nix --no-out-link

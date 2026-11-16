@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
+  "packages": [
+    "rustc",
+    "cargo",
+    "clippy",
+    "rustfmt",
+    "rust-analyzer",
+    "pkg-config",
+    "cmake",
+    "sqlite",
+    "act"
+  ],
+  "shell": {
+    "init_hook": [
+      "echo 'terminal dev environment (cargo)'"
+    ],
+    "scripts": {
+      "build": "cargo build --release",
+      "test": "cargo test --workspace",
+      "lint": "cargo clippy --release --workspace --all-targets -- -D warnings",
+      "fmt": "cargo fmt --all",
+      "run": "cargo run --",
+      "bundle": "./scripts/bundle-macos.sh"
+    }
+  }
+}
