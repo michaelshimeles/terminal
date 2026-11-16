@@ -2,6 +2,7 @@
 name = "tr-broker"
 description = "Brokerage accounts through SnapTrade: signed API client, portfolio model, order entry and credential storage"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]

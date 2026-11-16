@@ -2,6 +2,7 @@
 name = "terminal"
 description = "Bloomberg-style trading terminal with GPU charts and congressional trade tracking"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 default-run = "terminal"
 

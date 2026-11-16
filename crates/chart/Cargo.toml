@@ -2,6 +2,7 @@
 name = "tr-chart"
 description = "GPU chart rendering (wgpu) with LOD pyramids, viewport math and egui integration"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
