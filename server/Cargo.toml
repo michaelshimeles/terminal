@@ -2,6 +2,7 @@
 name = "tr-gateway"
 description = "Terminal data server: one upstream feed fanned out to every Terminal client"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]

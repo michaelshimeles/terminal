@@ -2,6 +2,7 @@
 name = "tr-data"
 description = "Pluggable market-data providers (Alpaca, Yahoo, sample) and a SQLite bar cache"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]

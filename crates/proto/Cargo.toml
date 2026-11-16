@@ -2,6 +2,7 @@
 name = "tr-proto"
 description = "Client protocol between Terminal clients and the Terminal data server"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 # Shared by the server, the desktop app and the browser build, so it must build for

@@ -2,6 +2,7 @@
 name = "tr-hl"
 description = "Hyperliquid order entry on testnet: L1 and user-signed signing, actions, asset ids, rounding, hard caps, info/exchange clients and the user stream"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]
