@@ -6,3 +6,9 @@
 /.env*
 secrets/
 snaptrade*.json
+
+# Nix build result symlinks
+/result
+/result-*
+# Devbox generated artifacts
+.devbox/

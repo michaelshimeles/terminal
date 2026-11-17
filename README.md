@@ -206,6 +206,56 @@ for Updates… or `UPDATE` checks at once. `scripts/check-macos-cross.sh` compil
 and lints the whole workspace for aarch64-apple-darwin from Linux (zig as the C cross-compiler;
 linking needs the macOS SDK).
 
+### Nix
+
+The project provides an optional Nix flake for users who already use Nix. The
+flake builds the native GUI binary from source on macOS (Apple Silicon and
+Intel) and Linux:
+
+```bash
+# Run the latest source from the default branch (launches the GUI)
+nix run github:michaelshimeles/terminal
+
+# Install into your profile
+nix profile add github:michaelshimeles/terminal
+
+# Build / develop
+nix build github:michaelshimeles/terminal
+nix develop github:michaelshimeles/terminal
+```
+
+The flake exposes `packages.<system>.default` (alias: `terminal`),
+`apps.<system>.default`, `devShells.<system>.default`, and `overlays.default`.
+On Linux the binary's ELF rpath is extended with the Vulkan loader, Wayland,
+libGL and libxkbcommon so it can find the display drivers dlopen()ed at
+runtime. `x86_64-darwin` builds against a pinned stable nixpkgs branch
+(`nixpkgs-26.05-darwin`) because nixpkgs-unstable no longer supports Intel
+macOS.
+
+Non-flake Nix works too: `nix-build` uses `default.nix` (a flake-compat shim
+pinned to the same nixpkgs revisions as `flake.lock`).
+
+### Devbox
+
+For a reproducible development environment, use Devbox:
+
+```bash
+# Install Devbox first (if not already installed)
+curl -fsSL https://get.jetify.dev/devbox | bash
+
+# Enter the environment (Rust toolchain, pkg-config, cmake, sqlite, act)
+devbox shell
+
+# Build the project
+devbox run build
+```
+
+Or install Devbox via Homebrew:
+
+```bash
+brew install jetify-com/devbox/devbox
+```
+
 ## In the browser
 
 The same code also builds for WebAssembly and runs in a browser tab on WebGPU:
