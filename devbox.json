@@ -1,19 +1,54 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
-  "packages": [
-    "rustc",
-    "cargo",
-    "clippy",
-    "rustfmt",
-    "rust-analyzer",
-    "pkg-config",
-    "cmake",
-    "sqlite",
-    "act"
-  ],
+  "packages": {
+    "act": "latest",
+    "cargo": "latest",
+    "clippy": "latest",
+    "cmake": "latest",
+    "libGL": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "libx11": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "libxcb": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "libxcursor": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "libxi": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "libxkbcommon": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "pkg-config": "latest",
+    "rust-analyzer": "latest",
+    "rustc": "latest",
+    "rustfmt": "latest",
+    "sqlite": "latest",
+    "vulkan-loader": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "wayland": {
+      "version": "latest",
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    }
+  },
   "shell": {
     "init_hook": [
-      "echo 'terminal dev environment (cargo)'"
+      "echo 'terminal dev environment (cargo)'",
+      // cargo-built binaries dlopen the display/GPU libs at runtime; the nix
+      // profile lib dir is not on the default linker search path.
+      "if [ \"$(uname -s)\" = \"Linux\" ]; then export LD_LIBRARY_PATH=\"$PWD/.devbox/nix/profile/default/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"; fi"
     ],
     "scripts": {
       "build": "cargo build --release",

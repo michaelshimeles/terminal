@@ -89,6 +89,27 @@ jobs:
         if: github.event_name != 'pull_request'
         run: nix run .#default -- --version
 
+      # Packaged GUI smoke test under Xvfb. The wrapper's --version/--help
+      # paths exit before the real binary runs, so they cannot catch missing
+      # runtime libraries or a broken display setup; TR_SMOKE_SECS runs the
+      # real GUI on offline sample data and quits after N seconds. Same trust
+      # rules as above: the binary is PR-controlled on pull_request events.
+      - name: Packaged GUI smoke test (Xvfb)
+        if: github.event_name != 'pull_request' && runner.os == 'Linux'
+        env:
+          TR_PROVIDER: sample
+          TR_CONGRESS_REFRESH_MIN: "0"
+          TR_SMOKE_SECS: "6"
+          TR_DATA_DIR: ${{ runner.temp }}/terminal-nix
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb libxkbcommon-x11-0 libxcb-xkb1 mesa-vulkan-drivers
+          nix build .#default --print-build-logs
+          xvfb-run -a ./result/bin/terminal > smoke-nix.log 2>&1
+          status=$?
+          cat smoke-nix.log
+          grep -q "smoke:" smoke-nix.log
+          exit $status
+
       # The non-flake entry point (flake-compat shim over default.nix).
       - name: nix-build default.nix
         run: nix-build default.nix --no-out-link

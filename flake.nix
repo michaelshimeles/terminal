@@ -66,6 +66,19 @@
         system:
         let
           pkgs = pkgsFor system;
+          # Display/GPU libraries the GUI links or dlopens at runtime
+          # (mirrors package.nix). mkShell.packages only sets build flags,
+          # so they also go on LD_LIBRARY_PATH for `cargo run`.
+          linuxLibs = [
+            pkgs.libxkbcommon
+            pkgs.wayland
+            pkgs.vulkan-loader
+            pkgs.libGL
+            pkgs.libx11
+            pkgs.libxcursor
+            pkgs.libxi
+            pkgs.libxcb
+          ];
         in
         {
           default = pkgs.mkShell {
@@ -80,16 +93,10 @@
               pkgs.sqlite # inspect the app's SQLite market-data cache
               pkgs.act # run GitHub Actions workflows locally
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-              pkgs.libxkbcommon
-              pkgs.wayland
-              pkgs.vulkan-loader
-              pkgs.libGL
-              pkgs.libx11
-              pkgs.libxcursor
-              pkgs.libxi
-              pkgs.libxcb
-            ];
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxLibs;
+            shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath linuxLibs}:$LD_LIBRARY_PATH"
+            '';
           };
         }
       );
