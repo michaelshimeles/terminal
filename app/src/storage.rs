@@ -93,6 +93,18 @@ mod imp {
         if old == new || new.join(".migrated-from-data").exists() {
             return new.to_path_buf();
         }
+        #[cfg(target_os = "linux")]
+        let _lock = match migration_lock(new) {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::warn!("could not lock configuration migration in {}: {e}", new.display());
+                return old.to_path_buf();
+            }
+        };
+        // Another process may have completed the migration while we waited for the lock.
+        if new.join(".migrated-from-data").exists() {
+            return new.to_path_buf();
+        }
         fn copy_missing(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> io::Result<()> {
             if from.is_dir() {
                 std::fs::create_dir_all(to)?;
@@ -101,6 +113,9 @@ mod imp {
                     copy_missing(&entry.path(), &to.join(entry.file_name()), created)?;
                 }
             } else if from.is_file() {
+                if to.exists() {
+                    return Ok(());
+                }
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static NEXT: AtomicU64 = AtomicU64::new(0);
                 let tmp = to.with_extension(format!(
@@ -149,6 +164,31 @@ mod imp {
             return old.to_path_buf();
         }
         new.to_path_buf()
+    }
+
+    /// Hold an OS lock until migration and any rollback are complete. The persistent lock file
+    /// must not be removed: doing so could let another process lock a different inode.
+    #[cfg(target_os = "linux")]
+    pub(super) fn migration_lock(dir: &Path) -> io::Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        std::fs::create_dir_all(dir)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".migration.lock"))?;
+        loop {
+            // SAFETY: file owns a valid descriptor throughout the call and remains open until
+            // the caller drops the returned file, releasing the advisory lock.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(file);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
     }
 
     /// Moves the data folder from `old` (its name before the app was renamed) to `new` the first
@@ -440,6 +480,47 @@ mod tests {
         assert_eq!(migrate_config(&old, &new), new);
         assert_eq!(read(&new.join("prefs.json")).unwrap(), b"updated");
         assert_eq!(read(&new.join("settings.json")).unwrap(), b"existing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migration_waits_for_another_process_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = scratch("xdg-lock");
+        let old = root.join("data");
+        let new = root.join("config");
+        write_atomic(&old.join("prefs.json"), b"preferences").unwrap();
+        let lock = imp::migration_lock(&new).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let old_thread = old.clone();
+        let new_thread = new.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            migrate_config(&old_thread, &new_thread)
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!new.join(".migrated-from-data").exists());
+        drop(lock);
+        assert_eq!(worker.join().unwrap(), new);
+        assert_eq!(read(&new.join("prefs.json")).unwrap(), b"preferences");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migration_skips_unreadable_source_when_destination_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("xdg-unreadable");
+        let old = root.join("data");
+        let new = root.join("config");
+        write_atomic(&old.join("prefs.json"), b"old").unwrap();
+        write_atomic(&new.join("prefs.json"), b"new").unwrap();
+        std::fs::set_permissions(old.join("prefs.json"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(migrate_config(&old, &new), new);
+        assert_eq!(read(&new.join("prefs.json")).unwrap(), b"new");
         std::fs::remove_dir_all(root).unwrap();
     }
 
