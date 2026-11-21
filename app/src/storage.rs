@@ -93,43 +93,58 @@ mod imp {
         if old == new || new.join(".migrated-from-data").exists() {
             return new.to_path_buf();
         }
-        fn copy_missing(from: &Path, to: &Path) -> io::Result<()> {
+        fn copy_missing(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> io::Result<()> {
             if from.is_dir() {
                 std::fs::create_dir_all(to)?;
                 for entry in std::fs::read_dir(from)? {
                     let entry = entry?;
-                    copy_missing(&entry.path(), &to.join(entry.file_name()))?;
+                    copy_missing(&entry.path(), &to.join(entry.file_name()), created)?;
                 }
             } else if from.is_file() {
-                use std::io::Write;
-                match std::fs::OpenOptions::new().write(true).create_new(true).open(to) {
-                    Ok(mut target) => {
-                        if let Err(e) = std::fs::File::open(from)
-                            .and_then(|mut source| io::copy(&mut source, &mut target))
-                            .and_then(|_| target.flush())
-                        {
-                            drop(target);
-                            let _ = std::fs::remove_file(to);
-                            return Err(e);
-                        }
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let tmp = to.with_extension(format!(
+                    "migration-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                let mut target = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+                let result = (|| -> io::Result<()> {
+                    io::copy(&mut std::fs::File::open(from)?, &mut target)?;
+                    drop(target);
+                    match std::fs::hard_link(&tmp, to) {
+                        Ok(()) => created.push(to.to_path_buf()),
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(e) => return Err(e),
                     }
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(e),
-                }
+                    Ok(())
+                })();
+                let _ = std::fs::remove_file(&tmp);
+                result?;
             }
             Ok(())
         }
+        let mut created = Vec::new();
         let result = (|| -> io::Result<()> {
             std::fs::create_dir_all(new)?;
             for name in ["prefs.json", "settings.json", "layouts", "themes"] {
                 let from = old.join(name);
                 if from.exists() {
-                    copy_missing(&from, &new.join(name))?;
+                    copy_missing(&from, &new.join(name), &mut created)?;
                 }
             }
-            std::fs::write(new.join(".migrated-from-data"), b"1\n")
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(new.join(".migrated-from-data")) {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(e),
+            }
         })();
         if let Err(e) = result {
+            for path in created.iter().rev() {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!("could not roll back migrated file {}: {e}", path.display());
+                }
+            }
             tracing::warn!("could not migrate configuration to {}: {e}; using {}", new.display(), old.display());
             return old.to_path_buf();
         }
@@ -404,6 +419,27 @@ mod tests {
         let blocked = root.join("blocked");
         std::fs::write(&blocked, b"file").unwrap();
         assert_eq!(migrate_config(&old, &blocked.join("config")), old);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_migration_rolls_back_on_late_failure_and_retries_current_data() {
+        let root = scratch("xdg-retry");
+        let old = root.join("data");
+        let new = root.join("config");
+        write_atomic(&old.join("prefs.json"), b"first").unwrap();
+        write_atomic(&old.join("settings.json"), b"old").unwrap();
+        write_atomic(&old.join("themes/Dark.toml"), b"theme").unwrap();
+        write_atomic(&new.join("settings.json"), b"existing").unwrap();
+        write_atomic(&new.join("themes"), b"blocks directory").unwrap();
+        assert_eq!(migrate_config(&old, &new), old);
+        assert!(!new.join("prefs.json").exists());
+        assert_eq!(read(&new.join("settings.json")).unwrap(), b"existing");
+        write_atomic(&old.join("prefs.json"), b"updated").unwrap();
+        std::fs::remove_file(new.join("themes")).unwrap();
+        assert_eq!(migrate_config(&old, &new), new);
+        assert_eq!(read(&new.join("prefs.json")).unwrap(), b"updated");
+        assert_eq!(read(&new.join("settings.json")).unwrap(), b"existing");
         std::fs::remove_dir_all(root).unwrap();
     }
 
