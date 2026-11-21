@@ -87,6 +87,55 @@ fn redirect(store: &impl KeyStore, old: &str, new: &str, key: String) -> String 
 mod imp {
     use super::*;
 
+    /// Copy configuration once, without overwriting a newer destination. Keep the old files as
+    /// a backup; a marker prevents deleted settings or layouts from being resurrected.
+    pub fn migrate_config(old: &Path, new: &Path) -> PathBuf {
+        if old == new || new.join(".migrated-from-data").exists() {
+            return new.to_path_buf();
+        }
+        fn copy_missing(from: &Path, to: &Path) -> io::Result<()> {
+            if from.is_dir() {
+                std::fs::create_dir_all(to)?;
+                for entry in std::fs::read_dir(from)? {
+                    let entry = entry?;
+                    copy_missing(&entry.path(), &to.join(entry.file_name()))?;
+                }
+            } else if from.is_file() {
+                use std::io::Write;
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(to) {
+                    Ok(mut target) => {
+                        if let Err(e) = std::fs::File::open(from)
+                            .and_then(|mut source| io::copy(&mut source, &mut target))
+                            .and_then(|_| target.flush())
+                        {
+                            drop(target);
+                            let _ = std::fs::remove_file(to);
+                            return Err(e);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+        let result = (|| -> io::Result<()> {
+            std::fs::create_dir_all(new)?;
+            for name in ["prefs.json", "settings.json", "layouts", "themes"] {
+                let from = old.join(name);
+                if from.exists() {
+                    copy_missing(&from, &new.join(name))?;
+                }
+            }
+            std::fs::write(new.join(".migrated-from-data"), b"1\n")
+        })();
+        if let Err(e) = result {
+            tracing::warn!("could not migrate configuration to {}: {e}; using {}", new.display(), old.display());
+            return old.to_path_buf();
+        }
+        new.to_path_buf()
+    }
+
     /// Moves the data folder from `old` (its name before the app was renamed) to `new` the first
     /// time, and leaves a link at the old path so builds that still use the old name find the
     /// same files. Returns the folder to use: `new`, or `old` if it couldn't be moved. Never
@@ -172,6 +221,10 @@ mod imp {
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::*;
+
+    pub fn migrate_config(_old: &Path, new: &Path) -> PathBuf {
+        new.to_path_buf()
+    }
 
     fn store() -> io::Result<web_sys::Storage> {
         web_sys::window()
@@ -319,6 +372,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn config_migration_preserves_existing_files_and_does_not_restore_deletions() {
+        let root = scratch("xdg-config");
+        let old = root.join("data");
+        let new = root.join("config");
+        write_atomic(&old.join("prefs.json"), b"old preferences").unwrap();
+        write_atomic(&old.join("settings.json"), b"old settings").unwrap();
+        write_atomic(&old.join("layouts/Desk.json"), b"layout").unwrap();
+        write_atomic(&old.join("themes/Dark.toml"), b"theme").unwrap();
+        write_atomic(&new.join("prefs.json"), b"new preferences").unwrap();
+        assert_eq!(migrate_config(&old, &new), new);
+        assert_eq!(read(&new.join("prefs.json")).unwrap(), b"new preferences");
+        assert_eq!(read(&new.join("settings.json")).unwrap(), b"old settings");
+        assert_eq!(read(&new.join("layouts/Desk.json")).unwrap(), b"layout");
+        assert_eq!(read(&new.join("themes/Dark.toml")).unwrap(), b"theme");
+        std::fs::remove_file(new.join("layouts/Desk.json")).unwrap();
+        migrate_config(&old, &new);
+        assert!(!new.join("layouts/Desk.json").exists());
+        assert!(old.join("layouts/Desk.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_migration_falls_back_when_destination_is_unusable() {
+        let root = scratch("xdg-failure");
+        let old = root.join("data");
+        write_atomic(&old.join("prefs.json"), b"preferences").unwrap();
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"file").unwrap();
+        assert_eq!(migrate_config(&old, &blocked.join("config")), old);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -376,12 +376,47 @@ pub fn data_dir() -> PathBuf {
             if cfg!(target_os = "macos") {
                 home.join("Library/Application Support")
             } else {
-                std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"))
+                xdg_dir("XDG_DATA_HOME", home.join(".local/share"))
             }
         };
         crate::storage::migrate(&parent.join("terminal-rs"), &parent.join("terminal"))
     })
     .clone()
+}
+
+/// Configuration lives separately on Linux; the override and other platforms keep one directory.
+pub fn config_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let data = data_dir();
+        if cfg!(test) || !cfg!(target_os = "linux") || std::env::var_os("TR_DATA_DIR").is_some() {
+            return data;
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let config = xdg_dir("XDG_CONFIG_HOME", home.join(".config")).join("terminal");
+        crate::storage::migrate_config(&data, &config)
+    })
+    .clone()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn xdg_dir(var: &str, default: PathBuf) -> PathBuf {
+    std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or(default)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn xdg_dir(_var: &str, default: PathBuf) -> PathBuf {
+    default
+}
+
+/// Regenerable chart history is a cache on Linux.
+#[cfg(not(target_arch = "wasm32"))]
+fn cache_dir() -> PathBuf {
+    if cfg!(test) || !cfg!(target_os = "linux") || std::env::var_os("TR_DATA_DIR").is_some() {
+        return data_dir();
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    xdg_dir("XDG_CACHE_HOME", home.join(".cache")).join("terminal")
 }
 
 impl Worker {
@@ -393,8 +428,11 @@ impl Worker {
             tracing::warn!("congress db unavailable ({e:#}); using in-memory store");
             Db::open_in_memory()
         })?;
-        let cache =
-            BarCache::open(dir.join("bars.sqlite3")).map_err(|e| tracing::warn!("bar cache unavailable: {e:#}")).ok();
+        let cache = std::fs::create_dir_all(cache_dir())
+            .map_err(anyhow::Error::from)
+            .and_then(|()| BarCache::open(cache_dir().join("bars.sqlite3")))
+            .map_err(|e| tracing::warn!("bar cache unavailable: {e:#}"))
+            .ok();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()

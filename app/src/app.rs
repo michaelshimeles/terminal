@@ -48,7 +48,7 @@ use crate::layouts::{LayoutDoc, Link, PaneSettings, Store, WindowGeometry};
 use crate::markets_view;
 use crate::prefs::{self, Prefs};
 use crate::theme;
-use crate::worker::{Profile, Request, Response, Worker, data_dir};
+use crate::worker::{Profile, Request, Response, Worker, config_dir, data_dir};
 
 use chrome::{SIDEBAR_W, STATUS_H, SidebarCmd};
 use settings_view::SettingsTab;
@@ -598,11 +598,11 @@ fn keys_from_words(words: &[String]) -> Vec<String> {
 }
 
 fn settings_path() -> std::path::PathBuf {
-    data_dir().join("settings.json")
+    config_dir().join("settings.json")
 }
 
 fn prefs_path() -> std::path::PathBuf {
-    data_dir().join("prefs.json")
+    config_dir().join("prefs.json")
 }
 
 impl TerminalApp {
@@ -610,7 +610,7 @@ impl TerminalApp {
         let system_accent =
             tr_macos::accent_color().map_or(theme::DEFAULT_ACCENT, |[r, g, b]| Color32::from_rgb(r, g, b));
         let mut prefs = Prefs::load(&prefs_path());
-        let theme_store = crate::themes::ThemeStore::new(data_dir().join("themes"));
+        let theme_store = crate::themes::ThemeStore::new(config_dir().join("themes"));
         let mut themes = theme_store.load_all();
         // Appearance overrides from older versions become a custom theme file.
         if let Some(mut t) = prefs.migrated_theme.take() {
@@ -650,7 +650,7 @@ impl TerminalApp {
             drag: None,
             dock_motion: Default::default(),
             renaming_tab: None,
-            store: Store::new(data_dir().join("layouts")),
+            store: Store::new(config_dir().join("layouts")),
             layout_name: "Default".into(),
             layout_names: Vec::new(),
             last_saved: Vec::new(),
