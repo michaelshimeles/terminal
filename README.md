@@ -127,7 +127,7 @@ gets the native title bar with traffic lights, window vibrancy behind the sideba
     row in a linked watchlist or world-markets pane loads it into the group.
   - **Saved layouts**: save, name, rename, duplicate, delete and switch (`LAYOUT <name>`, the
     sidebar list, ⌥1…⌥9); the active layout autosaves and is restored on launch. Each layout is a
-    JSON file in `~/Library/Application Support/terminal/layouts` (`$XDG_DATA_HOME` on Linux)
+    JSON file in `~/Library/Application Support/terminal/layouts` (`$XDG_CONFIG_HOME/terminal/layouts` on Linux)
     and can be imported or exported (`LAYOUT EXPORT`/`IMPORT`, or Settings › Layouts). Per-pane
     settings (chart type, indicators, drawings, filters, depth, link, tab title) and, optionally,
     the theme (`LAYOUT THEME ON`) save with the layout.
@@ -186,8 +186,14 @@ TR_PROVIDER=sample cargo run --release   # offline
 APCA_API_KEY_ID=… APCA_API_SECRET_KEY=… cargo run --release   # Alpaca
 ```
 
-Data lives in `~/Library/Application Support/terminal` (macOS) or
-`$XDG_DATA_HOME/terminal` (Linux), or `TR_DATA_DIR`. Versions from before the project was renamed
+On Linux, preferences, settings, layouts and themes live in `$XDG_CONFIG_HOME/terminal`
+(`~/.config/terminal` by default); persistent data and credentials live in
+`$XDG_DATA_HOME/terminal` (`~/.local/share/terminal`); and the bar cache lives in
+`$XDG_CACHE_HOME/terminal` (`~/.cache/terminal`). On first launch, existing configuration is
+copied from the data directory without overwriting files already in the config directory; the
+old files are kept as a backup. The bar cache is rebuilt rather than moved. On macOS, files live
+in `~/Library/Application Support/terminal`. Setting `TR_DATA_DIR` keeps all files together in
+that directory and disables the Linux split. Versions from before the project was renamed
 used a `terminal-rs` folder in the same place; the first launch moves it to `terminal` and leaves
 a link at the old path, so builds that still use the old name find the same files. The first
 congress ingest covers the current and previous year (a few minutes; it runs in the background

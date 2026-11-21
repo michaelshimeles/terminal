@@ -258,7 +258,7 @@ impl TerminalApp {
     }
 
     /// Live theme editor. Editing a built-in creates a custom copy; custom themes save to
-    /// `<data dir>/themes/<name>.toml` shortly after each change.
+    /// `<config dir>/themes/<name>.toml` shortly after each change.
     fn themes_tab(&mut self, ui: &mut Ui) {
         section(ui, "Theme editor");
         if !self.themes.iter().any(|t| t.name == self.editing_theme) {

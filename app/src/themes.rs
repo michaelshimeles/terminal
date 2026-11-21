@@ -1,5 +1,5 @@
 //! Themes: named bundles of colours, fonts and density. Eight are built in; custom themes
-//! are TOML (or JSON) files in `<data dir>/themes/`, so they can be shared, hand-edited,
+//! are TOML (or JSON) files in `<config dir>/themes/`, so they can be shared, hand-edited,
 //! imported and exported. A file only needs the fields it changes: anything missing is
 //! filled from the built-in dark or light base, chosen by its `dark` flag.
 
